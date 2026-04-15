@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>vilog-victorialogs</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f7f3ea;
+        --card: rgba(255, 255, 255, 0.8);
+        --ink: #172121;
+        --muted: #5c6b73;
+        --accent: #b84c2a;
+        --border: rgba(23, 33, 33, 0.12);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Segoe UI", sans-serif;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at top left, rgba(184, 76, 42, 0.2), transparent 32%),
+          linear-gradient(135deg, #efe6d5 0%, var(--bg) 45%, #f8f7f4 100%);
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+      main {
+        width: min(720px, 100%);
+        padding: 32px;
+        border: 1px solid var(--border);
+        border-radius: 24px;
+        background: var(--card);
+        backdrop-filter: blur(14px);
+        box-shadow: 0 18px 60px rgba(23, 33, 33, 0.08);
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: clamp(2rem, 5vw, 3.5rem);
+        line-height: 1;
+      }
+      p {
+        margin: 0 0 16px;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+      .badge {
+        display: inline-flex;
+        margin-bottom: 16px;
+        padding: 6px 12px;
+        border-radius: 999px;
+        background: rgba(184, 76, 42, 0.12);
+        color: var(--accent);
+        font-size: 0.9rem;
+        font-weight: 600;
+      }
+      code {
+        padding: 2px 6px;
+        border-radius: 8px;
+        background: rgba(23, 33, 33, 0.07);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="badge">Backend Ready</div>
+      <h1>vilog-victorialogs</h1>
+      <p>Datasource management, search, discovery, retention, and system probes are available through the JSON API.</p>
+      <p>Health probes are exposed at <code>/healthz</code> and <code>/readyz</code>.</p>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,806 @@
+openapi: 3.0.3
+info:
+  title: vilog-victorialogs API
+  version: 1.0.0
+  description: Monolithic backend API for VictoriaLogs datasource management, search, discovery, and retention control.
+servers:
+  - url: http://localhost:8080
+paths:
+  /:
+    get:
+      summary: Embedded placeholder page
+      responses:
+        "200":
+          description: HTML placeholder page
+  /healthz:
+    get:
+      summary: Liveness probe
+      responses:
+        "200":
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /readyz:
+    get:
+      summary: Readiness probe
+      responses:
+        "200":
+          description: Service dependencies are ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: Dependency not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /api/datasources:
+    get:
+      summary: List datasources
+      responses:
+        "200":
+          description: Datasource list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Datasource"
+    post:
+      summary: Create datasource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DatasourceUpsertRequest"
+      responses:
+        "201":
+          description: Datasource created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Datasource"
+  /api/datasources/{id}:
+    put:
+      summary: Update datasource
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DatasourceUpsertRequest"
+      responses:
+        "200":
+          description: Datasource updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Datasource"
+  /api/datasources/{id}/test:
+    post:
+      summary: Test datasource connectivity
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: Connectivity test result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatasourceTestResponse"
+  /api/datasources/{id}/discover:
+    post:
+      summary: Trigger datasource discovery
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: Discovery snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiscoveryResponse"
+  /api/query/search:
+    post:
+      summary: Search logs across datasources
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchRequest"
+      responses:
+        "200":
+          description: Aggregated search response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+  /api/query/services:
+    get:
+      summary: List discovered services for a datasource
+      parameters:
+        - name: datasource_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Service list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceListResponse"
+  /api/query/tags:
+    get:
+      summary: List available tags for a datasource and optional service
+      parameters:
+        - name: datasource_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: service
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Tag catalog
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TagCatalogResponse"
+  /api/query/tag-values:
+    get:
+      summary: List values for a tag field
+      parameters:
+        - name: datasource_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: field
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: service
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Tag values
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TagValuesResponse"
+  /api/tags:
+    get:
+      summary: List tag definitions
+      responses:
+        "200":
+          description: Tag definition list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TagDefinition"
+    post:
+      summary: Create tag definition
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TagDefinitionUpsertRequest"
+      responses:
+        "201":
+          description: Tag definition created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TagDefinition"
+  /api/tags/{id}:
+    put:
+      summary: Update tag definition
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TagDefinitionUpsertRequest"
+      responses:
+        "200":
+          description: Tag definition updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TagDefinition"
+    delete:
+      summary: Delete tag definition
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: Tag definition deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+  /api/retention/templates:
+    get:
+      summary: List retention templates
+      responses:
+        "200":
+          description: Retention templates
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RetentionPolicyTemplate"
+    post:
+      summary: Create retention template
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RetentionPolicyTemplateUpsertRequest"
+      responses:
+        "201":
+          description: Retention template created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RetentionPolicyTemplate"
+  /api/retention/templates/{id}:
+    put:
+      summary: Update retention template
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RetentionPolicyTemplateUpsertRequest"
+      responses:
+        "200":
+          description: Retention template updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RetentionPolicyTemplate"
+  /api/retention/bindings:
+    get:
+      summary: List retention bindings
+      responses:
+        "200":
+          description: Retention bindings
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DatasourceRetentionBinding"
+    post:
+      summary: Create retention binding
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DatasourceRetentionBindingUpsertRequest"
+      responses:
+        "201":
+          description: Retention binding created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatasourceRetentionBinding"
+  /api/retention/bindings/{id}:
+    put:
+      summary: Update retention binding
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DatasourceRetentionBindingUpsertRequest"
+      responses:
+        "200":
+          description: Retention binding updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatasourceRetentionBinding"
+  /api/retention/run/{datasource_id}:
+    post:
+      summary: Run retention for a datasource
+      parameters:
+        - name: datasource_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Retention task started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RetentionRunResponse"
+  /api/retention/tasks:
+    get:
+      summary: List retention delete tasks
+      responses:
+        "200":
+          description: Delete task list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DeleteTask"
+  /api/retention/tasks/{id}/stop:
+    post:
+      summary: Stop a retention delete task
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: Task stop requested
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+components:
+  parameters:
+    PathID:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+  schemas:
+    ComponentStatus:
+      type: object
+      properties:
+        name:
+          type: string
+        status:
+          type: string
+        error:
+          type: string
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        time:
+          type: string
+          format: date-time
+        version:
+          type: string
+        components:
+          type: array
+          items:
+            $ref: "#/components/schemas/ComponentStatus"
+    DatasourceHeaders:
+      type: object
+      properties:
+        AccountID:
+          type: string
+        ProjectID:
+          type: string
+        Authorization:
+          type: string
+    DatasourceQueryPaths:
+      type: object
+      properties:
+        query:
+          type: string
+        field_names:
+          type: string
+        field_values:
+          type: string
+        stream_field_names:
+          type: string
+        stream_field_values:
+          type: string
+        facets:
+          type: string
+        delete_run_task:
+          type: string
+        delete_active_tasks:
+          type: string
+        delete_stop_task:
+          type: string
+    DatasourceFieldMapping:
+      type: object
+      properties:
+        service_field:
+          type: string
+        pod_field:
+          type: string
+        message_field:
+          type: string
+        time_field:
+          type: string
+    Datasource:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        base_url:
+          type: string
+        enabled:
+          type: boolean
+        timeout_seconds:
+          type: integer
+        headers:
+          $ref: "#/components/schemas/DatasourceHeaders"
+        query_paths:
+          $ref: "#/components/schemas/DatasourceQueryPaths"
+        field_mapping:
+          $ref: "#/components/schemas/DatasourceFieldMapping"
+        supports_delete:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    DatasourceUpsertRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        base_url:
+          type: string
+        enabled:
+          type: boolean
+        timeout_seconds:
+          type: integer
+        headers:
+          $ref: "#/components/schemas/DatasourceHeaders"
+        query_paths:
+          $ref: "#/components/schemas/DatasourceQueryPaths"
+        field_mapping:
+          $ref: "#/components/schemas/DatasourceFieldMapping"
+        supports_delete:
+          type: boolean
+    DatasourceTestResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+    TagDefinition:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        display_name:
+          type: string
+        field_name:
+          type: string
+        ui_type:
+          type: string
+        multi:
+          type: boolean
+        enabled:
+          type: boolean
+        datasource_ids:
+          type: array
+          items:
+            type: string
+        service_names:
+          type: array
+          items:
+            type: string
+        auto_discovered:
+          type: boolean
+        priority:
+          type: integer
+    TagDefinitionUpsertRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        display_name:
+          type: string
+        field_name:
+          type: string
+        ui_type:
+          type: string
+        multi:
+          type: boolean
+        enabled:
+          type: boolean
+        datasource_ids:
+          type: array
+          items:
+            type: string
+        service_names:
+          type: array
+          items:
+            type: string
+        auto_discovered:
+          type: boolean
+        priority:
+          type: integer
+    DatasourceTagSnapshot:
+      type: object
+      properties:
+        id:
+          type: string
+        datasource_id:
+          type: string
+        discovered_at:
+          type: string
+          format: date-time
+        service_field:
+          type: string
+        pod_field:
+          type: string
+        message_field:
+          type: string
+        time_field:
+          type: string
+        tag_candidates:
+          type: array
+          items:
+            type: string
+        high_cardinality_fields:
+          type: array
+          items:
+            type: string
+        notify_status:
+          type: string
+    DiscoveryResponse:
+      type: object
+      properties:
+        snapshot:
+          $ref: "#/components/schemas/DatasourceTagSnapshot"
+    SearchRequest:
+      type: object
+      properties:
+        keyword:
+          type: string
+        start:
+          type: string
+          format: date-time
+        end:
+          type: string
+          format: date-time
+        datasource_ids:
+          type: array
+          items:
+            type: string
+        service_names:
+          type: array
+          items:
+            type: string
+        tags:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+        page:
+          type: integer
+        page_size:
+          type: integer
+        use_cache:
+          type: boolean
+    SearchResult:
+      type: object
+      properties:
+        timestamp:
+          type: string
+        message:
+          type: string
+        service:
+          type: string
+        pod:
+          type: string
+        datasource:
+          type: string
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+        raw:
+          type: object
+          additionalProperties: true
+    QuerySourceStatus:
+      type: object
+      properties:
+        datasource:
+          type: string
+        status:
+          type: string
+        hits:
+          type: integer
+        error:
+          type: string
+    SearchResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/SearchResult"
+        sources:
+          type: array
+          items:
+            $ref: "#/components/schemas/QuerySourceStatus"
+        partial:
+          type: boolean
+        cache_hit:
+          type: boolean
+        took_ms:
+          type: integer
+          format: int64
+    ServiceListResponse:
+      type: object
+      properties:
+        services:
+          type: array
+          items:
+            type: string
+        cache_hit:
+          type: boolean
+    TagCatalogResponse:
+      type: object
+      properties:
+        tags:
+          type: array
+          items:
+            $ref: "#/components/schemas/TagDefinition"
+    TagValuesResponse:
+      type: object
+      properties:
+        field:
+          type: string
+        values:
+          type: array
+          items:
+            type: string
+        cache_hit:
+          type: boolean
+    RetentionPolicyTemplate:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        retention_days:
+          type: integer
+        cron:
+          type: string
+        enabled:
+          type: boolean
+    RetentionPolicyTemplateUpsertRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        retention_days:
+          type: integer
+        cron:
+          type: string
+        enabled:
+          type: boolean
+    DatasourceRetentionBinding:
+      type: object
+      properties:
+        id:
+          type: string
+        datasource_id:
+          type: string
+        policy_template_id:
+          type: string
+        enabled:
+          type: boolean
+        service_scope:
+          type: array
+          items:
+            type: string
+        tag_scope:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+        last_run_at:
+          type: string
+          format: date-time
+        last_task_id:
+          type: string
+        last_status:
+          type: string
+    DatasourceRetentionBindingUpsertRequest:
+      type: object
+      properties:
+        datasource_id:
+          type: string
+        policy_template_id:
+          type: string
+        enabled:
+          type: boolean
+        service_scope:
+          type: array
+          items:
+            type: string
+        tag_scope:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+    DeleteTask:
+      type: object
+      properties:
+        id:
+          type: string
+        datasource_id:
+          type: string
+        binding_id:
+          type: string
+        task_id:
+          type: string
+        filter:
+          type: string
+        status:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        error_msg:
+          type: string
+    RetentionRunResponse:
+      type: object
+      properties:
+        datasource_id:
+          type: string
+        tasks:
+          type: array
+          items:
+            $ref: "#/components/schemas/DeleteTask"
+    StatusResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        message:
+          type: string

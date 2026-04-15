@@ -1,0 +1,36 @@
+services:
+  mongo:
+    image: mongo:7.0
+    container_name: vilog-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vilog-victorialogs
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      VILOG_MONGO_URI: mongodb://mongo:27017
+      VILOG_MONGO_DATABASE: vilog_victorialogs
+      VILOG_LOG_DEVELOPMENT: "true"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.example.yaml:/app/config.yaml:ro
+
+volumes:
+  mongo-data:
