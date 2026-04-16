@@ -1,56 +1,103 @@
+# 说明：
+# 1. 这个文件只配置“服务自身”的运行参数，不包含具体日志数据源列表。
+# 2. VictoriaLogs 数据源通过 Web 控制台或 /api/datasources 接口动态添加，持久化到 MongoDB 的 datasources 集合。
+# 3. 首次启动后，先打开 http://127.0.0.1:8080/ ，再在 Datasources 页面创建数据源。
+
 app:
+  # 服务名，仅用于日志和标识。
   name: vilog-victorialogs
+  # 运行环境：development / production / local。
   environment: development
 
 http:
+  # HTTP 监听地址。
   addr: ":8080"
+  # 读取请求超时。
   read_timeout: 10s
+  # 写响应超时。
   write_timeout: 15s
+  # Keep-Alive 空闲超时。
   idle_timeout: 60s
+  # 优雅关闭超时。
   shutdown_timeout: 15s
+  # 反向代理地址白名单，通常部署在 Nginx / Traefik 后面时再配置。
   trusted_proxies: []
 
 mongo:
+  # MongoDB 连接串。系统配置、数据源、缓存、发现快照、生命周期任务都存这里。
   uri: mongodb://localhost:27017
+  # 数据库名。
   database: vilog_victorialogs
+  # 建立连接超时。
   connect_timeout: 10s
+  # 启动探活 ping 超时。
   ping_timeout: 3s
 
 logging:
+  # 日志级别：debug / info / warn / error。
   level: info
+  # development=true 时使用开发日志格式。
   development: true
 
 cache:
+  # 查询结果缓存 TTL。建议保守设置，避免误以为是实时结果。
   query_ttl: 300s
+  # 服务列表缓存 TTL。
   service_list_ttl: 1800s
+  # 标签值缓存 TTL。
   tag_values_ttl: 1800s
 
 victorialogs:
+  # 对单次 VictoriaLogs 请求的重试次数，不含首次请求。
   request_retries: 1
+  # discover 时最多拉取多少候选字段/统计项。
   discovery_limit: 200
+  # 标签值候选接口最大拉取数量。
   tag_value_limit: 200
 
 security:
+  # 是否信任 X-Forwarded-For / X-Real-IP。
+  # 仅当服务部署在可信代理后面时再打开。
   trust_proxy_headers: false
+  # IP/CIDR 白名单。为空表示不限制访问。
+  # 示例：
+  # whitelist:
+  #   - 127.0.0.1
+  #   - 10.0.0.0/8
   whitelist: []
+  # 基础限流，每秒允许请求数。0 表示关闭。
   rate_limit_rps: 0
+  # 限流突发桶容量。0 表示关闭。
   rate_limit_burst: 0
 
 telegram:
+  # 是否启用 Telegram 通知。
   enabled: false
+  # Bot Token。仅 telegram.enabled=true 时必填。
   bot_token: ""
+  # 接收通知的 chat_id。仅 telegram.enabled=true 时必填。
   chat_id: ""
+  # Telegram Bot API 基地址，默认官方地址。
   api_base_url: https://api.telegram.org
+  # 单次发送超时。
   send_timeout: 5s
 
 discovery:
+  # 启动后是否异步扫描所有已启用数据源并尝试识别服务字段/标签。
   startup_enabled: true
+  # 自动发现默认回看的时间窗口。
   window: 24h
+  # 启动 discover 的并发数。
   concurrency: 4
 
 retention:
+  # 是否启用定时生命周期调度器。
   scheduler_enabled: false
+  # 单个数据源每天最多创建多少个删除任务。
   max_delete_tasks_per_day: 1
+  # 允许 retention_days 的最大范围，防止一次删得过大。
   max_delete_range_days: 30
+  # 调用远端删除接口超时。
   delete_timeout: 10s
+  # 轮询远端删除任务状态的间隔。
   poll_interval: 30s

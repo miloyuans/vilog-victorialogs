@@ -77,6 +77,58 @@ make docker-down
 
 The config file is `config.yaml`. Environment overrides use the `VILOG_` prefix.
 
+## 数据源如何配置
+
+当前代码里，`config.yaml` 不负责声明具体的 VictoriaLogs 数据源列表。代码结构上：
+
+- 服务级配置由 [config.example.yaml](/C:/Users/mylo/Documents/milo2025/go/vilog-victorialogs/config.example.yaml:1) 和 [internal/config/config.go](/C:/Users/mylo/Documents/milo2025/go/vilog-victorialogs/internal/config/config.go:1) 加载
+- 数据源本身通过 [internal/store/mongo/datasources.go](/C:/Users/mylo/Documents/milo2025/go/vilog-victorialogs/internal/store/mongo/datasources.go:1) 持久化到 MongoDB
+- 管理入口是 `GET /` 内嵌控制台，或者 `POST /api/datasources`
+
+也就是说，正确的使用方式是：
+
+1. 先在 `config.yaml` 里配置服务监听、Mongo、白名单、Telegram、discover、retention 等运行参数
+2. 启动服务
+3. 打开 `http://127.0.0.1:8080/`
+4. 在 `Datasources` 页面新增一个或多个 VictoriaLogs 数据源
+5. 数据源保存后会写入 Mongo，后续查询、discover、retention 都从 Mongo 读取
+
+如果你想直接走 API，也可以调用：
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/datasources \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "prod-vl-01",
+    "base_url": "http://127.0.0.1:9428",
+    "enabled": true,
+    "timeout_seconds": 15,
+    "headers": {
+      "AccountID": "0",
+      "ProjectID": "0",
+      "Authorization": ""
+    },
+    "query_paths": {
+      "query": "/select/logsql/query",
+      "field_names": "/select/logsql/field_names",
+      "field_values": "/select/logsql/field_values",
+      "stream_field_names": "/select/logsql/stream_field_names",
+      "stream_field_values": "/select/logsql/stream_field_values",
+      "facets": "/select/logsql/facets",
+      "delete_run_task": "/delete/run_task",
+      "delete_active_tasks": "/delete/active_tasks",
+      "delete_stop_task": "/delete/stop_task"
+    },
+    "field_mapping": {
+      "service_field": "",
+      "pod_field": "",
+      "message_field": "",
+      "time_field": "_time"
+    },
+    "supports_delete": false
+  }'
+```
+
 Common environment overrides:
 
 - `VILOG_HTTP_ADDR`
