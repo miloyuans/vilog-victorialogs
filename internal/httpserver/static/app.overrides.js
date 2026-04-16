@@ -9,6 +9,7 @@ function createQueryLayer(mode, value) {
   return {
     id: nextQueryLayerID(),
     mode: mode || "keyword",
+    operator: "and",
     value: value || "",
   };
 }
@@ -41,6 +42,7 @@ function ensureEnhancedState() {
   state.search.queryLayers = state.search.queryLayers.map((layer) => ({
     id: layer && layer.id ? String(layer.id) : nextQueryLayerID(),
     mode: layer && layer.mode === "logsql" ? "logsql" : "keyword",
+    operator: layer && layer.operator === "or" ? "or" : "and",
     value: layer && typeof layer.value === "string" ? layer.value : "",
   }));
 }
@@ -71,7 +73,8 @@ function buildBackendQueryFromLayer(layer) {
   if (!raw) return "";
   if (layer.mode === "logsql") return raw;
   const tokens = splitKeywordTokens(raw);
-  return tokens.map((token) => `"${escapeQueryToken(token)}"`).join(" OR ");
+  const joiner = layer.operator === "or" ? " or " : " and ";
+  return tokens.map((token) => `"${escapeQueryToken(token)}"`).join(joiner);
 }
 
 function getPrimaryLayer() {
@@ -135,7 +138,9 @@ function layerMatches(item, layer) {
   if (layer.mode === "keyword") {
     const tokens = splitKeywordTokens(raw);
     if (!tokens.length) return true;
-    return tokens.some((token) => haystack.indexOf(String(token).toLowerCase()) >= 0);
+    return layer.operator === "or"
+      ? tokens.some((token) => haystack.indexOf(String(token).toLowerCase()) >= 0)
+      : tokens.every((token) => haystack.indexOf(String(token).toLowerCase()) >= 0);
   }
   return haystack.indexOf(raw.toLowerCase()) >= 0;
 }
@@ -187,6 +192,7 @@ function renderQueryLayer(layer, index) {
           <span>${esc(getLayerNote(index, layer))}</span>
         </div>
         <div class="query-layer-actions">
+          ${layer.mode === "keyword" ? `<div class="mode-switch query-operator-switch"><button class="mode-button ${layer.operator !== "or" ? "active" : ""}" type="button" data-query-operator="and" data-layer-id="${esc(layer.id)}">AND</button><button class="mode-button ${layer.operator === "or" ? "active" : ""}" type="button" data-query-operator="or" data-layer-id="${esc(layer.id)}">OR</button></div>` : ""}
           <div class="mode-switch query-mode-switch">
             <button class="mode-button ${layer.mode === "keyword" ? "active" : ""}" type="button" data-query-layer-mode="keyword" data-layer-id="${esc(layer.id)}">${esc(s("关键词", "Keyword"))}</button>
             <button class="mode-button ${layer.mode === "logsql" ? "active" : ""}" type="button" data-query-layer-mode="logsql" data-layer-id="${esc(layer.id)}">LogsQL</button>
@@ -266,7 +272,11 @@ function renderSearchToolbar() {
             <strong>${esc(s("关键字 / LogsQL 递归过滤器", "Keyword / LogsQL Recursive Filters"))}</strong>
             <span>${esc(s("先确定数据源和服务，再通过主查询命中结果，后续层按顺序继续过滤。", "Pick datasources and services first, then run the primary query and keep narrowing with recursive filters."))}</span>
           </div>
-          <button class="button button-small" type="button" data-action="add-query-layer">${esc(s("添加过滤层", "Add Filter Layer"))}</button>
+          <div class="query-composer-toolbar">
+            <div id="search-level-filters" class="inline-dock-block"></div>
+            <div id="search-highlight-palette" class="inline-dock-block"></div>
+            <button class="button button-small" type="button" data-action="add-query-layer">${esc(s("添加过滤层", "Add Filter Layer"))}</button>
+          </div>
         </div>
         <div class="query-layer-stack">${state.search.queryLayers.map((layer, index) => renderQueryLayer(layer, index)).join("")}</div>
       </div>
@@ -399,7 +409,6 @@ renderSearchMarkup = function () {
           </div>
         </div>
       </div>
-      <div class="search-floating-dock" id="search-floating-dock"><div class="floating-dock-block" id="search-level-filters"></div><div class="floating-dock-block" id="search-highlight-palette"></div></div>
       <div id="search-detail-modal"></div>
       <div class="search-loading-overlay" id="search-loading-overlay"><div class="search-loading-dialog"><div class="search-loading-spinner"></div><strong>${esc(s("正在刷新查询结果", "Refreshing Query Results"))}</strong><span>${esc(s("请稍候，主工作台会在查询完成后恢复交互。", "Please wait while the workbench refreshes the result set."))}</span></div></div>
     </div>
@@ -591,6 +600,15 @@ handleClick = function (event) {
     return;
   }
 
+  const operator = button.getAttribute("data-query-operator");
+  if (operator && layerID) {
+    state.search.queryLayers = state.search.queryLayers.map((layer) =>
+      layer.id === layerID ? { ...layer, operator } : layer,
+    );
+    renderSearchControls();
+    return;
+  }
+
   const datasourceID = button.getAttribute("data-search-datasource-id");
   if (datasourceID) return toggleSearchDatasource(datasourceID);
   if (button.hasAttribute("data-search-datasource-all")) return selectAllSearchDatasources();
@@ -740,6 +758,8 @@ renderSearchControls = function () {
   renderSearchTimePanel();
   renderSearchContext();
   renderSearchCatalogs();
+  renderSearchLevelFilters();
+  renderSearchHighlightPalette();
   renderSearchLoadingState();
   syncSearchMenuState();
 };
@@ -795,7 +815,7 @@ renderSearchCatalogs = function () {
 
 getDecoratedResults = function () {
   const results = getRawDecoratedResults();
-  const layers = state.search.queryLayers.slice(1);
+  const layers = state.search.queryLayers.filter((layer, index) => index !== 0 || layer.mode === "keyword");
   return layers.reduce((items, layer) => String(layer.value || "").trim() ? items.filter((item) => layerMatches(item, layer)) : items, results);
 };
 
@@ -977,10 +997,17 @@ submitSearch = async function (event) {
   state.search.page = page;
   state.search.pageSize = pageSize;
   state.search.useCache = byId("search-use-cache") ? byId("search-use-cache").checked : true;
-  const payload = { keyword: buildBackendQueryFromLayer(getPrimaryLayer()), start: localToRFC3339(byId("search-start").value), end: localToRFC3339(byId("search-end").value), datasource_ids: state.search.selectedDatasourceIDs.slice(), service_names: state.search.serviceNames.slice(), tags: normalizeFilters(state.search.activeFilters), page, page_size: pageSize, use_cache: state.search.useCache !== false };
+  const primaryLayer = getPrimaryLayer();
+  const payload = { keyword: buildBackendQueryFromLayer(primaryLayer), start: localToRFC3339(byId("search-start").value), end: localToRFC3339(byId("search-end").value), datasource_ids: state.search.selectedDatasourceIDs.slice(), service_names: state.search.serviceNames.slice(), tags: normalizeFilters(state.search.activeFilters), page, page_size: pageSize, use_cache: state.search.useCache !== false };
   setSearchLoading(true);
   try {
-    state.search.response = await request("/api/query/search", { method: "POST", body: JSON.stringify(payload) });
+    try {
+      state.search.response = await request("/api/query/search", { method: "POST", body: JSON.stringify(payload) });
+    } catch (error) {
+      if (primaryLayer.mode !== "keyword" || !payload.keyword) throw error;
+      const fallbackPayload = { ...payload, keyword: "" };
+      state.search.response = await request("/api/query/search", { method: "POST", body: JSON.stringify(fallbackPayload) });
+    }
     state.search.levelFilter = "all";
     const results = getVisibleResults();
     state.search.selectedResultKey = results[0] ? String(results[0]._index) : "";
