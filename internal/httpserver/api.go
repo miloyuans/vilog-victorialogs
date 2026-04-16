@@ -14,6 +14,7 @@ func (s *Server) registerDatasourceRoutes(api *gin.RouterGroup) {
 	group.GET("", s.listDatasources)
 	group.POST("", s.createDatasource)
 	group.PUT("/:id", s.updateDatasource)
+	group.DELETE("/:id", s.deleteDatasource)
 	group.POST("/:id/test", s.testDatasource)
 	group.POST("/:id/discover", s.discoverDatasource)
 	group.GET("/:id/snapshot", s.getDatasourceSnapshot)
@@ -83,6 +84,14 @@ func (s *Server) updateDatasource(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, item)
+}
+
+func (s *Server) deleteDatasource(c *gin.Context) {
+	if err := s.deps.Datasources.Delete(c.Request.Context(), c.Param("id"), actorFromRequest(c, s.cfg.Security.TrustProxyHeaders)); err != nil {
+		writeError(c, http.StatusBadRequest, "datasource_delete_failed", err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, model.StatusResponse{Status: "ok"})
 }
 
 func (s *Server) testDatasource(c *gin.Context) {

@@ -22,6 +22,8 @@ const storageKeys = {
   locale: "vilog.locale",
   view: "vilog.search.view",
   wrap: "vilog.search.wrap",
+  navCollapsed: "vilog.ui.navCollapsed",
+  railCollapsed: "vilog.search.railCollapsed",
 };
 
 const state = {
@@ -40,19 +42,26 @@ const state = {
   tagEditingId: "",
   templateEditingId: "",
   bindingEditingId: "",
+  ui: {
+    navCollapsed: localStorage.getItem(storageKeys.navCollapsed) === "true",
+    railCollapsed: localStorage.getItem(storageKeys.railCollapsed) === "true",
+    detailOpen: false,
+    openMenu: "",
+  },
   search: {
     selectedDatasourceIDs: [],
     catalogDatasourceID: "",
-    service: "",
+    serviceNames: [],
     services: [],
     tagCatalog: [],
     tagValues: {},
     activeFilters: {},
     response: null,
     selectedResultKey: "",
-    view: localStorage.getItem(storageKeys.view) || "list",
+    view: localStorage.getItem(storageKeys.view) || "table",
     wrap: localStorage.getItem(storageKeys.wrap) !== "false",
     levelFilter: "all",
+    timePreset: "1h",
   },
 };
 
@@ -60,7 +69,7 @@ function mount() {
   document.documentElement.lang = state.locale === "zh" ? "zh-CN" : "en";
   document.title = s("vilog-victorialogs 日志工作台", "vilog-victorialogs Log Workbench");
   byId("app").innerHTML = `
-    <div class="app-shell">
+    <div class="app-shell ${state.ui.navCollapsed ? "nav-collapsed" : ""}" id="app-shell">
       ${renderExploreTabs()}
       <div class="workspace-shell">
         ${renderExploreHeader()}
@@ -242,29 +251,23 @@ function renderExploreTabs() {
   return `
     <nav class="nav-tabs nav-tabs-explore">
       <div class="nav-brand">
-        <span class="nav-brand-mark">VL</span>
+        <button class="nav-brand-mark nav-brand-toggle" type="button" data-toggle-nav="1">VL</button>
         <div class="nav-brand-copy">
           <strong>VictoriaLogs</strong>
-          <span>${esc(s("Explore 工作区", "Explore workspace"))}</span>
+          <span>${esc(s("Core 工作区", "Core workspace"))}</span>
         </div>
       </div>
       <div class="nav-section">
-        <div class="nav-section-title">${esc(s("Explore", "Explore"))}</div>
-        ${exploreNavItem("overview", s("概览", "Overview"), "OV")}
+        <div class="nav-section-title">${esc(s("Core", "Core"))}</div>
         ${exploreNavItem("search", s("日志查询", "Logs"), "LG")}
-      </div>
-      <div class="nav-section">
-        <div class="nav-section-title">${esc(s("Manage", "Manage"))}</div>
         ${exploreNavItem("datasources", s("数据源", "Datasources"), "DS")}
-        ${exploreNavItem("tags", s("标签", "Tags"), "TG")}
-        ${exploreNavItem("retention", s("生命周期", "Retention"), "RT")}
       </div>
     </nav>
   `;
 }
 
 function exploreNavItem(id, label, short) {
-  return `<button class="tab-button ${state.activePanel === id ? "active" : ""}" type="button" data-panel-target="${esc(id)}"><span class="tab-icon">${esc(short)}</span><span>${esc(label)}</span></button>`;
+  return `<button class="tab-button ${state.activePanel === id ? "active" : ""}" type="button" data-panel-target="${esc(id)}"><span class="tab-icon">${esc(short)}</span><span class="tab-label">${esc(label)}</span></button>`;
 }
 
 function s(zh, en) {
@@ -1610,7 +1613,7 @@ function highlight(text, keyword) { const safe = esc(text); if (!keyword) return
 function escapeRegExp(text) { return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 function findByID(list, id) { return (list || []).find((item) => item.id === id); }
 
-bootstrap();
+if (!window.__vilogExternalBootstrap) bootstrap();
 function rangeButton(id, label) {
   return `<button class="chip-button" type="button" data-range="${esc(id)}">${esc(label)}</button>`;
 }

@@ -73,6 +73,18 @@ func (s *Service) Update(ctx context.Context, id string, req model.DatasourceUps
 	return datasource, nil
 }
 
+func (s *Service) Delete(ctx context.Context, id, actor string) error {
+	existing, err := s.store.GetDatasource(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := s.store.DeleteDatasource(ctx, id); err != nil {
+		return err
+	}
+	_ = s.audit(ctx, "datasource", id, "delete", actor, map[string]any{"name": existing.Name})
+	return nil
+}
+
 func mergeDatasourceRequest(existing model.Datasource, req model.DatasourceUpsertRequest) model.DatasourceUpsertRequest {
 	merged := req
 	if strings.TrimSpace(merged.Name) == "" {

@@ -60,3 +60,26 @@ func (s *Store) UpdateDatasource(ctx context.Context, datasource model.Datasourc
 	}
 	return nil
 }
+
+func (s *Store) DeleteDatasource(ctx context.Context, id string) error {
+	result, err := s.collection(collectionDatasources).DeleteOne(ctx, bson.M{"_id": id})
+	if err != nil {
+		return fmt.Errorf("delete datasource: %w", err)
+	}
+	if result.DeletedCount == 0 {
+		return ErrNotFound
+	}
+
+	cleanupTargets := []string{
+		collectionServiceCatalog,
+		collectionDatasourceTagSnapshots,
+		collectionDatasourceRetentionBindings,
+		collectionDeleteTasks,
+	}
+	for _, name := range cleanupTargets {
+		if _, err := s.collection(name).DeleteMany(ctx, bson.M{"datasource_id": id}); err != nil {
+			return fmt.Errorf("cleanup %s for datasource %s: %w", name, id, err)
+		}
+	}
+	return nil
+}
