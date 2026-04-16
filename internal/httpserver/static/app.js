@@ -61,8 +61,10 @@ function mount() {
   document.title = s("vilog-victorialogs 日志工作台", "vilog-victorialogs Log Workbench");
   byId("app").innerHTML = `
     <div class="app-shell">
-      ${renderHeader()}
-      ${renderTabs()}
+      ${renderExploreTabs()}
+      <div class="workspace-shell">
+        ${renderExploreHeader()}
+        <main class="workspace-main">
       <section class="panel ${state.activePanel === "overview" ? "active" : ""}" id="panel-overview">
         <div class="page-grid">
           <div class="card">
@@ -107,6 +109,8 @@ function mount() {
       <section class="panel ${state.activePanel === "datasources" ? "active" : ""}" id="panel-datasources"></section>
       <section class="panel ${state.activePanel === "tags" ? "active" : ""}" id="panel-tags"></section>
       <section class="panel ${state.activePanel === "retention" ? "active" : ""}" id="panel-retention"></section>
+        </main>
+      </div>
       <div class="toast-stack" id="toast-stack"></div>
     </div>
   `;
@@ -171,6 +175,96 @@ function renderTabs() {
 
 function tab(id, label) {
   return `<button class="tab-button ${state.activePanel === id ? "active" : ""}" type="button" data-panel-target="${esc(id)}">${esc(label)}</button>`;
+}
+
+function renderExploreHeader() {
+  return `
+    <header class="topbar topbar-explore">
+      <div class="topbar-main">
+        <div class="breadcrumb-bar">
+          <span class="breadcrumb-pill">${esc(s("Home", "Home"))}</span>
+          <span class="breadcrumb-sep">/</span>
+          <span class="breadcrumb-pill">${esc(s("Explore", "Explore"))}</span>
+          <span class="breadcrumb-sep">/</span>
+          <span class="breadcrumb-pill current">${esc(s("VictoriaLogs", "VictoriaLogs"))}</span>
+        </div>
+        <div class="topbar-search" aria-hidden="true">
+          <span class="topbar-search-icon">Q</span>
+          <input type="text" placeholder="${esc(s("搜索命令、数据源或工作区", "Search commands, datasources, or workspace"))}" disabled />
+          <kbd>Ctrl+K</kbd>
+        </div>
+        <div class="topbar-overview">
+          <div class="topbar-copy">
+            <div class="brand-label">${esc(s("Explore Workspace", "Explore Workspace"))}</div>
+            <h1>${esc(s("VictoriaLogs 探索工作台", "VictoriaLogs Explore"))}</h1>
+            <p>${esc(s(
+              "参考 Grafana Explore 的布局节奏，重组侧边导航、查询面板、日志柱状概览和下方日志流，保留现有 datasource / tag / retention 功能。",
+              "Restructured around a Grafana Explore rhythm with a left rail, central query workbench, log histogram, and stream view while preserving datasource, tag, and retention operations.",
+            ))}</p>
+          </div>
+          <div class="hero-actions">
+            <button class="button button-primary" type="button" data-panel-target="search">${esc(s("进入 Explore", "Open Explore"))}</button>
+            <button class="button button-warm" type="button" id="refresh-all">${esc(s("刷新", "Refresh"))}</button>
+            <button class="button button-ghost" type="button" data-panel-target="datasources">${esc(s("数据源", "Datasources"))}</button>
+            <div class="locale-switch">
+              <button class="locale-button ${state.locale === "zh" ? "active" : ""}" type="button" data-locale="zh">ZH</button>
+              <button class="locale-button ${state.locale === "en" ? "active" : ""}" type="button" data-locale="en">EN</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="status-stack">
+        <div class="status-card">
+          <div class="status-strip">
+            <span class="status-pill tone-neutral" id="health-pill">${esc(s("健康", "Health"))}: ...</span>
+            <span class="status-pill tone-neutral" id="ready-pill">${esc(s("就绪", "Ready"))}: ...</span>
+          </div>
+          <div class="build-note" id="build-pill">${esc(s("正在读取构建信息...", "Loading build information..."))}</div>
+        </div>
+        <div class="status-card">
+          <h3>${esc(s("当前状态", "Current State"))}</h3>
+          <p>${esc(s("查看依赖就绪、数据源数量和最近一次调试动作。", "Inspect readiness, datasource count, and the latest debugging action."))}</p>
+          <div id="overview-focus">${esc(s("正在读取数据源状态...", "Loading datasource state..."))}</div>
+        </div>
+        <div class="status-card">
+          <h3>${esc(s("推荐流程", "Recommended Flow"))}</h3>
+          <p>${esc(s(
+            "1. 创建并测试数据源 2. 执行一次 Discover 3. 选择目录源和查询源 4. 再叠加服务与标签过滤。",
+            "1. Create and test a datasource 2. Run Discover 3. Choose catalog and search datasources 4. Add service and tag filters.",
+          ))}</p>
+        </div>
+      </div>
+    </header>
+  `;
+}
+
+function renderExploreTabs() {
+  return `
+    <nav class="nav-tabs nav-tabs-explore">
+      <div class="nav-brand">
+        <span class="nav-brand-mark">VL</span>
+        <div class="nav-brand-copy">
+          <strong>VictoriaLogs</strong>
+          <span>${esc(s("Explore 工作区", "Explore workspace"))}</span>
+        </div>
+      </div>
+      <div class="nav-section">
+        <div class="nav-section-title">${esc(s("Explore", "Explore"))}</div>
+        ${exploreNavItem("overview", s("概览", "Overview"), "OV")}
+        ${exploreNavItem("search", s("日志查询", "Logs"), "LG")}
+      </div>
+      <div class="nav-section">
+        <div class="nav-section-title">${esc(s("Manage", "Manage"))}</div>
+        ${exploreNavItem("datasources", s("数据源", "Datasources"), "DS")}
+        ${exploreNavItem("tags", s("标签", "Tags"), "TG")}
+        ${exploreNavItem("retention", s("生命周期", "Retention"), "RT")}
+      </div>
+    </nav>
+  `;
+}
+
+function exploreNavItem(id, label, short) {
+  return `<button class="tab-button ${state.activePanel === id ? "active" : ""}" type="button" data-panel-target="${esc(id)}"><span class="tab-icon">${esc(short)}</span><span>${esc(label)}</span></button>`;
 }
 
 function s(zh, en) {
@@ -819,14 +913,18 @@ async function loadSearchCatalogs() {
   const tagParams = new URLSearchParams({ datasource_id: state.search.catalogDatasourceID });
   if (state.search.service) tagParams.set("service", state.search.service);
 
-  const [servicesResp, tagsResp] = await Promise.all([
+  const [servicesResp, tagsResp] = await Promise.allSettled([
     request("/api/query/services?" + serviceParams.toString()),
     request("/api/query/tags?" + tagParams.toString()),
   ]);
 
-  state.search.services = servicesResp.services || [];
+  state.search.services = servicesResp.status === "fulfilled" ? (servicesResp.value.services || []) : [];
   if (state.search.service && state.search.services.indexOf(state.search.service) === -1) state.search.service = "";
-  state.search.tagCatalog = tagsResp.tags || [];
+  state.search.tagCatalog = tagsResp.status === "fulfilled" ? (tagsResp.value.tags || []) : [];
+  if (tagsResp.status !== "fulfilled") {
+    state.search.activeFilters = {};
+    state.search.tagValues = {};
+  }
   pruneSearchFilters();
   renderSearchControls();
 }
@@ -932,7 +1030,14 @@ function renderSearchDatasourceGrid() {
 
 function renderSearchContext() {
   const catalog = findByID(state.datasources, state.search.catalogDatasourceID);
-  byId("search-context-note").textContent = `${s("已选查询源", "Selected Sources")}: ${state.search.selectedDatasourceIDs.length} · ${s("目录源", "Catalog")}: ${catalog ? catalog.name : s("无", "None")}`;
+  const parts = [
+    `${s("已选查询源", "Selected Sources")}: ${state.search.selectedDatasourceIDs.length}`,
+    `${s("目录源", "Catalog")}: ${catalog ? catalog.name : s("无", "None")}`,
+  ];
+  if (catalog && !state.search.services.length) {
+    parts.push(s("服务目录为空，可先到数据源面板执行 Discover。", "Service catalog is empty. Run Discover from the datasource panel first."));
+  }
+  byId("search-context-note").textContent = parts.join(" · ");
 }
 
 function renderSearchCatalogs() {
@@ -957,7 +1062,7 @@ function renderSearchCatalogs() {
 
 function renderSearchResults() {
   renderSearchSummary();
-  renderSearchHistogram();
+  renderSearchHistogramPanel();
   renderSearchSources();
   renderSearchLevelFilters();
   renderSearchResultsBody();
@@ -982,6 +1087,14 @@ function renderSearchHistogram() {
   const items = buildHistogram(getDecoratedResults());
   byId("search-histogram").innerHTML = items.length
     ? items.map((item) => `<div class="histogram-bar" style="height:${item.height}%" title="${esc(item.title)}" data-count="${esc(String(item.count))}"></div>`).join("")
+    : `<div class="empty-state">${esc(s("还没有执行查询。", "No search has been executed."))}</div>`;
+}
+
+function renderSearchHistogramPanel() {
+  const items = buildHistogram(getDecoratedResults());
+  const total = getDecoratedResults().length;
+  byId("search-histogram").innerHTML = items.length
+    ? `<div class="histogram-track">${items.map((item) => `<div class="histogram-bar" style="height:${item.height}%" title="${esc(item.title)}" data-count="${esc(String(item.count))}"></div>`).join("")}</div><div class="histogram-footer"><span>${esc(s("Logs volume", "Logs volume"))}</span><span class="legend"><span class="legend-swatch" style="background:#aab4c0"></span>${esc(s(`总量 ${total}`, `Total ${total}`))}</span></div>`
     : `<div class="empty-state">${esc(s("还没有执行查询。", "No search has been executed."))}</div>`;
 }
 

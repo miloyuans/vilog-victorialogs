@@ -212,19 +212,25 @@ func (s *Service) ListServices(ctx context.Context, datasourceID string) ([]stri
 		return cached.Services, true, nil
 	}
 
+	if _, err := s.datasources.Get(ctx, datasourceID); err != nil {
+		return nil, false, err
+	}
+
 	entries, err := s.store.ListServiceCatalog(ctx, datasourceID)
 	if err != nil {
 		return nil, false, err
 	}
+	discoveryFailed := false
 	if len(entries) == 0 {
-		if _, err := s.Discover(ctx, datasourceID, "api"); err != nil {
-			if !errors.Is(err, mongostore.ErrNotFound) {
+		if _, err := s.Discover(ctx, datasourceID, "api"); err == nil {
+			entries, err = s.store.ListServiceCatalog(ctx, datasourceID)
+			if err != nil {
 				return nil, false, err
 			}
-		}
-		entries, err = s.store.ListServiceCatalog(ctx, datasourceID)
-		if err != nil {
+		} else if errors.Is(err, mongostore.ErrNotFound) {
 			return nil, false, err
+		} else {
+			discoveryFailed = true
 		}
 	}
 
@@ -235,10 +241,12 @@ func (s *Service) ListServices(ctx context.Context, datasourceID string) ([]stri
 	services = uniqueStrings(services)
 	sort.Strings(services)
 
-	_ = s.cache.Set(ctx, cache.KindServiceList, cacheKey, model.ServiceListResponse{
-		Services: services,
-		CacheHit: false,
-	}, s.cache.ServiceListTTL())
+	if !discoveryFailed {
+		_ = s.cache.Set(ctx, cache.KindServiceList, cacheKey, model.ServiceListResponse{
+			Services: services,
+			CacheHit: false,
+		}, s.cache.ServiceListTTL())
+	}
 
 	return services, false, nil
 }
