@@ -14,6 +14,7 @@
 - Startup discovery plus Telegram notification fallback
 - IP/CIDR whitelist and in-memory rate limiting
 - Audit logging for config mutations and delete actions
+- Embedded web console at `GET /` for datasource, search, tag, and retention debugging
 
 ## Linux Quick Start
 
@@ -43,6 +44,14 @@ make docker-up
 ```
 
 The service listens on `:8080` by default.
+
+Embedded console:
+
+```bash
+curl -I http://127.0.0.1:8080/
+```
+
+Then open `http://127.0.0.1:8080/` in a browser.
 
 ## Linux Operations
 
@@ -90,6 +99,7 @@ See [config.example.yaml](config.example.yaml) for the full config surface.
 - `PUT /api/datasources/:id`
 - `POST /api/datasources/:id/test`
 - `POST /api/datasources/:id/discover`
+- `GET /api/datasources/:id/snapshot`
 - `POST /api/query/search`
 - `GET /api/query/services`
 - `GET /api/query/tags`

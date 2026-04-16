@@ -14,6 +14,7 @@ const readinessCheckTimeout = 2 * time.Second
 
 func (s *Server) registerRoutes() {
 	s.engine.GET("/", s.handleIndex)
+	s.engine.StaticFS("/assets", embeddedStaticFS())
 	s.engine.GET("/healthz", s.handleHealthz)
 	s.engine.GET("/readyz", s.handleReadyz)
 

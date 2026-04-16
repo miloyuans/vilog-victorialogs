@@ -60,7 +60,7 @@ func (s *Service) Update(ctx context.Context, id string, req model.DatasourceUps
 		return model.Datasource{}, err
 	}
 
-	datasource, err := buildDatasource(id, req, existing.CreatedAt)
+	datasource, err := buildDatasource(id, mergeDatasourceRequest(existing, req), existing.CreatedAt)
 	if err != nil {
 		return model.Datasource{}, err
 	}
@@ -71,6 +71,81 @@ func (s *Service) Update(ctx context.Context, id string, req model.DatasourceUps
 	}
 	_ = s.audit(ctx, "datasource", datasource.ID, "update", actor, map[string]any{"name": datasource.Name})
 	return datasource, nil
+}
+
+func mergeDatasourceRequest(existing model.Datasource, req model.DatasourceUpsertRequest) model.DatasourceUpsertRequest {
+	merged := req
+	if strings.TrimSpace(merged.Name) == "" {
+		merged.Name = existing.Name
+	}
+	if strings.TrimSpace(merged.BaseURL) == "" {
+		merged.BaseURL = existing.BaseURL
+	}
+	if merged.Enabled == nil {
+		enabled := existing.Enabled
+		merged.Enabled = &enabled
+	}
+	if merged.TimeoutSeconds <= 0 {
+		merged.TimeoutSeconds = existing.TimeoutSeconds
+	}
+	if merged.SupportsDelete == nil {
+		supportsDelete := existing.SupportsDelete
+		merged.SupportsDelete = &supportsDelete
+	}
+	if merged.Headers == (model.DatasourceHeaders{}) {
+		merged.Headers = existing.Headers
+	}
+
+	if merged.QueryPaths == (model.DatasourceQueryPaths{}) {
+		merged.QueryPaths = existing.QueryPaths
+	} else {
+		if merged.QueryPaths.Query == "" {
+			merged.QueryPaths.Query = existing.QueryPaths.Query
+		}
+		if merged.QueryPaths.FieldNames == "" {
+			merged.QueryPaths.FieldNames = existing.QueryPaths.FieldNames
+		}
+		if merged.QueryPaths.FieldValues == "" {
+			merged.QueryPaths.FieldValues = existing.QueryPaths.FieldValues
+		}
+		if merged.QueryPaths.StreamFieldNames == "" {
+			merged.QueryPaths.StreamFieldNames = existing.QueryPaths.StreamFieldNames
+		}
+		if merged.QueryPaths.StreamFieldValues == "" {
+			merged.QueryPaths.StreamFieldValues = existing.QueryPaths.StreamFieldValues
+		}
+		if merged.QueryPaths.Facets == "" {
+			merged.QueryPaths.Facets = existing.QueryPaths.Facets
+		}
+		if merged.QueryPaths.DeleteRunTask == "" {
+			merged.QueryPaths.DeleteRunTask = existing.QueryPaths.DeleteRunTask
+		}
+		if merged.QueryPaths.DeleteActiveTasks == "" {
+			merged.QueryPaths.DeleteActiveTasks = existing.QueryPaths.DeleteActiveTasks
+		}
+		if merged.QueryPaths.DeleteStopTask == "" {
+			merged.QueryPaths.DeleteStopTask = existing.QueryPaths.DeleteStopTask
+		}
+	}
+
+	if merged.FieldMapping == (model.DatasourceFieldMapping{}) {
+		merged.FieldMapping = existing.FieldMapping
+	} else {
+		if merged.FieldMapping.ServiceField == "" {
+			merged.FieldMapping.ServiceField = existing.FieldMapping.ServiceField
+		}
+		if merged.FieldMapping.PodField == "" {
+			merged.FieldMapping.PodField = existing.FieldMapping.PodField
+		}
+		if merged.FieldMapping.MessageField == "" {
+			merged.FieldMapping.MessageField = existing.FieldMapping.MessageField
+		}
+		if merged.FieldMapping.TimeField == "" {
+			merged.FieldMapping.TimeField = existing.FieldMapping.TimeField
+		}
+	}
+
+	return merged
 }
 
 func (s *Service) Test(ctx context.Context, id string) (model.DatasourceTestResponse, error) {

@@ -8,10 +8,10 @@ servers:
 paths:
   /:
     get:
-      summary: Embedded placeholder page
+      summary: Embedded web console
       responses:
         "200":
-          description: HTML placeholder page
+          description: HTML console page
   /healthz:
     get:
       summary: Liveness probe
@@ -103,6 +103,18 @@ paths:
       responses:
         "200":
           description: Discovery snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiscoveryResponse"
+  /api/datasources/{id}/snapshot:
+    get:
+      summary: Get the latest discovery snapshot for a datasource
+      parameters:
+        - $ref: "#/components/parameters/PathID"
+      responses:
+        "200":
+          description: Latest discovery snapshot
           content:
             application/json:
               schema:

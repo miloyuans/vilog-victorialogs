@@ -49,8 +49,8 @@ func (m *Manager) Reload(ctx context.Context) error {
 func (m *Manager) Stop() context.Context {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.cron == nil {
-		return context.Background()
+	if m.cron == nil || !m.started {
+		return stoppedContext()
 	}
 	m.started = false
 	return m.cron.Stop()
@@ -89,4 +89,10 @@ func (m *Manager) reloadLocked(ctx context.Context) error {
 		m.cron.Start()
 	}
 	return nil
+}
+
+func stoppedContext() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
 }

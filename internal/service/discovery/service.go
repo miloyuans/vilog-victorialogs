@@ -276,6 +276,10 @@ func (s *Service) ListAllTags(ctx context.Context) ([]model.TagDefinition, error
 	return s.store.ListTagDefinitions(ctx)
 }
 
+func (s *Service) GetSnapshot(ctx context.Context, datasourceID string) (model.DatasourceTagSnapshot, error) {
+	return s.store.GetSnapshot(ctx, datasourceID)
+}
+
 func (s *Service) ListTagValues(ctx context.Context, datasourceID, field, serviceName string) ([]string, bool, error) {
 	cacheKey := datasourceID + ":" + field + ":" + serviceName
 	var cached model.TagValuesResponse

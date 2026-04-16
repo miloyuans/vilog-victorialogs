@@ -16,6 +16,7 @@ func (s *Server) registerDatasourceRoutes(api *gin.RouterGroup) {
 	group.PUT("/:id", s.updateDatasource)
 	group.POST("/:id/test", s.testDatasource)
 	group.POST("/:id/discover", s.discoverDatasource)
+	group.GET("/:id/snapshot", s.getDatasourceSnapshot)
 }
 
 func (s *Server) registerQueryRoutes(api *gin.RouterGroup) {
@@ -97,6 +98,15 @@ func (s *Server) discoverDatasource(c *gin.Context) {
 	result, err := s.deps.Discovery.Discover(c.Request.Context(), c.Param("id"), actorFromRequest(c, s.cfg.Security.TrustProxyHeaders))
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "discover_failed", err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, model.DiscoveryResponse{Snapshot: result})
+}
+
+func (s *Server) getDatasourceSnapshot(c *gin.Context) {
+	result, err := s.deps.Discovery.GetSnapshot(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "snapshot_get_failed", err.Error())
 		return
 	}
 	c.JSON(http.StatusOK, model.DiscoveryResponse{Snapshot: result})
