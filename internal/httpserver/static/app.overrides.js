@@ -1414,14 +1414,28 @@ highlight = function (text) {
     return value && typeof value === "object" && !Array.isArray(value) ? value : {};
   }
 
-  const PAGE_SIZE_PRESETS = [100, 200, 500, 1000];
+  const PAGE_SIZE_PRESETS = [100, 200, 500, 1000, 5000, 10000];
   const BACKEND_SEARCH_PAGE_SIZE = 1000;
   const SEARCH_EXPORT_LIMIT = 100000;
+  const MAX_UI_PAGE_SIZE = 10000;
 
   function getResolvedSearchPageSize(value) {
     const candidate = Number(value || state.search && state.search.pageSizeCustom || state.search && state.search.pageSize || 500);
     if (!Number.isFinite(candidate)) return 500;
-    return Math.min(50000, Math.max(50, Math.floor(candidate)));
+    return Math.min(MAX_UI_PAGE_SIZE, Math.max(50, Math.floor(candidate)));
+  }
+
+  function getSearchPageSizeValidation(value) {
+    const raw = String(value == null ? "" : value).trim();
+    if (!raw) return { valid: true, value: getResolvedSearchPageSize(500), raw: "" };
+    const candidate = Number(raw);
+    if (!Number.isFinite(candidate) || candidate <= 0) {
+      return { valid: false, value: getResolvedSearchPageSize(500), raw };
+    }
+    if (candidate > MAX_UI_PAGE_SIZE) {
+      return { valid: false, value: MAX_UI_PAGE_SIZE, raw };
+    }
+    return { valid: true, value: getResolvedSearchPageSize(candidate), raw };
   }
 
   function getActivePageSizeMode() {
@@ -1432,8 +1446,23 @@ highlight = function (text) {
   function resolveSearchPageSizeFromDOM() {
     const select = byId("search-page-size");
     const custom = byId("search-page-size-custom");
-    if (select && select.value === "custom") return getResolvedSearchPageSize(custom && custom.value);
+    if (select && select.value === "custom") return getSearchPageSizeValidation(custom && custom.value).value;
     return getResolvedSearchPageSize(select && select.value);
+  }
+
+  function getSearchPageCount(total, pageSize) {
+    const safeTotal = Math.max(0, Number(total || 0));
+    const safeSize = Math.max(1, getResolvedSearchPageSize(pageSize || state.search && state.search.pageSize || 500));
+    return Math.max(1, Math.ceil(safeTotal / safeSize));
+  }
+
+  function getSearchTotalCount() {
+    const response = safeObject(state.search && state.search.response);
+    return Math.max(Number(response.total || 0), safeArray(response.results).length);
+  }
+
+  function getCurrentExportFormat() {
+    return state.search && state.search.view === "json" ? "json" : "stream";
   }
 
   function getBackendPrimaryQuery(layer) {
@@ -1478,7 +1507,9 @@ highlight = function (text) {
     state.search.page = Math.max(1, Number(state.search.page || 1) || 1);
     state.search.pageSize = getResolvedSearchPageSize(state.search.pageSize || 500);
     state.search.pageSizeCustom = getResolvedSearchPageSize(state.search.pageSizeCustom || state.search.pageSize || 1500);
+    state.search.pageSizeCustomRaw = String(state.search.pageSizeCustomRaw || state.search.pageSizeCustom || 1500);
     state.search.pageSizeMode = String(state.search.pageSizeMode || getActivePageSizeMode());
+    state.search.pageSizeError = !!state.search.pageSizeError;
     if (state.search.pageSizeMode !== "custom" && PAGE_SIZE_PRESETS.indexOf(Number(state.search.pageSizeMode)) >= 0) {
       state.search.pageSize = getResolvedSearchPageSize(state.search.pageSizeMode);
     }
@@ -1855,7 +1886,9 @@ highlight = function (text) {
     const exportBusy = state.search.exporting;
     const pageSize = getResolvedSearchPageSize(state.search.pageSize || 500);
     const pageSizeMode = state.search.pageSizeMode === "custom" ? "custom" : getActivePageSizeMode();
-    const customPageSize = getResolvedSearchPageSize(state.search.pageSizeCustom || pageSize);
+    const customValidation = getSearchPageSizeValidation(state.search.pageSizeCustomRaw || state.search.pageSizeCustom || pageSize);
+    const customPageSize = customValidation.raw || String(getResolvedSearchPageSize(state.search.pageSizeCustom || pageSize));
+    const pageSizeError = pageSizeMode === "custom" && !customValidation.valid;
     const target = byId("search-toolbar-controls");
     if (!target) return;
     syncHiddenQueryInput();
@@ -2509,6 +2542,611 @@ highlight = function (text) {
     const node = byId("search-context-note");
     if (!node) return;
     node.textContent = `${s("查询源", "Sources")}: ${safeArray(state.search.selectedDatasourceIDs).length || "ALL"} · ${s("主目录", "Catalog")}: ${catalog ? catalog.name : s("无", "None")} · ${s("服务", "Services")}: ${serviceLabel} · ${s("标签过滤", "Tag filters")}: ${filters} · ${s("递归过滤层", "Recursive layers")}: ${layers}`;
+  };
+
+  const __baseHandleClick = handleClick;
+  const __baseHandleInput = handleInput;
+  const __baseHandleChange = handleChange;
+
+  renderSelectedMenuTokens = function (items, kind) {
+    const selected = safeArray(items);
+    if (!selected.length) {
+      return `<span class="menu-selection-empty">${esc(s("\u5f53\u524d\u4e3a ALL", "Currently ALL"))}</span>`;
+    }
+    return selected
+      .map((item) => {
+        const label = kind === "datasource" ? item.name : item;
+        const attr = kind === "datasource"
+          ? `data-search-datasource-id="${esc(item.id)}"`
+          : `data-search-service-name="${esc(item)}"`;
+        return `<span class="menu-selection-token">${esc(label)}<button class="menu-token-close" type="button" ${attr} aria-label="${esc(s("\u79fb\u9664", "Remove"))}">x</button></span>`;
+      })
+      .join("");
+  };
+
+  getLayerNote = function (index, layer) {
+    if (index === 0) {
+      return layer.mode === "logsql"
+        ? s("\u7b2c 1 \u5c42\u76f4\u63a5\u53d1\u9001 LogsQL \u5230\u540e\u7aef\u6267\u884c\u3002", "Layer 1 sends LogsQL directly to the backend.")
+        : s("\u7b2c 1 \u5c42\u5148\u6309\u6570\u636e\u6e90 / \u670d\u52a1 / \u65f6\u95f4\u7a97\u53e3\u83b7\u53d6\u7ed3\u679c\uff0c\u5173\u952e\u5b57\u518d\u5728\u672c\u5730\u9012\u5f52\u8fc7\u6ee4\u3002", "Layer 1 fetches the datasource/service/time window first, then applies keyword filtering locally.");
+    }
+    return layer.mode === "logsql"
+      ? s("\u8fd9\u4e00\u5c42\u4f1a\u5728\u5f53\u524d\u7ed3\u679c\u4e0a\u7ee7\u7eed\u505a LogsQL \u6837\u5f0f\u7684\u672c\u5730\u8fc7\u6ee4\u3002", "This layer keeps filtering the current result set with a local LogsQL-style matcher.")
+      : s("\u8fd9\u4e00\u5c42\u4ec5\u5728\u4e0a\u4e00\u5c42\u7ed3\u679c\u4e0a\u9012\u5f52\u8fc7\u6ee4\uff1bShift+Enter \u6362\u884c\uff0cEnter \u76f4\u63a5\u67e5\u8be2\u3002", "This layer recursively filters the previous result set; Shift+Enter inserts a line break and Enter runs the query.");
+  };
+
+  renderQueryLayer = function (layer, index) {
+    const title = index === 0
+      ? s("\u4e3b\u67e5\u8be2", "Primary Query")
+      : s("\u9012\u5f52\u8fc7\u6ee4 " + index, "Recursive Filter " + index);
+    return `
+      <div class="query-layer-card" data-query-layer-card="${esc(layer.id)}">
+        <div class="query-layer-head">
+          <div class="query-layer-copy">
+            <strong>${esc(title)}</strong>
+            <span>${esc(getLayerNote(index, layer))}</span>
+          </div>
+          <div class="query-layer-actions">
+            ${layer.mode === "keyword" ? `<div class="mode-switch query-operator-switch"><button class="mode-button ${layer.operator !== "or" ? "active" : ""}" type="button" data-query-operator="and" data-layer-id="${esc(layer.id)}">AND</button><button class="mode-button ${layer.operator === "or" ? "active" : ""}" type="button" data-query-operator="or" data-layer-id="${esc(layer.id)}">OR</button></div>` : ""}
+            <div class="mode-switch query-mode-switch">
+              <button class="mode-button ${layer.mode === "keyword" ? "active" : ""}" type="button" data-query-layer-mode="keyword" data-layer-id="${esc(layer.id)}">${esc(s("\u5173\u952e\u8bcd", "Keyword"))}</button>
+              <button class="mode-button ${layer.mode === "logsql" ? "active" : ""}" type="button" data-query-layer-mode="logsql" data-layer-id="${esc(layer.id)}">LogsQL</button>
+            </div>
+            ${index > 0 ? `<button class="icon-button" type="button" data-action="remove-query-layer" data-layer-id="${esc(layer.id)}">x</button>` : ""}
+          </div>
+        </div>
+        <textarea class="query-layer-input" data-query-layer-input="${esc(layer.id)}" rows="${index === 0 ? "3" : "2"}" placeholder="${esc(getLayerPlaceholder(layer, index))}">${esc(layer.value || "")}</textarea>
+        <div class="query-layer-foot">
+          <span>${esc(index === 0 ? s("Enter \u76f4\u63a5\u67e5\u8be2\uff0cShift+Enter \u6362\u884c\u3002", "Press Enter to run and Shift+Enter for a line break.") : s("\u8fd9\u4e00\u5c42\u4ec5\u4f5c\u7528\u4e8e\u4e0a\u4e00\u5c42\u7ed3\u679c\uff0c\u4e0d\u4f1a\u91cd\u65b0\u5411\u540e\u7aef\u53d1\u8d77\u8bf7\u6c42\u3002", "This layer filters the previous result set locally without sending a new backend request."))}</span>
+        </div>
+      </div>
+    `;
+  };
+
+  buildCurrentSearchPayload = function (page, pageSize) {
+    normalizeFrontendCollections();
+    syncHiddenQueryInput();
+    const primaryLayer = getPrimaryLayer();
+    return {
+      keyword: primaryLayer.mode === "logsql" ? getBackendPrimaryQuery(primaryLayer) : "",
+      start: localToRFC3339((byId("search-start") && byId("search-start").value) || ""),
+      end: localToRFC3339((byId("search-end") && byId("search-end").value) || ""),
+      datasource_ids: safeArray(state.search.selectedDatasourceIDs).slice(),
+      service_names: safeArray(state.search.serviceNames).slice(),
+      tags: normalizeFilters(state.search.activeFilters),
+      page: Number(page || state.search.page || 1),
+      page_size: getResolvedSearchPageSize(pageSize || state.search.pageSize || 500),
+      use_cache: state.search.useCache !== false,
+    };
+  };
+
+  renderSearchCatalogDatasourceOptions = function () {
+    normalizeFrontendCollections();
+    const trigger = byId("search-datasource-trigger");
+    const menu = byId("search-datasource-menu");
+    if (trigger) trigger.textContent = getSearchDatasourceLabel();
+    if (!menu) return;
+    const allItems = safeArray(state.datasources);
+    const items = filteredMenuDatasources();
+    if (!allItems.length) {
+      menu.innerHTML = empty(s("\u6682\u65e0\u6570\u636e\u6e90\u3002", "No datasource."));
+      return;
+    }
+    const selectedItems = allItems.filter((item) => safeArray(state.search.selectedDatasourceIDs).indexOf(item.id) >= 0);
+    menu.innerHTML = `
+      <div class="toolbar-menu-section">
+        <div class="menu-section-title">${esc(s("\u67e5\u8be2\u6570\u636e\u6e90", "Search Datasources"))}</div>
+        <div class="menu-search-row">
+          <input class="menu-search-input" id="search-datasource-menu-search" type="search" placeholder="${esc(s("\u6a21\u7cca\u5339\u914d\u6570\u636e\u6e90\u540d\u79f0 / \u5730\u5740 / ID", "Fuzzy-match datasource name / URL / ID"))}" value="${esc(getMenuSearchValue("datasource"))}" />
+          <div class="menu-selection-strip compact">${renderSelectedMenuTokens(selectedItems, "datasource")}</div>
+        </div>
+        <div class="menu-action-row">
+          <button class="chip-button ${safeArray(state.search.selectedDatasourceIDs).length >= allItems.length ? "active" : ""}" type="button" data-search-datasource-all="1">ALL</button>
+          <span class="menu-meta-tip">${esc(s("\u652f\u6301\u591a\u9009\uff0c\u9ed8\u8ba4 ALL\u3002", "Multi-select supported, default ALL."))}</span>
+        </div>
+        <div class="menu-check-list">${items.length ? items.map((item) => {
+          const selected = safeArray(state.search.selectedDatasourceIDs).indexOf(item.id) >= 0;
+          const isCatalog = item.id === state.search.catalogDatasourceID;
+          return `<button class="menu-check-item ${selected ? "active" : ""}" type="button" data-search-datasource-id="${esc(item.id)}"><span class="menu-check-indicator">${selected ? "&#10003;" : ""}</span><span class="menu-check-main"><strong>${esc(item.name)}</strong><small>${esc(item.base_url || "-")}</small></span><span class="menu-check-meta">${pill(isCatalog ? s("\u4e3b\u76ee\u5f55", "Catalog") : item.enabled ? s("\u542f\u7528", "Enabled") : s("\u505c\u7528", "Disabled"), isCatalog ? "tone-neutral" : item.enabled ? "tone-ok" : "tone-warn")}</span></button>`;
+        }).join("") : empty(s("\u6ca1\u6709\u5339\u914d\u5f53\u524d\u5173\u952e\u5b57\u7684\u6570\u636e\u6e90\u3002", "No datasource matches the current keyword."))}</div>
+      </div>
+    `;
+  };
+
+  renderSearchServiceOptions = function () {
+    normalizeFrontendCollections();
+    const trigger = byId("search-service-trigger");
+    const menu = byId("search-service-menu");
+    if (trigger) trigger.textContent = getSearchServiceLabel();
+    if (!menu) return;
+    if (!state.search.catalogDatasourceID) {
+      menu.innerHTML = empty(s("\u5148\u9009\u62e9\u6570\u636e\u6e90\u3002", "Pick a datasource first."));
+      return;
+    }
+    const services = safeArray(state.search.services);
+    const items = filteredMenuServices();
+    if (!services.length) {
+      menu.innerHTML = empty(s("\u670d\u52a1\u76ee\u5f55\u4e3a\u7a7a\uff0c\u8bf7\u5148\u6267\u884c Discover\u3002", "Service catalog is empty. Run Discover first."));
+      return;
+    }
+    menu.innerHTML = `
+      <div class="toolbar-menu-section">
+        <div class="menu-section-title">${esc(s("\u670d\u52a1\u76ee\u5f55", "Service Catalog"))}</div>
+        <div class="menu-search-row">
+          <input class="menu-search-input" id="search-service-menu-search" type="search" placeholder="${esc(s("\u6a21\u7cca\u5339\u914d\u670d\u52a1\u540d\u79f0", "Fuzzy-match service name"))}" value="${esc(getMenuSearchValue("service"))}" />
+          <div class="menu-selection-strip compact">${renderSelectedMenuTokens(safeArray(state.search.serviceNames), "service")}</div>
+        </div>
+        <div class="menu-action-row">
+          <button class="chip-button ${safeArray(state.search.serviceNames).length === 0 || safeArray(state.search.serviceNames).length >= services.length ? "active" : ""}" type="button" data-search-service-all="1">ALL</button>
+          <span class="menu-meta-tip">${esc(s("\u670d\u52a1\u5217\u8868\u4f1a\u6839\u968f\u6570\u636e\u6e90\u81ea\u52a8\u5237\u65b0\u5e76\u53bb\u91cd\u3002", "The service list follows the selected datasources and is automatically deduplicated."))}</span>
+        </div>
+        <div class="menu-check-list">${items.length ? items.map((name) => {
+          const selected = safeArray(state.search.serviceNames).indexOf(name) >= 0;
+          return `<button class="menu-check-item ${selected ? "active" : ""}" type="button" data-search-service-name="${esc(name)}"><span class="menu-check-indicator">${selected ? "&#10003;" : ""}</span><span class="menu-check-main"><strong>${esc(name)}</strong><small>${esc(s("\u5355\u9009\u3001\u591a\u9009\u6216 ALL\u90fd\u53ef\u4ee5\u3002", "Single, multi-select, or ALL are all supported."))}</small></span></button>`;
+        }).join("") : empty(s("\u6ca1\u6709\u5339\u914d\u5f53\u524d\u5173\u952e\u5b57\u7684\u670d\u52a1\u3002", "No service matches the current keyword."))}</div>
+      </div>
+    `;
+  };
+
+  renderSearchContext = function () {
+    normalizeFrontendCollections();
+    const catalog = findByID(state.datasources, state.search.catalogDatasourceID);
+    const serviceLabel = safeArray(state.search.serviceNames).length
+      ? `${state.search.serviceNames.length} ${s("\u4e2a\u670d\u52a1", "services")}`
+      : s("ALL \u670d\u52a1", "ALL services");
+    const filters = Object.keys(normalizeFilters(state.search.activeFilters)).length;
+    const layers = safeArray(state.search.queryLayers).filter((layer) => String(layer && layer.value || "").trim()).length;
+    const node = byId("search-context-note");
+    if (!node) return;
+    node.textContent = `${s("\u67e5\u8be2\u6e90", "Sources")}: ${safeArray(state.search.selectedDatasourceIDs).length || "ALL"} / ${s("\u4e3b\u76ee\u5f55", "Catalog")}: ${catalog ? catalog.name : s("\u65e0", "None")} / ${s("\u670d\u52a1", "Services")}: ${serviceLabel} / ${s("\u6807\u7b7e\u8fc7\u6ee4", "Tag filters")}: ${filters} / ${s("\u9012\u5f52\u8fc7\u6ee4\u5c42", "Recursive layers")}: ${layers}`;
+  };
+
+  renderSearchLevelFilters = function () {
+    const counts = countLevels(getDecoratedResults());
+    const target = byId("search-level-filters");
+    if (!target) return;
+    const buttons = [`<button class="chip-button ${state.search.levelFilter === "all" ? "active" : ""}" type="button" data-level-filter="all">${esc(s("\u5168\u90e8", "All"))} / ${esc(String(getDecoratedResults().length))}</button>`];
+    Object.keys(counts).forEach((level) => {
+      buttons.push(`<button class="chip-button ${state.search.levelFilter === level ? "active" : ""}" type="button" data-level-filter="${esc(level)}">${esc(level.toUpperCase())} / ${esc(String(counts[level]))}</button>`);
+    });
+    target.innerHTML = `<div class="inline-filter-title">${esc(s("\u7ea7\u522b", "Levels"))}</div><div class="chip-row compact-chip-row">${buttons.join("")}</div>`;
+  };
+
+  renderSearchHighlightPalette = function () {
+    const target = byId("search-highlight-palette");
+    if (!target) return;
+    const tones = [
+      { id: "yellow", label: s("\u9ec4\u8272", "Yellow") },
+      { id: "green", label: s("\u7eff\u8272", "Green") },
+      { id: "red", label: s("\u7ea2\u8272", "Red") },
+      { id: "purple", label: s("\u7d2b\u8272", "Purple") }
+    ];
+    target.innerHTML = `<div class="inline-filter-title">${esc(s("\u9ad8\u4eae", "Highlight"))}</div><div class="highlight-palette compact-highlight-palette">${tones.map((tone) => `<button class="highlight-tone-button ${state.search.highlightTone === tone.id ? "active" : ""}" type="button" data-highlight-tone="${esc(tone.id)}"><span class="highlight-tone-preview tone-${esc(tone.id)}"></span>${esc(tone.label)}</button>`).join("")}</div>`;
+  };
+
+  function getSearchPageSizeFromState() {
+    const mode = state.search.pageSizeMode === "custom" ? "custom" : getActivePageSizeMode();
+    const validation = mode === "custom"
+      ? getSearchPageSizeValidation(state.search.pageSizeCustomRaw || state.search.pageSizeCustom || state.search.pageSize || 500)
+      : { valid: true, value: getResolvedSearchPageSize(state.search.pageSize || mode) };
+    return {
+      mode,
+      valid: !!validation.valid,
+      value: getResolvedSearchPageSize(validation.value),
+      raw: validation.raw || String(validation.value),
+    };
+  }
+
+  async function runSearchWindow(pageOverride, options) {
+    normalizeFrontendCollections();
+    syncHiddenQueryInput();
+    if (!safeArray(state.search.selectedDatasourceIDs).length) {
+      toast(s("\u8bf7\u5148\u9009\u62e9\u81f3\u5c11\u4e00\u4e2a\u67e5\u8be2\u6570\u636e\u6e90\u3002", "Select at least one search datasource."), "error");
+      return false;
+    }
+    const pageInfo = getSearchPageSizeFromState();
+    if (!pageInfo.valid) {
+      state.search.pageSizeError = true;
+      renderSearchToolbar();
+      toast(s("\u81ea\u5b9a\u4e49\u6761\u6570\u6700\u5927\u4e0d\u80fd\u8d85\u8fc7 10000\u3002", "Custom rows cannot exceed 10000."), "error");
+      return false;
+    }
+    const page = Math.max(1, Number(pageOverride || (byId("search-page") && byId("search-page").value) || state.search.page || 1) || 1);
+    state.search.page = page;
+    state.search.pageSize = pageInfo.value;
+    state.search.pageSizeCustom = pageInfo.mode === "custom" ? pageInfo.value : state.search.pageSizeCustom;
+    state.search.pageSizeCustomRaw = pageInfo.raw;
+    state.search.pageSizeMode = pageInfo.mode;
+    state.search.useCache = byId("search-use-cache") ? byId("search-use-cache").checked : true;
+    if (byId("search-page")) byId("search-page").value = String(page);
+    setSearchLoading(true);
+    try {
+      const response = safeObject(await requestSearchWindow(page, pageInfo.value));
+      response.results = safeArray(response.results);
+      response.sources = safeArray(response.sources);
+      response.total = Math.max(Number(response.total || 0), response.results.length);
+      state.search.response = response;
+      state.search.levelFilter = state.search.levelFilter || "all";
+      state.search.exportStatusTone = "idle";
+      state.search.exportStatusText = s("\u5c31\u7eea", "Ready");
+      const results = getVisibleResults();
+      state.search.selectedResultKey = results[0] ? String(results[0]._index) : "";
+      state.ui.detailOpen = false;
+      renderSearchControls();
+      renderSearchResults();
+      if (!(options && options.silentSuccess)) {
+        toast(results.length ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\u3002", "Search completed.") : s("\u67e5\u8be2\u5b8c\u6210\uff0c\u4f46\u5f53\u524d\u6761\u4ef6\u4e0b\u6ca1\u6709\u6570\u636e\u3002", "Search completed, but no data matched the current filters."), results.length ? "success" : "info");
+      }
+      return true;
+    } catch (error) {
+      toast(error.message || String(error), "error");
+      return false;
+    } finally {
+      setSearchLoading(false);
+    }
+  }
+
+  async function navigateSearchPage(delta) {
+    normalizeFrontendCollections();
+    if (!state.search.response) return;
+    const currentPage = Math.max(1, Number(state.search.page || 1) || 1);
+    const pageSize = getSearchPageSizeFromState().value;
+    const pageCount = getSearchPageCount(getSearchTotalCount(), pageSize);
+    if (delta < 0 && currentPage <= 1) {
+      toast(s("\u5df2\u7ecf\u662f\u7b2c\u4e00\u9875\u3002", "Already on the first page."), "info");
+      return;
+    }
+    if (delta > 0 && currentPage >= pageCount) {
+      toast(s("\u5df2\u7ecf\u662f\u6700\u540e\u4e00\u9875\u3002", "Already on the last page."), "info");
+      return;
+    }
+    await runSearchWindow(currentPage + delta, { silentSuccess: true });
+  }
+
+  function exportCurrentSearchResults() {
+    return runExport(getCurrentExportFormat(), { all: true });
+  }
+
+  fetchAllResultsForExport = async function () {
+    normalizeFrontendCollections();
+    const hardLimit = SEARCH_EXPORT_LIMIT;
+    const exportPageSize = Math.min(1000, Math.max(200, Number(state.search.pageSize || 500)));
+    let page = 1;
+    let merged = [];
+    let total = 0;
+    while (page <= 200) {
+      const payload = buildCurrentSearchPayload(page, exportPageSize);
+      const response = await request("/api/query/search", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      const rows = safeArray(response && response.results);
+      total = Number(response && response.total || total || 0);
+      if (!rows.length) break;
+      merged = merged.concat(rows);
+      if ((total && merged.length >= total) || rows.length < exportPageSize) break;
+      if (merged.length >= hardLimit) {
+        toast(
+          s("\u5bfc\u51fa\u7ed3\u679c\u8fc7\u5927\uff0c\u5df2\u622a\u65ad\u5230\u524d 100000 \u6761\u3002\u5efa\u8bae\u5148\u7f29\u5c0f\u67e5\u8be2\u8303\u56f4\u3002", "Export is too large. Truncated to the first 100,000 rows. Narrow the query for a full export."),
+          "info",
+        );
+        break;
+      }
+      page += 1;
+    }
+    return applyClientSideResultFilters(merged);
+  };
+
+  renderSearchSummary = function () {
+    normalizeFrontendCollections();
+    const raw = getRawDecoratedResults();
+    const filtered = getDecoratedResults();
+    const visible = getVisibleResults();
+    const response = safeObject(state.search.response);
+    const total = Math.max(Number(response.total || 0), raw.length);
+    const target = byId("search-summary");
+    if (!target) return;
+    target.innerHTML = [
+      summaryTile(s("\u603b\u7ed3\u679c\u6570", "Total Results"), String(total), s("\u5f53\u524d\u67e5\u8be2\u65f6\u95f4\u8303\u56f4\u5185\u7684\u603b\u7ed3\u679c\u6570", "Total rows available inside the current query window")),
+      summaryTile(s("\u9012\u5f52\u8fc7\u6ee4\u540e", "After Recursive Filters"), String(filtered.length), s("\u5e94\u7528\u9012\u5f52\u8fc7\u6ee4\u5c42\u4e4b\u540e\u4fdd\u7559\u4e0b\u6765\u7684\u7ed3\u679c\u6570", "Rows remaining after recursive filter layers")),
+      summaryTile(s("\u5f53\u524d\u53ef\u89c1", "Currently Visible"), String(visible.length), s("\u5f53\u524d\u9875\u5185\u5b9e\u9645\u663e\u793a\u7684\u7ed3\u679c\u6570", "Rows actually visible inside the current page")),
+      summaryTile(s("\u7f13\u5b58 / \u90e8\u5206\u6210\u529f", "Cache / Partial"), `${response.cache_hit ? s("\u547d\u4e2d", "Hit") : s("\u672a\u547d\u4e2d", "Miss")} / ${response.partial ? s("\u662f", "Yes") : "OK"}`, `${s("\u8017\u65f6", "Took")}: ${response.took_ms || 0}ms`)
+    ].join("");
+  };
+
+  renderSearchToolbar = function () {
+    normalizeFrontendCollections();
+    const selectedCount = safeArray(state.search.selectedDatasourceIDs).length;
+    const serviceCount = safeArray(state.search.serviceNames).length;
+    const resultCount = getVisibleResults().length;
+    const exportBusy = state.search.exporting;
+    const pageInfo = getSearchPageSizeFromState();
+    const target = byId("search-toolbar-controls");
+    if (!target) return;
+    syncHiddenQueryInput();
+    target.innerHTML = `
+      <div class="search-toolbar-row search-toolbar-row-primary">
+        <div class="toolbar-cluster toolbar-cluster-left">
+          <button class="toolbar-trigger toolbar-trigger-select" type="button" data-open-menu="datasource">
+            <span class="toolbar-trigger-label">${esc(s("\u6570\u636e\u6e90", "Datasource"))}</span>
+            <strong id="search-datasource-trigger">${esc(getSearchDatasourceLabel())}</strong>
+          </button>
+          <button class="toolbar-trigger toolbar-trigger-select" type="button" data-open-menu="service">
+            <span class="toolbar-trigger-label">${esc(s("\u670d\u52a1\u76ee\u5f55", "Service Catalog"))}</span>
+            <strong id="search-service-trigger">${esc(getSearchServiceLabel())}</strong>
+          </button>
+        </div>
+        <div class="toolbar-cluster toolbar-cluster-right">
+          <button class="toolbar-trigger toolbar-trigger-time" type="button" data-open-menu="time">
+            <span class="toolbar-trigger-label">${esc(s("\u65f6\u95f4\u8303\u56f4", "Time Range"))}</span>
+            <strong id="search-time-trigger">${esc(getSearchTimeLabel())}</strong>
+          </button>
+          <label class="toolbar-inline-field">
+            <span>${esc(s("\u9875\u7801", "Page"))}</span>
+            <input id="search-page" type="number" min="1" step="1" value="${esc(String(state.search.page || 1))}" />
+          </label>
+          <label class="toolbar-inline-field">
+            <span>${esc(s("\u6761\u6570", "Rows"))}</span>
+            <select id="search-page-size">
+              <option value="100" ${pageInfo.mode === "100" ? "selected" : ""}>100</option>
+              <option value="200" ${pageInfo.mode === "200" ? "selected" : ""}>200</option>
+              <option value="500" ${pageInfo.mode === "500" ? "selected" : ""}>500</option>
+              <option value="1000" ${pageInfo.mode === "1000" ? "selected" : ""}>1000</option>
+              <option value="5000" ${pageInfo.mode === "5000" ? "selected" : ""}>5000</option>
+              <option value="10000" ${pageInfo.mode === "10000" ? "selected" : ""}>10000</option>
+              <option value="custom" ${pageInfo.mode === "custom" ? "selected" : ""}>Custom</option>
+            </select>
+            <input id="search-page-size-custom" class="${pageInfo.mode === "custom" ? "" : "is-hidden"} ${!pageInfo.valid ? "field-error" : ""}" type="number" min="50" max="${MAX_UI_PAGE_SIZE}" step="50" value="${pageInfo.mode === "custom" ? esc(String(pageInfo.raw)) : ""}" placeholder="Custom" />
+          </label>
+          <label class="toolbar-inline-check">
+            <input id="search-use-cache" type="checkbox" ${state.search.useCache === false ? "" : "checked"} />
+            ${esc(s("\u7f13\u5b58", "Cache"))}
+          </label>
+          <button class="button button-small button-ghost" type="button" id="search-refresh-catalogs">${esc(s("\u5237\u65b0", "Refresh"))}</button>
+          <button class="button button-small button-muted" type="button" id="search-clear-filters">${esc(s("\u6e05\u7a7a", "Clear"))}</button>
+          <button class="button button-small button-primary" type="submit" id="search-submit">${esc(s("\u6267\u884c\u67e5\u8be2", "Run Query"))}</button>
+        </div>
+      </div>
+      <div class="search-toolbar-row search-toolbar-row-query">
+        <div class="query-composer">
+          <div class="query-composer-head">
+            <div class="query-composer-copy">
+              <strong>${esc(s("\u5173\u952e\u5b57 / LogsQL \u9012\u5f52\u8fc7\u6ee4\u5668", "Keyword / LogsQL Recursive Filters"))}</strong>
+              <span class="query-composer-hint">${esc(s("\u5148\u786e\u5b9a\u6570\u636e\u6e90\u548c\u670d\u52a1\uff0c\u518d\u901a\u8fc7\u4e3b\u67e5\u8be2\u547d\u4e2d\u7ed3\u679c\uff0c\u540e\u7eed\u5c42\u6309\u987a\u5e8f\u7ee7\u7eed\u8fc7\u6ee4\u3002", "Pick datasources and services first, then run the primary query and keep narrowing with recursive filters."))}</span>
+            </div>
+            <div class="query-composer-toolbar">
+              <div id="search-level-filters" class="inline-dock-block"></div>
+              <div id="search-highlight-palette" class="inline-dock-block"></div>
+              <button class="button button-small" type="button" data-action="add-query-layer">${esc(s("\u6dfb\u52a0\u8fc7\u6ee4\u5c42", "Add Filter Layer"))}</button>
+            </div>
+          </div>
+          <div class="query-layer-stack">${safeArray(state.search.queryLayers).map((layer, index) => renderQueryLayer(layer, index)).join("")}</div>
+        </div>
+      </div>
+      <div class="search-toolbar-row search-toolbar-row-context">
+        <div class="search-context-line" id="search-context-note"></div>
+      </div>
+      <div class="search-toolbar-row search-toolbar-row-mini-meta">
+        <div class="toolbar-mini-meta">${esc(s("\u67e5\u8be2\u6570\u636e\u6e90", "Query datasources"))}: ${esc(String(selectedCount || "ALL"))}</div>
+        <div class="toolbar-mini-meta">${esc(s("\u670d\u52a1\u76ee\u5f55", "Services"))}: ${esc(String(serviceCount || "ALL"))}</div>
+        <div class="toolbar-mini-meta">${esc(s("\u5f53\u524d\u53ef\u89c1", "Visible"))}: ${esc(String(resultCount))}</div>
+        <div class="toolbar-mini-meta">${esc(s("\u5bfc\u51fa\u72b6\u6001", "Export"))}: ${esc(exportBusy ? s("\u5bfc\u51fa\u4e2d", "Exporting") : s("\u5c31\u7eea", "Ready"))}</div>
+        ${!pageInfo.valid ? `<div class="toolbar-mini-meta tone-warn">${esc(s("\u81ea\u5b9a\u4e49\u6761\u6570\u6700\u5927\u4e0d\u80fd\u8d85\u8fc7 10000", "Custom rows cannot exceed 10000"))}</div>` : ""}
+      </div>
+    `;
+  };
+
+  renderSearchMarkup = function () {
+    normalizeFrontendCollections();
+    return `
+      <div class="query-shell query-shell-compact">
+        <div class="search-toolbar-sticky">
+          <div class="card search-toolbar-card">
+            <div class="card-body compact-card-body">
+              <form id="search-form" class="search-toolbar search-toolbar-compact">
+                <div id="search-toolbar-controls"></div>
+                <div class="toolbar-menu-layer">
+                  <div class="toolbar-menu-panel" id="search-datasource-menu"></div>
+                  <div class="toolbar-menu-panel" id="search-service-menu"></div>
+                  <div class="toolbar-menu-panel" id="search-time-menu">
+                    <div class="toolbar-menu-section">
+                      <div class="menu-section-title">${esc(s("\u5feb\u6377\u65f6\u95f4", "Presets"))}</div>
+                      <div class="quick-range-grid">${rangeButtonRow()}</div>
+                    </div>
+                    <div class="toolbar-menu-section">
+                      <div class="menu-section-title">${esc(s("\u81ea\u5b9a\u4e49\u65f6\u95f4", "Custom Range"))}</div>
+                      <div class="field-grid compact search-time-grid">
+                        <div class="field"><label for="search-start-custom">${esc(s("\u5f00\u59cb", "Start"))}</label><input id="search-start-custom" type="datetime-local" /></div>
+                        <div class="field"><label for="search-end-custom">${esc(s("\u7ed3\u675f", "End"))}</label><input id="search-end-custom" type="datetime-local" /></div>
+                      </div>
+                      <div class="form-actions"><button class="button button-small button-primary" type="button" data-action="apply-custom-time">${esc(s("\u5e94\u7528\u81ea\u5b9a\u4e49\u65f6\u95f4", "Apply Custom Range"))}</button></div>
+                    </div>
+                  </div>
+                </div>
+                <div class="hidden-time-inputs">
+                  <input id="search-start" type="datetime-local" />
+                  <input id="search-end" type="datetime-local" />
+                  <textarea id="search-keyword" rows="1"></textarea>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+        <div class="card search-workbench-card">
+          <div class="card-body compact-card-body workbench-card-body">
+            <div class="search-workbench ${state.ui.railCollapsed ? "rail-collapsed" : ""}">
+              <aside class="search-rail" id="search-rail">
+                <div class="search-rail-head">
+                  <button class="icon-button" type="button" data-toggle-rail="1">${esc(state.ui.railCollapsed ? ">" : "<")}</button>
+                  <div class="search-rail-copy"><strong>${esc(s("\u7ed3\u679c\u5de5\u5177", "Result Tools"))}</strong><span>${esc(s("\u89c6\u56fe\u3001\u6807\u7b7e", "Views and tags"))}</span></div>
+                </div>
+                <div class="search-rail-body">
+                  <div class="search-rail-actions">
+                    <div class="mode-switch">${viewButton("table", s("\u8868\u683c", "Table"))}${viewButton("list", s("\u65e5\u5fd7\u6d41", "Stream"))}${viewButton("json", "JSON")}</div>
+                    <button class="mode-button ${state.search.wrap ? "active" : ""}" type="button" id="search-wrap-toggle">${esc(s("\u81ea\u52a8\u6298\u53e0", "Clamp"))}</button>
+                  </div>
+                  <div class="search-rail-section"><div class="search-rail-section-title">${esc(s("\u5f53\u524d\u8fc7\u6ee4", "Active Filters"))}</div><div id="search-active-filters"></div></div>
+                  <div class="search-rail-section"><div class="search-rail-section-title">${esc(s("\u6807\u7b7e\u76ee\u5f55", "Tag Catalog"))}</div><div class="tag-grid search-tag-grid" id="search-tag-catalog"></div></div>
+                </div>
+              </aside>
+              <section class="search-main">
+                <div class="summary-strip summary-strip-compact" id="search-summary"></div>
+                <div class="card search-panel search-panel-volume"><div class="card-body compact-card-body"><div class="section-head search-panel-head"><div><h3 class="card-title">Logs volume</h3><p>${esc(s("\u67f1\u72b6\u56fe\u53ea\u4fdd\u7559\u8d8b\u52bf\u6982\u89c8\uff0c\u628a\u66f4\u591a\u7a7a\u95f4\u8ba9\u7ed9\u65e5\u5fd7\u5185\u5bb9\u3002", "The histogram stays compact so the log results keep most of the screen."))}</p></div></div><div id="search-histogram"></div><div class="divider"></div><div class="source-grid compact-source-grid" id="search-source-grid"></div></div></div>
+                <div class="card search-panel search-panel-results"><div class="card-body compact-card-body"><div class="section-head search-panel-head"><div><h3 class="card-title">${esc(s("\u65e5\u5fd7\u7ed3\u679c", "Logs"))}</h3><p>${esc(s("\u4e3b\u7a97\u53e3\u4fdd\u6301\u7d27\u51d1\u6d4f\u89c8\uff0c\u7ffb\u9875\u901a\u8fc7\u900f\u660e\u60ac\u6d6e\u533a\u57df\u5feb\u901f\u5207\u6362\u3002", "The main window stays compact and pages switch through transparent hover zones."))}</p></div></div><div id="search-results-body"></div></div></div>
+              </section>
+            </div>
+          </div>
+        </div>
+        <div id="search-detail-modal"></div>
+        <div id="floating-export-dock"></div>
+        <div class="search-loading-overlay" id="search-loading-overlay"><div class="search-loading-dialog"><div class="search-loading-spinner"></div><strong>${esc(s("\u6b63\u5728\u5237\u65b0\u67e5\u8be2\u7ed3\u679c", "Refreshing Query Results"))}</strong><span>${esc(s("\u8bf7\u7a0d\u5019\uff0c\u4e3b\u5de5\u4f5c\u53f0\u4f1a\u5728\u67e5\u8be2\u5b8c\u6210\u540e\u6062\u590d\u4ea4\u4e92\u3002", "Please wait while the workbench refreshes the result set."))}</span></div></div>
+      </div>
+    `;
+  };
+
+  renderSearchResultsBody = function () {
+    const node = byId("search-results-body");
+    if (!node) return;
+    if (!state.search.response) {
+      node.innerHTML = empty(s("\u8fd8\u6ca1\u6709\u6267\u884c\u67e5\u8be2\u3002", "No search has been executed."));
+      return;
+    }
+    const results = getVisibleResults();
+    ensureSelectedResult(results);
+    const total = getSearchTotalCount();
+    const pageSize = getSearchPageSizeFromState().value;
+    const pageCount = getSearchPageCount(total, pageSize);
+    const page = Math.max(1, Number(state.search.page || 1) || 1);
+    let content = "";
+    if (!results.length) {
+      content = empty(s("\u5f53\u524d\u6761\u4ef6\u4e0b\u6ca1\u6709\u65e5\u5fd7\u7ed3\u679c\u3002", "No logs matched the current query."));
+    } else if (state.search.view === "json") {
+      content = `<div class="raw-view compact-raw-view"><pre>${esc(JSON.stringify(results.map(stripRuntimeFields), null, 2))}</pre></div>`;
+    } else if (state.search.view === "table") {
+      content = `<div class="table-wrap table-wrap-compact"><table class="log-results-table"><thead><tr><th>${esc(s("\u65f6\u95f4", "Timestamp"))}</th><th>${esc(s("\u6570\u636e\u6e90", "Datasource"))}</th><th>${esc(s("\u670d\u52a1", "Service"))}</th><th>${esc(s("\u7ea7\u522b", "Level"))}</th><th>${esc(s("\u65e5\u5fd7\u5185\u5bb9", "Message"))}</th><th>${esc(s("\u64cd\u4f5c", "Action"))}</th></tr></thead><tbody>${results.map((item) => `<tr class="${String(item._index) === state.search.selectedResultKey ? "active" : ""}"><td>${esc(formatDate(item.timestamp))}</td><td>${esc(item.datasource || "-")}</td><td>${esc(item.service || "-")}</td><td>${pill(item._level.toUpperCase(), levelTone(item._level))}</td><td><div class="log-cell-message ${state.search.wrap ? "clamped" : ""}" title="${esc(item.message || "")}">${highlight(item.message || "", "")}</div></td><td><button class="button button-small" type="button" data-select-result="${esc(String(item._index))}">${esc(s("\u8be6\u60c5", "Detail"))}</button></td></tr>`).join("")}</tbody></table></div>`;
+    } else {
+      content = `<div class="logs-list compact-logs-list">${results.map(renderLogEntry).join("")}</div>`;
+    }
+    node.innerHTML = `
+      <div class="results-viewport">
+        <div class="results-page-indicator">${esc(s("\u7b2c", "Page"))} ${esc(String(page))} / ${esc(String(pageCount))}</div>
+        <button class="result-page-hitbox result-page-hitbox-prev ${page <= 1 ? "is-edge" : ""}" type="button" data-action="search-page-prev" aria-label="${esc(s("\u4e0a\u4e00\u9875", "Previous page"))}"><span>${esc(s("\u4e0a\u4e00\u9875", "Previous"))}</span></button>
+        <button class="result-page-hitbox result-page-hitbox-next ${page >= pageCount ? "is-edge" : ""}" type="button" data-action="search-page-next" aria-label="${esc(s("\u4e0b\u4e00\u9875", "Next page"))}"><span>${esc(s("\u4e0b\u4e00\u9875", "Next"))}</span></button>
+        <div class="results-viewport-body">${content}</div>
+      </div>
+    `;
+  };
+
+  renderSearchFloatingExportDock = function () {
+    normalizeFrontendCollections();
+    const target = byId("floating-export-dock");
+    if (!target) return;
+    if (!state.search.response) {
+      target.innerHTML = "";
+      return;
+    }
+    const visible = getVisibleResults();
+    const exportTone = state.search.exportStatusTone === "error"
+      ? "tone-warn"
+      : state.search.exportStatusTone === "ok"
+        ? "tone-ok"
+        : "tone-soft";
+    const exportStatusText = state.search.exportStatusText || s("\u5c31\u7eea", "Ready");
+    const formatLabel = getCurrentExportFormat() === "json" ? "JSON" : "TXT.GZ";
+    target.innerHTML = `
+      <div class="floating-export-card ${state.search.exporting ? "is-busy" : ""}">
+        <div class="floating-export-copy">
+          <strong>${esc(s("\u7ed3\u679c\u5bfc\u51fa", "Result Export"))}</strong>
+          <span>${esc(s("\u6839\u636e\u5f53\u524d\u89c6\u56fe\u683c\u5f0f\u5bfc\u51fa\u5168\u90e8\u67e5\u8be2\u7ed3\u679c\uff1a", "Download the full query result using the current result format:"))} ${esc(formatLabel)}</span>
+        </div>
+        <div class="floating-export-status-row">
+          <div class="floating-export-status">
+            ${pill(state.search.exporting ? s("\u5bfc\u51fa\u4e2d", "Exporting") : s("\u5bfc\u51fa\u72b6\u6001", "Export Status"), exportTone)}
+            <span>${esc(exportStatusText)}</span>
+          </div>
+          <button class="button button-small button-primary" type="button" data-action="export-search-all" ${state.search.exporting || !visible.length ? "disabled" : ""}>${esc(s("\u5168\u90e8\u4e0b\u8f7d", "Download All"))}</button>
+        </div>
+      </div>
+    `;
+  };
+
+  handleInput = function (event) {
+    __baseHandleInput(event);
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    if (target.id === "search-page-size-custom") {
+      const validation = getSearchPageSizeValidation(target.value);
+      state.search.pageSizeCustomRaw = String(target.value || "");
+      state.search.pageSizeError = !validation.valid;
+      if (validation.valid) {
+        state.search.pageSizeCustom = validation.value;
+        state.search.pageSize = validation.value;
+      }
+      target.classList.toggle("field-error", state.search.pageSizeError);
+    }
+  };
+
+  handleChange = function (event) {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+    if (target.id === "search-page-size") {
+      const mode = String(target.value || "500");
+      state.search.pageSizeMode = mode;
+      if (mode === "custom") {
+        const validation = getSearchPageSizeValidation(state.search.pageSizeCustomRaw || state.search.pageSizeCustom || 1500);
+        state.search.pageSizeCustomRaw = validation.raw || String(state.search.pageSizeCustom || 1500);
+        state.search.pageSizeError = !validation.valid;
+        if (validation.valid) state.search.pageSizeCustom = validation.value;
+      } else {
+        state.search.pageSizeError = false;
+        state.search.pageSize = getResolvedSearchPageSize(mode);
+      }
+      renderSearchControls();
+      return;
+    }
+    __baseHandleChange(event);
+  };
+
+  handleClick = function (event) {
+    const button = event.target.closest("button");
+    if (button) {
+      const action = button.getAttribute("data-action");
+      if (action === "export-search-all") return exportCurrentSearchResults();
+      if (action === "search-page-prev") return navigateSearchPage(-1);
+      if (action === "search-page-next") return navigateSearchPage(1);
+    }
+    return __baseHandleClick(event);
+  };
+
+  clearSearchFilters = async function () {
+    normalizeFrontendCollections();
+    state.search.pageSizeCustomRaw = "1500";
+    state.search.pageSizeError = false;
+    state.search.pageSizeMode = "500";
+    state.search.page = 1;
+    state.search.pageSize = 500;
+    state.search.pageSizeCustom = 1500;
+    if (byId("search-page")) byId("search-page").value = "1";
+    if (byId("search-page-size")) byId("search-page-size").value = "500";
+    if (byId("search-page-size-custom")) byId("search-page-size-custom").value = "";
+    state.search.selectedDatasourceIDs = [];
+    state.search.serviceNames = [];
+    state.search.activeFilters = {};
+    state.search.tagValues = {};
+    state.search.levelFilter = "all";
+    state.search.queryLayers = [createQueryLayer("keyword", "")];
+    state.search.highlightTone = "yellow";
+    state.ui.detailOpen = false;
+    state.ui.menuSearch = { datasource: "", service: "" };
+    normalizeDatasourceState();
+    if (state.search.catalogDatasourceID) await loadSearchCatalogs();
+    else renderSearchControls();
+    renderSearchResults();
+  };
+
+  submitSearch = async function (event) {
+    event.preventDefault();
+    await runSearchWindow();
   };
 })();
 

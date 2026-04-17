@@ -23,6 +23,11 @@ type Service struct {
 	client *victorialogs.Client
 }
 
+const (
+	maxDatasourceWindow = 100000
+	remoteChunkLimit    = 1000
+)
+
 func New(store *mongostore.Store, cacheService *cache.Service, client *victorialogs.Client) *Service {
 	return &Service{
 		store:  store,
@@ -66,7 +71,6 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 		status  model.QuerySourceStatus
 	}
 
-	remoteLimit := page * pageSize
 	resultsCh := make(chan sourceResult, len(datasources))
 	var wg sync.WaitGroup
 
@@ -78,13 +82,16 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 
 			snapshot, _ := s.store.GetSnapshot(ctx, ds.ID)
 			logsql := buildLogsQL(ds, snapshot, tagDefinitions, req.Keyword, req.ServiceNames, req.Tags)
-			rows, queryErr := s.client.Query(ctx, ds, victorialogs.QueryRequest{
-				Query:  logsql,
-				Start:  start,
-				End:    end,
-				Limit:  remoteLimit,
-				Offset: 0,
-			})
+			rows, truncated, queryErr := s.fetchDatasourceWindow(
+				ctx,
+				ds,
+				snapshot,
+				tagDefinitions,
+				logsql,
+				start,
+				end,
+				page*pageSize,
+			)
 			if queryErr != nil {
 				resultsCh <- sourceResult{
 					status: model.QuerySourceStatus{
@@ -102,24 +109,19 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 					results: []model.SearchResult{},
 					status: model.QuerySourceStatus{
 						Datasource: ds.Name,
-						Status:     "empty",
+						Status:     statusLabelForRows(truncated, true),
 						Hits:       0,
 					},
 				}
 				return
 			}
 
-			normalizedRows := make([]model.SearchResult, 0, len(rows))
-			for _, row := range rows {
-				normalizedRows = append(normalizedRows, normalizeRow(ds, snapshot, tagDefinitions, row))
-			}
-
 			resultsCh <- sourceResult{
-				results: normalizedRows,
+				results: rows,
 				status: model.QuerySourceStatus{
 					Datasource: ds.Name,
-					Status:     "ok",
-					Hits:       len(normalizedRows),
+					Status:     statusLabelForRows(truncated, false),
+					Hits:       len(rows),
 				},
 			}
 		}()
@@ -134,7 +136,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 	for item := range resultsCh {
 		allResults = append(allResults, item.results...)
 		sourceStatuses = append(sourceStatuses, item.status)
-		if item.status.Status == "error" {
+		if item.status.Status == "error" || item.status.Status == "partial" {
 			partial = true
 		}
 	}
@@ -143,7 +145,15 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 		left := parseTimestamp(allResults[i].Timestamp)
 		right := parseTimestamp(allResults[j].Timestamp)
 		if left.Equal(right) {
-			return allResults[i].Datasource < allResults[j].Datasource
+			leftMessage := strings.ToLower(allResults[i].Message)
+			rightMessage := strings.ToLower(allResults[j].Message)
+			if leftMessage == rightMessage {
+				if allResults[i].Datasource == allResults[j].Datasource {
+					return allResults[i].Service < allResults[j].Service
+				}
+				return allResults[i].Datasource < allResults[j].Datasource
+			}
+			return leftMessage < rightMessage
 		}
 		return left.After(right)
 	})
@@ -152,6 +162,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 	response := model.SearchResponse{
 		Results:  pageResults,
 		Sources:  sourceStatuses,
+		Total:    len(allResults),
 		Partial:  partial,
 		CacheHit: false,
 		TookMS:   time.Since(startedAt).Milliseconds(),
@@ -162,6 +173,70 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 	}
 
 	return response, nil
+}
+
+func (s *Service) fetchDatasourceWindow(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	logsql string,
+	start, end time.Time,
+	targetLimit int,
+) ([]model.SearchResult, bool, error) {
+	requestedWindow := targetLimit
+	if requestedWindow <= 0 {
+		requestedWindow = 200
+	}
+	if requestedWindow > maxDatasourceWindow {
+		requestedWindow = maxDatasourceWindow
+	}
+
+	normalizedRows := make([]model.SearchResult, 0, requestedWindow)
+	offset := 0
+	truncated := false
+	lastBatchSize := 0
+	lastBatchLimit := 0
+
+	for offset < requestedWindow {
+		limit := remoteChunkLimit
+		if remaining := requestedWindow - offset; remaining < limit {
+			limit = remaining
+		}
+		lastBatchLimit = limit
+
+		rows, err := s.client.Query(ctx, datasource, victorialogs.QueryRequest{
+			Query:  logsql,
+			Start:  start,
+			End:    end,
+			Limit:  limit,
+			Offset: offset,
+		})
+		if err != nil {
+			return nil, false, err
+		}
+		if len(rows) == 0 {
+			break
+		}
+		lastBatchSize = len(rows)
+
+		batch := make([]model.SearchResult, 0, len(rows))
+		for _, row := range rows {
+			batch = append(batch, normalizeRow(datasource, snapshot, tagDefinitions, row))
+		}
+		normalizedRows = mergeContinuationRows(normalizedRows, batch)
+		offset += len(rows)
+
+		if len(rows) < limit {
+			break
+		}
+	}
+
+	if offset >= requestedWindow && lastBatchSize >= lastBatchLimit {
+		truncated = true
+	}
+
+	return normalizedRows, truncated, nil
 }
 
 func (s *Service) resolveDatasources(ctx context.Context, datasourceIDs []string) ([]model.Datasource, error) {
@@ -313,6 +388,72 @@ func normalizeRow(datasource model.Datasource, snapshot model.DatasourceTagSnaps
 		Labels:     labels,
 		Raw:        row,
 	}
+}
+
+func mergeContinuationRows(current []model.SearchResult, incoming []model.SearchResult) []model.SearchResult {
+	if len(incoming) == 0 {
+		return current
+	}
+
+	result := current
+	for _, row := range incoming {
+		if shouldMergeContinuation(result, row) {
+			mergeIntoPrevious(&result[len(result)-1], row)
+			continue
+		}
+		result = append(result, row)
+	}
+	return result
+}
+
+func shouldMergeContinuation(current []model.SearchResult, row model.SearchResult) bool {
+	if len(current) == 0 {
+		return false
+	}
+	return strings.TrimSpace(row.Timestamp) == ""
+}
+
+func mergeIntoPrevious(previous *model.SearchResult, continuation model.SearchResult) {
+	if previous == nil {
+		return
+	}
+
+	message := strings.TrimSpace(continuation.Message)
+	if message != "" {
+		if strings.TrimSpace(previous.Message) != "" {
+			previous.Message += "\n"
+		}
+		previous.Message += message
+	}
+	if previous.Service == "" {
+		previous.Service = continuation.Service
+	}
+	if previous.Pod == "" {
+		previous.Pod = continuation.Pod
+	}
+	if previous.Labels == nil {
+		previous.Labels = map[string]string{}
+	}
+	for key, value := range continuation.Labels {
+		if previous.Labels[key] == "" && strings.TrimSpace(value) != "" {
+			previous.Labels[key] = value
+		}
+	}
+	if previous.Raw == nil {
+		previous.Raw = map[string]any{}
+	}
+	existing, _ := previous.Raw["_merged_continuations"].([]any)
+	previous.Raw["_merged_continuations"] = append(existing, continuation.Raw)
+}
+
+func statusLabelForRows(truncated, empty bool) string {
+	if truncated {
+		return "partial"
+	}
+	if empty {
+		return "empty"
+	}
+	return "ok"
 }
 
 func extractValue(row map[string]any, primary string, fallbacks ...string) any {

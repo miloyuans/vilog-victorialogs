@@ -267,6 +267,7 @@ func parseJSONLines(data []byte) ([]map[string]any, error) {
 
 	rows := make([]map[string]any, 0)
 	scanner := bufio.NewScanner(bytes.NewReader(trimmed))
+	scanner.Buffer(make([]byte, 0, 128*1024), 16*1024*1024)
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {

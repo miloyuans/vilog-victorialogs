@@ -32,6 +32,7 @@ type QuerySourceStatus struct {
 type SearchResponse struct {
 	Results  []SearchResult      `json:"results"`
 	Sources  []QuerySourceStatus `json:"sources"`
+	Total    int                 `json:"total"`
 	Partial  bool                `json:"partial"`
 	CacheHit bool                `json:"cache_hit"`
 	TookMS   int64               `json:"took_ms"`
