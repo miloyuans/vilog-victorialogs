@@ -1404,3 +1404,911 @@ highlight = function (text) {
 };
 
 bootstrap();
+
+
+/* ===== UX compact + searchable dropdown + floating export patch ===== */
+(function () {
+  function safeArray(value) {
+    return Array.isArray(value) ? value : [];
+  }
+
+  function safeObject(value) {
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  }
+
+  function normalizeFrontendCollections() {
+    ensureEnhancedState.__base && ensureEnhancedState.__base();
+    state.datasources = safeArray(state.datasources);
+    state.tags = safeArray(state.tags);
+    state.templates = safeArray(state.templates);
+    state.bindings = safeArray(state.bindings);
+    state.tasks = safeArray(state.tasks);
+    state.ui = safeObject(state.ui);
+    state.search = safeObject(state.search);
+    state.ui.menuSearch = safeObject(state.ui.menuSearch);
+    state.ui.menuSearch.datasource = String(state.ui.menuSearch.datasource || "");
+    state.ui.menuSearch.service = String(state.ui.menuSearch.service || "");
+    state.search.selectedDatasourceIDs = safeArray(state.search.selectedDatasourceIDs);
+    state.search.serviceNames = safeArray(state.search.serviceNames);
+    state.search.services = safeArray(state.search.services);
+    state.search.tagCatalog = safeArray(state.search.tagCatalog);
+    state.search.tagValues = safeObject(state.search.tagValues);
+    state.search.activeFilters = safeObject(state.search.activeFilters);
+    state.search.queryLayers = safeArray(state.search.queryLayers).length ? state.search.queryLayers : [createQueryLayer("keyword", "")];
+    state.search.exporting = !!state.search.exporting;
+  }
+
+  if (!ensureEnhancedState.__base) {
+    ensureEnhancedState.__base = ensureEnhancedState;
+  }
+  ensureEnhancedState = function () {
+    normalizeFrontendCollections();
+  };
+  ensureEnhancedState();
+
+  function fuzzyMatch(text, keyword) {
+    const needle = String(keyword || "").trim().toLowerCase();
+    if (!needle) return true;
+    const source = String(text || "").toLowerCase();
+    if (source.indexOf(needle) >= 0) return true;
+    let offset = 0;
+    for (const char of needle) {
+      offset = source.indexOf(char, offset);
+      if (offset < 0) return false;
+      offset += 1;
+    }
+    return true;
+  }
+
+  function getMenuSearchValue(kind) {
+    normalizeFrontendCollections();
+    return kind === "service" ? state.ui.menuSearch.service : state.ui.menuSearch.datasource;
+  }
+
+  function setMenuSearchValue(kind, value) {
+    normalizeFrontendCollections();
+    if (kind === "service") state.ui.menuSearch.service = String(value || "");
+    else state.ui.menuSearch.datasource = String(value || "");
+  }
+
+  function filteredMenuDatasources() {
+    normalizeFrontendCollections();
+    const keyword = getMenuSearchValue("datasource");
+    return safeArray(state.datasources).filter((item) => {
+      const haystack = [item && item.name, item && item.base_url, item && item.id, item && item.enabled ? "enabled" : "disabled"].join(" ");
+      return fuzzyMatch(haystack, keyword);
+    });
+  }
+
+  function filteredMenuServices() {
+    normalizeFrontendCollections();
+    const keyword = getMenuSearchValue("service");
+    return safeArray(state.search.services).filter((name) => fuzzyMatch(name, keyword));
+  }
+
+  function buildCurrentSearchPayload(page, pageSize) {
+    normalizeFrontendCollections();
+    syncHiddenQueryInput();
+    const primaryLayer = getPrimaryLayer();
+    return {
+      keyword: buildBackendQueryFromLayer(primaryLayer),
+      start: localToRFC3339((byId("search-start") && byId("search-start").value) || ""),
+      end: localToRFC3339((byId("search-end") && byId("search-end").value) || ""),
+      datasource_ids: safeArray(state.search.selectedDatasourceIDs).slice(),
+      service_names: safeArray(state.search.serviceNames).slice(),
+      tags: normalizeFilters(state.search.activeFilters),
+      page: Number(page || state.search.page || 1),
+      page_size: Number(pageSize || state.search.pageSize || 500),
+      use_cache: state.search.useCache !== false,
+    };
+  }
+
+  function decorateExportResults(items) {
+    return safeArray(items).map((item, index) => ({
+      ...item,
+      _index: index,
+      _level: inferLevel(item),
+    }));
+  }
+
+  function applyClientSideResultFilters(items) {
+    let decorated = decorateExportResults(items);
+    const layers = safeArray(state.search.queryLayers).filter((layer, index) => index !== 0 || layer.mode === "keyword");
+    decorated = layers.reduce((list, layer) => {
+      if (!String(layer && layer.value || "").trim()) return list;
+      return safeArray(list).filter((item) => layerMatches(item, layer));
+    }, decorated);
+    if (state.search.levelFilter && state.search.levelFilter !== "all") {
+      decorated = decorated.filter((item) => item._level === state.search.levelFilter);
+    }
+    return decorated;
+  }
+
+  async function fetchAllResultsForExport() {
+    normalizeFrontendCollections();
+    const hardLimit = 20000;
+    const exportPageSize = Math.min(1000, Math.max(200, Number(state.search.pageSize || 500)));
+    let page = 1;
+    let merged = [];
+    let total = 0;
+    while (page <= 200) {
+      const payload = buildCurrentSearchPayload(page, exportPageSize);
+      const response = await request("/api/query/search", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      const rows = safeArray(response && response.results);
+      total = Number(response && response.total || total || 0);
+      if (!rows.length) break;
+      merged = merged.concat(rows);
+      if ((total && merged.length >= total) || rows.length < exportPageSize) break;
+      if (merged.length >= hardLimit) {
+        toast(
+          s("导出结果过大，已截断到前 20000 条。建议先缩小查询范围。", "Export is too large. Truncated to the first 20,000 rows. Narrow the query for a full export."),
+          "info",
+        );
+        break;
+      }
+      page += 1;
+    }
+    return applyClientSideResultFilters(merged);
+  }
+
+  function exportFilename(ext, allResults) {
+    const range = state.search.timePreset === "custom" ? "custom" : String(state.search.timePreset || "1h");
+    return "logs-" + (allResults ? "all" : "page") + "-" + range + "." + ext;
+  }
+
+  function downloadDecoratedResults(format, results, allResults) {
+    if (!safeArray(results).length) {
+      toast(s("没有可导出的查询结果。", "No query results to export."), "error");
+      return;
+    }
+    if (format === "json") {
+      downloadTextFile(exportFilename("json", allResults), JSON.stringify(results.map(stripRuntimeFields), null, 2), "application/json");
+      return;
+    }
+    const text = results
+      .map((item) => `[${formatDate(item.timestamp)}] ${item.datasource || "-"} ${item.service || "-"} ${item.message || ""}`)
+      .join("\n");
+    downloadTextFile(exportFilename("txt", allResults), text, "text/plain");
+  }
+
+  async function runExport(format, options) {
+    normalizeFrontendCollections();
+    const allResults = !!(options && options.all);
+    if (allResults) {
+      state.search.exporting = true;
+      renderSearchFloatingExportDock();
+      try {
+        const results = await fetchAllResultsForExport();
+        downloadDecoratedResults(format, results, true);
+      } catch (error) {
+        toast(error.message || String(error), "error");
+      } finally {
+        state.search.exporting = false;
+        renderSearchFloatingExportDock();
+      }
+      return;
+    }
+    downloadDecoratedResults(format, getVisibleResults(), false);
+  }
+
+  exportSearchResults = function (format, options) {
+    return runExport(format, options || {});
+  };
+
+  normalizeDatasourceState = function () {
+    normalizeFrontendCollections();
+    const enabled = safeArray(state.datasources).filter((item) => item && item.enabled);
+    const fallback = enabled.length ? enabled : safeArray(state.datasources).slice();
+    const valid = new Set(safeArray(state.datasources).map((item) => item.id));
+    state.search.selectedDatasourceIDs = safeArray(state.search.selectedDatasourceIDs).filter((id) => valid.has(id));
+    if (!state.search.selectedDatasourceIDs.length && fallback.length) {
+      state.search.selectedDatasourceIDs = fallback.map((item) => item.id);
+    }
+    syncCatalogDatasource();
+  };
+
+  syncCatalogDatasource = function () {
+    normalizeFrontendCollections();
+    const valid = new Set(safeArray(state.datasources).map((item) => item.id));
+    const selected = safeArray(state.search.selectedDatasourceIDs).find((id) => valid.has(id));
+    if (selected) {
+      state.search.catalogDatasourceID = selected;
+      return;
+    }
+    if (valid.has(state.search.catalogDatasourceID)) return;
+    const fallback = safeArray(state.datasources).find((item) => item && item.enabled) || safeArray(state.datasources)[0];
+    state.search.catalogDatasourceID = fallback ? fallback.id : "";
+  };
+
+  loadSearchCatalogs = async function () {
+    normalizeFrontendCollections();
+    syncCatalogDatasource();
+    if (!state.search.catalogDatasourceID) {
+      state.search.services = [];
+      state.search.serviceNames = [];
+      state.search.tagCatalog = [];
+      state.search.activeFilters = {};
+      state.search.tagValues = {};
+      renderSearchControls();
+      return;
+    }
+
+    const serviceParams = new URLSearchParams({ datasource_id: state.search.catalogDatasourceID });
+    const tagParams = new URLSearchParams({ datasource_id: state.search.catalogDatasourceID });
+    if (safeArray(state.search.serviceNames).length === 1) tagParams.set("service", state.search.serviceNames[0]);
+
+    const responses = await Promise.allSettled([
+      request("/api/query/services?" + serviceParams.toString()),
+      request("/api/query/tags?" + tagParams.toString()),
+    ]);
+
+    const servicePayload = responses[0].status === "fulfilled" ? responses[0].value : {};
+    const tagPayload = responses[1].status === "fulfilled" ? responses[1].value : {};
+    state.search.services = safeArray(servicePayload && servicePayload.services);
+    state.search.serviceNames = safeArray(state.search.serviceNames).filter((name) => state.search.services.indexOf(name) >= 0);
+    state.search.tagCatalog = safeArray(tagPayload && tagPayload.tags);
+    if (responses[1].status !== "fulfilled") {
+      state.search.activeFilters = {};
+      state.search.tagValues = {};
+    }
+    pruneSearchFilters();
+    renderSearchControls();
+  };
+
+  getRawDecoratedResults = function () {
+    const base = safeArray(state.search.response && state.search.response.results);
+    return base.map((item, index) => ({
+      ...item,
+      _index: index,
+      _level: inferLevel(item),
+    }));
+  };
+
+  getDecoratedResults = function () {
+    const results = getRawDecoratedResults();
+    const layers = safeArray(state.search.queryLayers).filter((layer, index) => index !== 0 || layer.mode === "keyword");
+    return layers.reduce((items, layer) => {
+      if (!String(layer && layer.value || "").trim()) return items;
+      return safeArray(items).filter((item) => layerMatches(item, layer));
+    }, results);
+  };
+
+  getVisibleResults = function () {
+    const all = getDecoratedResults();
+    return state.search.levelFilter === "all" ? all : safeArray(all).filter((item) => item._level === state.search.levelFilter);
+  };
+
+  getSelectedResult = function () {
+    const items = getVisibleResults();
+    return safeArray(items).find((item) => String(item._index) === state.search.selectedResultKey) || items[0] || null;
+  };
+
+  getSearchDatasourceLabel = function () {
+    normalizeFrontendCollections();
+    const enabled = safeArray(state.datasources).filter((item) => item && item.enabled);
+    const total = enabled.length || safeArray(state.datasources).length;
+    const selected = safeArray(state.datasources).filter((item) => safeArray(state.search.selectedDatasourceIDs).indexOf(item.id) >= 0);
+    if (!selected.length) return "ALL";
+    if (selected.length >= total && total > 1) return "ALL";
+    if (selected.length === 1) return selected[0].name;
+    return `${selected[0].name} +${selected.length - 1}`;
+  };
+
+  getSearchServiceLabel = function () {
+    normalizeFrontendCollections();
+    const total = safeArray(state.search.services).length;
+    if (!safeArray(state.search.serviceNames).length || safeArray(state.search.serviceNames).length >= total) return "ALL";
+    if (state.search.serviceNames.length === 1) return state.search.serviceNames[0];
+    return `${state.search.serviceNames[0]} +${state.search.serviceNames.length - 1}`;
+  };
+
+  renderSearchToolbar = function () {
+    normalizeFrontendCollections();
+    const selectedCount = safeArray(state.search.selectedDatasourceIDs).length;
+    const serviceCount = safeArray(state.search.serviceNames).length;
+    const resultCount = getVisibleResults().length;
+    const exportBusy = state.search.exporting;
+    const target = byId("search-toolbar-controls");
+    if (!target) return;
+    syncHiddenQueryInput();
+    target.innerHTML = `
+      <div class="search-toolbar-row search-toolbar-row-primary">
+        <div class="toolbar-cluster toolbar-cluster-left">
+          <button class="toolbar-trigger toolbar-trigger-select" type="button" data-open-menu="datasource">
+            <span class="toolbar-trigger-label">${esc(s("数据源", "Datasource"))}</span>
+            <strong id="search-datasource-trigger">${esc(getSearchDatasourceLabel())}</strong>
+          </button>
+          <button class="toolbar-trigger toolbar-trigger-select" type="button" data-open-menu="service">
+            <span class="toolbar-trigger-label">${esc(s("服务目录", "Service Catalog"))}</span>
+            <strong id="search-service-trigger">${esc(getSearchServiceLabel())}</strong>
+          </button>
+        </div>
+        <div class="toolbar-cluster toolbar-cluster-right">
+          <button class="toolbar-trigger toolbar-trigger-time" type="button" data-open-menu="time">
+            <span class="toolbar-trigger-label">${esc(s("时间范围", "Time Range"))}</span>
+            <strong id="search-time-trigger">${esc(getSearchTimeLabel())}</strong>
+          </button>
+          <label class="toolbar-inline-field">
+            <span>${esc(s("页码", "Page"))}</span>
+            <input id="search-page" type="number" min="1" step="1" value="${esc(String(state.search.page || 1))}" />
+          </label>
+          <label class="toolbar-inline-field">
+            <span>${esc(s("条数", "Rows"))}</span>
+            <select id="search-page-size">
+              <option value="100" ${state.search.pageSize === 100 ? "selected" : ""}>100</option>
+              <option value="200" ${state.search.pageSize === 200 ? "selected" : ""}>200</option>
+              <option value="500" ${state.search.pageSize == null || state.search.pageSize === 500 ? "selected" : ""}>500</option>
+              <option value="1000" ${state.search.pageSize === 1000 ? "selected" : ""}>1000</option>
+            </select>
+          </label>
+          <label class="toolbar-inline-check">
+            <input id="search-use-cache" type="checkbox" ${state.search.useCache === false ? "" : "checked"} />
+            ${esc(s("缓存", "Cache"))}
+          </label>
+          <button class="button button-small button-ghost" type="button" id="search-refresh-catalogs">${esc(s("刷新", "Refresh"))}</button>
+          <button class="button button-small button-muted" type="button" id="search-clear-filters">${esc(s("清空", "Clear"))}</button>
+          <button class="button button-small button-primary" type="submit" id="search-submit">${esc(s("执行查询", "Run Query"))}</button>
+        </div>
+      </div>
+      <div class="search-toolbar-row search-toolbar-row-query">
+        <div class="query-composer">
+          <div class="query-composer-head">
+            <div class="query-composer-copy">
+              <strong>${esc(s("关键字 / LogsQL 递归过滤器", "Keyword / LogsQL Recursive Filters"))}</strong>
+              <span class="query-composer-hint">${esc(s("先确定数据源和服务，再通过主查询命中结果，后续层按顺序继续过滤。", "Pick datasources and services first, then run the primary query and keep narrowing with recursive filters."))}</span>
+            </div>
+            <div class="query-composer-toolbar">
+              <div id="search-level-filters" class="inline-dock-block"></div>
+              <div id="search-highlight-palette" class="inline-dock-block"></div>
+              <button class="button button-small" type="button" data-action="add-query-layer">${esc(s("添加过滤层", "Add Filter Layer"))}</button>
+            </div>
+          </div>
+          <div class="query-layer-stack">${safeArray(state.search.queryLayers).map((layer, index) => renderQueryLayer(layer, index)).join("")}</div>
+        </div>
+      </div>
+      <div class="search-toolbar-row search-toolbar-row-context">
+        <div class="search-context-line" id="search-context-note"></div>
+      </div>
+      <div class="search-toolbar-row search-toolbar-row-mini-meta">
+        <div class="toolbar-mini-meta">${esc(s("查询数据源", "Query datasources"))}: ${esc(String(selectedCount || "ALL"))}</div>
+        <div class="toolbar-mini-meta">${esc(s("服务目录", "Services"))}: ${esc(String(serviceCount || "ALL"))}</div>
+        <div class="toolbar-mini-meta">${esc(s("当前可见", "Visible"))}: ${esc(String(resultCount))}</div>
+        <div class="toolbar-mini-meta">${esc(s("导出状态", "Export"))}: ${esc(exportBusy ? s("导出中", "Exporting") : s("就绪", "Ready"))}</div>
+      </div>
+    `;
+  };
+
+  renderSearchCatalogDatasourceOptions = function () {
+    normalizeFrontendCollections();
+    const trigger = byId("search-datasource-trigger");
+    const menu = byId("search-datasource-menu");
+    if (trigger) trigger.textContent = getSearchDatasourceLabel();
+    if (!menu) return;
+    const items = filteredMenuDatasources();
+    if (!safeArray(state.datasources).length) {
+      menu.innerHTML = empty(s("暂无数据源。", "No datasource."));
+      return;
+    }
+    const selectedItems = safeArray(state.datasources).filter((item) => safeArray(state.search.selectedDatasourceIDs).indexOf(item.id) >= 0);
+    menu.innerHTML = `
+      <div class="toolbar-menu-section">
+        <div class="menu-section-title">${esc(s("查询数据源", "Search Datasources"))}</div>
+        <div class="menu-search-row">
+          <input class="menu-search-input" id="search-datasource-menu-search" type="search" placeholder="${esc(s("搜索数据源名称 / 地址 / ID", "Search datasource name / URL / ID"))}" value="${esc(getMenuSearchValue("datasource"))}" />
+          <div class="menu-selection-strip compact">${renderSelectedMenuTokens(selectedItems, "datasource")}</div>
+        </div>
+        <div class="menu-action-row">
+          <button class="chip-button ${safeArray(state.search.selectedDatasourceIDs).length >= safeArray(state.datasources).length ? "active" : ""}" type="button" data-search-datasource-all="1">ALL</button>
+          <span class="menu-meta-tip">${esc(s("支持多选，默认 ALL；目录数据源自动跟随第一项选中源。", "Multi-select supported, default ALL; catalog datasource follows the first selected datasource."))}</span>
+        </div>
+        <div class="menu-check-list">${items.length ? items.map((item) => {
+          const selected = safeArray(state.search.selectedDatasourceIDs).indexOf(item.id) >= 0;
+          const isCatalog = item.id === state.search.catalogDatasourceID;
+          return `<button class="menu-check-item ${selected ? "active" : ""}" type="button" data-search-datasource-id="${esc(item.id)}"><span class="menu-check-indicator">${selected ? "✓" : ""}</span><span class="menu-check-main"><strong>${esc(item.name)}</strong><small>${esc(item.base_url || "-")}</small></span><span class="menu-check-meta">${pill(isCatalog ? s("主目录", "Catalog") : item.enabled ? s("启用", "Enabled") : s("停用", "Disabled"), isCatalog ? "tone-neutral" : item.enabled ? "tone-ok" : "tone-warn")}</span></button>`;
+        }).join("") : empty(s("没有匹配当前关键字的数据源。", "No datasource matches the current keyword."))}</div>
+      </div>
+    `;
+  };
+
+  renderSearchServiceOptions = function () {
+    normalizeFrontendCollections();
+    const trigger = byId("search-service-trigger");
+    const menu = byId("search-service-menu");
+    if (trigger) trigger.textContent = getSearchServiceLabel();
+    if (!menu) return;
+    if (!state.search.catalogDatasourceID) {
+      menu.innerHTML = empty(s("先选择数据源。", "Pick a datasource first."));
+      return;
+    }
+    const items = filteredMenuServices();
+    if (!safeArray(state.search.services).length) {
+      menu.innerHTML = empty(s("服务目录为空，请先执行 Discover。", "Service catalog is empty. Run Discover first."));
+      return;
+    }
+    menu.innerHTML = `
+      <div class="toolbar-menu-section">
+        <div class="menu-section-title">${esc(s("服务目录", "Service Catalog"))}</div>
+        <div class="menu-search-row">
+          <input class="menu-search-input" id="search-service-menu-search" type="search" placeholder="${esc(s("搜索服务名称", "Search service name"))}" value="${esc(getMenuSearchValue("service"))}" />
+          <div class="menu-selection-strip compact">${renderSelectedMenuTokens(safeArray(state.search.serviceNames), "service")}</div>
+        </div>
+        <div class="menu-action-row">
+          <button class="chip-button ${safeArray(state.search.serviceNames).length === 0 || safeArray(state.search.serviceNames).length >= safeArray(state.search.services).length ? "active" : ""}" type="button" data-search-service-all="1">ALL</button>
+          <span class="menu-meta-tip">${esc(s("支持多选，默认 ALL；单服务时标签目录会更精准。", "Multi-select supported, default ALL; single-service selection yields a more precise tag catalog."))}</span>
+        </div>
+        <div class="menu-check-list">${items.length ? items.map((name) => {
+          const selected = safeArray(state.search.serviceNames).indexOf(name) >= 0;
+          return `<button class="menu-check-item ${selected ? "active" : ""}" type="button" data-search-service-name="${esc(name)}"><span class="menu-check-indicator">${selected ? "✓" : ""}</span><span class="menu-check-main"><strong>${esc(name)}</strong><small>${esc(s("支持单选、多选或 ALL。", "Single, multi, or ALL selection is supported."))}</small></span></button>`;
+        }).join("") : empty(s("没有匹配当前关键字的服务。", "No service matches the current keyword."))}</div>
+      </div>
+    `;
+  };
+
+  renderSearchMarkup = function () {
+    normalizeFrontendCollections();
+    return `
+      <div class="query-shell query-shell-compact">
+        <div class="search-toolbar-sticky">
+          <div class="card search-toolbar-card">
+            <div class="card-body compact-card-body">
+              <form id="search-form" class="search-toolbar search-toolbar-compact">
+                <div id="search-toolbar-controls"></div>
+                <div class="toolbar-menu-layer">
+                  <div class="toolbar-menu-panel" id="search-datasource-menu"></div>
+                  <div class="toolbar-menu-panel" id="search-service-menu"></div>
+                  <div class="toolbar-menu-panel" id="search-time-menu">
+                    <div class="toolbar-menu-section">
+                      <div class="menu-section-title">${esc(s("快捷时间", "Presets"))}</div>
+                      <div class="quick-range-grid">${rangeButtonRow()}</div>
+                    </div>
+                    <div class="toolbar-menu-section">
+                      <div class="menu-section-title">${esc(s("自定义时间", "Custom Range"))}</div>
+                      <div class="field-grid compact search-time-grid">
+                        <div class="field"><label for="search-start-custom">${esc(s("开始", "Start"))}</label><input id="search-start-custom" type="datetime-local" /></div>
+                        <div class="field"><label for="search-end-custom">${esc(s("结束", "End"))}</label><input id="search-end-custom" type="datetime-local" /></div>
+                      </div>
+                      <div class="form-actions"><button class="button button-small button-primary" type="button" data-action="apply-custom-time">${esc(s("应用自定义时间", "Apply Custom Range"))}</button></div>
+                    </div>
+                  </div>
+                </div>
+                <div class="hidden-time-inputs">
+                  <input id="search-start" type="datetime-local" />
+                  <input id="search-end" type="datetime-local" />
+                  <textarea id="search-keyword" rows="1"></textarea>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+        <div class="card search-workbench-card">
+          <div class="card-body compact-card-body workbench-card-body">
+            <div class="search-workbench ${state.ui.railCollapsed ? "rail-collapsed" : ""}">
+              <aside class="search-rail" id="search-rail">
+                <div class="search-rail-head">
+                  <button class="icon-button" type="button" data-toggle-rail="1">${esc(state.ui.railCollapsed ? ">" : "<")}</button>
+                  <div class="search-rail-copy"><strong>${esc(s("结果工具", "Result Tools"))}</strong><span>${esc(s("导出、视图、标签", "Export, views, and tags"))}</span></div>
+                </div>
+                <div class="search-rail-body">
+                  <div class="search-rail-actions">
+                    <div class="mode-switch">${viewButton("table", s("表格", "Table"))}${viewButton("list", s("日志流", "Stream"))}${viewButton("json", "JSON")}</div>
+                    <button class="mode-button ${state.search.wrap ? "active" : ""}" type="button" id="search-wrap-toggle">${esc(s("自动折叠", "Clamp"))}</button>
+                    <button class="button button-small" type="button" data-action="export-search-json">${esc(s("导出 JSON", "Export JSON"))}</button>
+                    <button class="button button-small" type="button" data-action="export-search-stream">${esc(s("导出日志流", "Export Stream"))}</button>
+                    <button class="button button-small" type="button" data-action="export-search-json-all">${esc(s("导出全部 JSON", "Export All JSON"))}</button>
+                    <button class="button button-small" type="button" data-action="export-search-stream-all">${esc(s("导出全部文本", "Export All Text"))}</button>
+                  </div>
+                  <div class="search-rail-section"><div class="search-rail-section-title">${esc(s("当前过滤", "Active Filters"))}</div><div id="search-active-filters"></div></div>
+                  <div class="search-rail-section"><div class="search-rail-section-title">${esc(s("标签目录", "Tag Catalog"))}</div><div class="tag-grid search-tag-grid" id="search-tag-catalog"></div></div>
+                </div>
+              </aside>
+              <section class="search-main">
+                <div class="summary-strip summary-strip-compact" id="search-summary"></div>
+                <div class="card search-panel search-panel-volume"><div class="card-body compact-card-body"><div class="section-head search-panel-head"><div><h3 class="card-title">Logs volume</h3><p>${esc(s("柱状图只负责展示趋势，时间坐标和日志级别可以快速联动筛选。", "The histogram focuses on trend; time labels and level filters stay close for quick iteration."))}</p></div></div><div id="search-histogram"></div><div class="divider"></div><div class="source-grid compact-source-grid" id="search-source-grid"></div></div></div>
+                <div class="card search-panel search-panel-results"><div class="card-body compact-card-body"><div class="section-head search-panel-head"><div><h3 class="card-title">${esc(s("日志结果", "Logs"))}</h3><p>${esc(s("主窗口保持整齐浏览；详情通过附属弹窗查看，不打断结果流。", "The main window stays readable while full detail opens in a secondary modal."))}</p></div></div><div id="search-results-body"></div></div></div>
+              </section>
+            </div>
+          </div>
+        </div>
+        <div id="search-detail-modal"></div>
+        <div id="floating-export-dock"></div>
+        <div class="search-loading-overlay" id="search-loading-overlay"><div class="search-loading-dialog"><div class="search-loading-spinner"></div><strong>${esc(s("正在刷新查询结果", "Refreshing Query Results"))}</strong><span>${esc(s("请稍候，主工作台会在查询完成后恢复交互。", "Please wait while the workbench refreshes the result set."))}</span></div></div>
+      </div>
+    `;
+  };
+
+  renderSearchFloatingExportDock = function () {
+    normalizeFrontendCollections();
+    const target = byId("floating-export-dock");
+    if (!target) return;
+    if (!state.search.response) {
+      target.innerHTML = "";
+      return;
+    }
+    const visible = getVisibleResults();
+    target.innerHTML = `
+      <div class="floating-export-card ${state.search.exporting ? "is-busy" : ""}">
+        <div class="floating-export-copy">
+          <strong>${esc(s("结果导出", "Result Export"))}</strong>
+          <span>${esc(s("悬浮下载当前查询结果；支持当前页和全部结果导出。", "Floating export for the current query; supports current page and full-result export."))}</span>
+        </div>
+        <div class="floating-export-actions">
+          <button class="button button-small" type="button" data-action="export-search-json" ${visible.length ? "" : "disabled"}>${esc(s("当前页 JSON", "Page JSON"))}</button>
+          <button class="button button-small" type="button" data-action="export-search-stream" ${visible.length ? "" : "disabled"}>${esc(s("当前页文本", "Page Text"))}</button>
+          <button class="button button-small button-primary" type="button" data-action="export-search-json-all" ${state.search.exporting ? "disabled" : ""}>${esc(s("全部 JSON", "All JSON"))}</button>
+          <button class="button button-small button-primary" type="button" data-action="export-search-stream-all" ${state.search.exporting ? "disabled" : ""}>${esc(s("全部文本", "All Text"))}</button>
+        </div>
+      </div>
+    `;
+  };
+
+  renderSearchResults = function () {
+    renderSearchSummary();
+    renderSearchHistogramPanel();
+    renderSearchSources();
+    renderSearchLevelFilters();
+    renderSearchHighlightPalette();
+    renderSearchResultsBody();
+    renderSearchInspector();
+    renderSearchLoadingState();
+    renderSearchFloatingExportDock();
+    const wrapButton = byId("search-wrap-toggle");
+    if (wrapButton) wrapButton.classList.toggle("active", state.search.wrap);
+  };
+
+  renderSearchSummary = function () {
+    normalizeFrontendCollections();
+    const raw = getRawDecoratedResults();
+    const filtered = getDecoratedResults();
+    const visible = getVisibleResults();
+    const response = safeObject(state.search.response);
+    const target = byId("search-summary");
+    if (!target) return;
+    target.innerHTML = [
+      summaryTile(s("总结果数", "Total Results"), String(raw.length), s("后端返回的结果总数", "Total rows returned from the backend")),
+      summaryTile(s("递归过滤后", "After Recursive Filters"), String(filtered.length), s("应用递归过滤层之后保留下来的结果数", "Rows remaining after recursive filter layers")),
+      summaryTile(s("当前可见", "Currently Visible"), String(visible.length), s("应用日志级别筛选之后当前窗口可见的结果数", "Rows currently visible after the level filter")),
+      summaryTile(s("缓存 / 部分成功", "Cache / Partial"), `${response.cache_hit ? s("命中", "Hit") : s("未命中", "Miss")} / ${response.partial ? s("是", "Yes") : "OK"}`, `${s("耗时", "Took")}: ${response.took_ms || 0}ms`)
+    ].join("");
+  };
+
+  renderSearchHistogramPanel = function () {
+    const results = getDecoratedResults();
+    const items = buildSearchHistogram(results);
+    const levels = countLevels(results);
+    const target = byId("search-histogram");
+    if (!target) return;
+    if (!state.search.response) {
+      target.innerHTML = `<div class="empty-state">${esc(s("还没有执行查询。", "No search has been executed."))}</div>`;
+      return;
+    }
+    if (!items.length) {
+      target.innerHTML = `<div class="empty-state">${esc(s("当前条件下没有柱状图数据。", "No histogram data for the current filters."))}</div>`;
+      return;
+    }
+    target.innerHTML = `<div class="histogram-frame histogram-frame-fine"><div class="histogram-track histogram-track-fine">${items.map((item) => `<div class="histogram-column"><div class="histogram-bar" style="height:${item.height}%" title="${esc(item.title)}"></div><span class="histogram-axis-label">${esc(item.label)}</span></div>`).join("")}</div></div><div class="histogram-footer histogram-footer-fine"><span class="legend">${pill(`${s("总量", "Total")} ${results.length}`, "tone-soft")}</span><span class="legend">${Object.keys(levels).map((level) => `<span class="legend-item"><span class="legend-swatch level-${esc(level)}"></span>${esc(level)} ${esc(String(levels[level]))}</span>`).join("")}</span></div>`;
+  };
+
+  handleInput = function (event) {
+    normalizeFrontendCollections();
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+
+    const layerID = target.getAttribute("data-query-layer-input");
+    if (layerID) {
+      const layer = safeArray(state.search.queryLayers).find((item) => item.id === layerID);
+      if (layer) layer.value = target.value;
+      syncHiddenQueryInput();
+      return;
+    }
+
+    if (target.id === "datasource-search") {
+      state.ui.datasourceSearch = target.value;
+      renderDatasourceList();
+      return;
+    }
+
+    if (target.id === "search-page") {
+      state.search.page = Number(target.value || 1);
+      return;
+    }
+
+    if (target.id === "search-datasource-menu-search") {
+      setMenuSearchValue("datasource", target.value);
+      renderSearchCatalogDatasourceOptions();
+      syncSearchMenuState();
+      return;
+    }
+
+    if (target.id === "search-service-menu-search") {
+      setMenuSearchValue("service", target.value);
+      renderSearchServiceOptions();
+      syncSearchMenuState();
+    }
+  };
+
+  handleClick = function (event) {
+    normalizeFrontendCollections();
+    const button = event.target.closest("button");
+    if (!button) {
+      if (!event.target.closest(".toolbar-menu-panel") && !event.target.closest(".toolbar-trigger")) closeSearchMenus();
+      return;
+    }
+
+    const panel = button.getAttribute("data-panel-target");
+    if (panel) return setPanel(panel);
+
+    const locale = button.getAttribute("data-locale");
+    if (locale && locale !== state.locale) {
+      localStorage.setItem(storageKeys.locale, locale);
+      return window.location.reload();
+    }
+
+    if (button.getAttribute("data-toggle-nav")) {
+      state.ui.navCollapsed = !state.ui.navCollapsed;
+      localStorage.setItem(storageKeys.navCollapsed, String(state.ui.navCollapsed));
+      const shell = byId("app-shell");
+      if (shell) shell.classList.toggle("nav-collapsed", state.ui.navCollapsed);
+      return;
+    }
+
+    if (button.getAttribute("data-toggle-rail")) {
+      state.ui.railCollapsed = !state.ui.railCollapsed;
+      localStorage.setItem(storageKeys.railCollapsed, String(state.ui.railCollapsed));
+      const workbench = document.querySelector(".search-workbench");
+      if (workbench) workbench.classList.toggle("rail-collapsed", state.ui.railCollapsed);
+      button.textContent = state.ui.railCollapsed ? ">" : "<";
+      return;
+    }
+
+    if (button.id === "search-refresh-catalogs") return refreshCatalogs();
+    if (button.id === "search-clear-filters") return clearSearchFilters();
+
+    const menu = button.getAttribute("data-open-menu");
+    if (menu) {
+      state.ui.openMenu = state.ui.openMenu === menu ? "" : menu;
+      syncSearchMenuState();
+      return;
+    }
+
+    const range = button.getAttribute("data-range");
+    if (range) return applyQuickRange(range);
+
+    const view = button.getAttribute("data-search-view");
+    if (view) {
+      state.search.view = view;
+      localStorage.setItem(storageKeys.view, view);
+      renderSearchResults();
+      return;
+    }
+
+    if (button.id === "search-wrap-toggle") {
+      state.search.wrap = !state.search.wrap;
+      localStorage.setItem(storageKeys.wrap, String(state.search.wrap));
+      renderSearchResults();
+      return;
+    }
+
+    const layerMode = button.getAttribute("data-query-layer-mode");
+    const layerID = button.getAttribute("data-layer-id");
+    if (layerMode && layerID) {
+      state.search.queryLayers = safeArray(state.search.queryLayers).map((layer) => layer.id === layerID ? { ...layer, mode: layerMode } : layer);
+      renderSearchControls();
+      return;
+    }
+
+    const operator = button.getAttribute("data-query-operator");
+    if (operator && layerID) {
+      state.search.queryLayers = safeArray(state.search.queryLayers).map((layer) => layer.id === layerID ? { ...layer, operator } : layer);
+      renderSearchControls();
+      return;
+    }
+
+    const datasourceID = button.getAttribute("data-search-datasource-id");
+    if (datasourceID) return toggleSearchDatasource(datasourceID);
+    if (button.hasAttribute("data-search-datasource-all")) return selectAllSearchDatasources();
+
+    const serviceName = button.getAttribute("data-search-service-name");
+    if (serviceName != null) return toggleSearchService(serviceName);
+    if (button.hasAttribute("data-search-service-all")) return selectAllSearchServices();
+
+    const resultID = button.getAttribute("data-select-result");
+    if (resultID != null) {
+      state.search.selectedResultKey = resultID;
+      state.ui.detailOpen = true;
+      renderSearchResultsBody();
+      renderSearchInspector();
+      return;
+    }
+
+    const addTag = button.getAttribute("data-add-tag");
+    if (addTag) return addSearchTag(addTag);
+
+    const removeTag = button.getAttribute("data-remove-tag");
+    if (removeTag) return removeSearchTag(removeTag);
+
+    const filterField = button.getAttribute("data-toggle-tag-value-field");
+    const filterValue = button.getAttribute("data-toggle-tag-value");
+    if (filterField && filterValue != null) return toggleSearchTagValue(filterField, filterValue);
+
+    const level = button.getAttribute("data-level-filter");
+    if (level) {
+      state.search.levelFilter = level;
+      renderSearchResults();
+      return;
+    }
+
+    const tone = button.getAttribute("data-highlight-tone");
+    if (tone) {
+      state.search.highlightTone = tone;
+      renderSearchResultsBody();
+      renderSearchHighlightPalette();
+      return;
+    }
+
+    const action = button.getAttribute("data-action");
+    const id = button.getAttribute("data-id");
+    if (action === "apply-custom-time") return applyCustomTime();
+    if (action === "close-datasource-modal") {
+      setDatasourceModalOpen(false);
+      return;
+    }
+    if (action === "close-search-detail") {
+      state.ui.detailOpen = false;
+      renderSearchInspector();
+      return;
+    }
+    if (action === "add-query-layer") {
+      state.search.queryLayers.push(createQueryLayer("keyword", ""));
+      renderSearchControls();
+      return;
+    }
+    if (action === "remove-query-layer" && layerID) {
+      state.search.queryLayers = safeArray(state.search.queryLayers).filter((layer) => layer.id !== layerID);
+      if (!state.search.queryLayers.length) state.search.queryLayers = [createQueryLayer("keyword", "")];
+      renderSearchControls();
+      return;
+    }
+    if (action === "export-search-json") return exportSearchResults("json");
+    if (action === "export-search-stream") return exportSearchResults("stream");
+    if (action === "export-search-json-all") return exportSearchResults("json", { all: true });
+    if (action === "export-search-stream-all") return exportSearchResults("stream", { all: true });
+    if (action === "inspect-datasource" && id) return fillDatasourceForm(findByID(state.datasources, id));
+    if (action === "edit-datasource" && id) return fillDatasourceForm(findByID(state.datasources, id));
+    if (action === "delete-datasource" && id) return removeDatasourceDefinition(id, button);
+    if (action === "test-datasource" && id) return runDatasourceTest(id, button);
+    if (action === "discover-datasource" && id) return runDatasourceDiscovery(id, button);
+    if (action === "snapshot-datasource" && id) return runSnapshot(id, button);
+    if (action === "explore-datasource" && id) return exploreDatasource(id);
+    if (action === "edit-tag" && id) return fillTagForm(findByID(state.tags, id));
+    if (action === "delete-tag" && id) return removeTagDefinition(id, button);
+    if (action === "edit-template" && id) return fillTemplateForm(findByID(state.templates, id));
+    if (action === "edit-binding" && id) return fillBindingForm(findByID(state.bindings, id));
+    if (action === "stop-task" && id) return stopTask(id, button);
+
+    closeSearchMenus();
+  };
+
+  toggleSearchDatasource = async function (id) {
+    normalizeFrontendCollections();
+    state.search.selectedDatasourceIDs = safeArray(state.search.selectedDatasourceIDs).indexOf(id) >= 0
+      ? safeArray(state.search.selectedDatasourceIDs).filter((item) => item !== id)
+      : safeArray(state.search.selectedDatasourceIDs).concat([id]);
+    syncCatalogDatasource();
+    await loadSearchCatalogs();
+  };
+
+  selectAllSearchDatasources = async function () {
+    normalizeFrontendCollections();
+    const enabled = safeArray(state.datasources).filter((item) => item && item.enabled);
+    const pool = enabled.length ? enabled : safeArray(state.datasources);
+    state.search.selectedDatasourceIDs = pool.map((item) => item.id);
+    syncCatalogDatasource();
+    await loadSearchCatalogs();
+  };
+
+  toggleSearchService = async function (name) {
+    normalizeFrontendCollections();
+    state.search.serviceNames = safeArray(state.search.serviceNames).indexOf(name) >= 0
+      ? safeArray(state.search.serviceNames).filter((item) => item !== name)
+      : safeArray(state.search.serviceNames).concat([name]);
+    state.search.activeFilters = {};
+    state.search.tagValues = {};
+    await loadSearchCatalogs();
+  };
+
+  selectAllSearchServices = async function () {
+    normalizeFrontendCollections();
+    state.search.serviceNames = [];
+    state.search.activeFilters = {};
+    state.search.tagValues = {};
+    await loadSearchCatalogs();
+  };
+
+  clearSearchFilters = async function () {
+    normalizeFrontendCollections();
+    state.search.selectedDatasourceIDs = [];
+    state.search.serviceNames = [];
+    state.search.activeFilters = {};
+    state.search.tagValues = {};
+    state.search.levelFilter = "all";
+    state.search.queryLayers = [createQueryLayer("keyword", "")];
+    state.search.highlightTone = "yellow";
+    state.ui.detailOpen = false;
+    state.ui.menuSearch = { datasource: "", service: "" };
+    if (byId("search-page")) byId("search-page").value = "1";
+    if (byId("search-page-size")) byId("search-page-size").value = "500";
+    normalizeDatasourceState();
+    if (state.search.catalogDatasourceID) await loadSearchCatalogs();
+    else renderSearchControls();
+    renderSearchResults();
+  };
+
+  submitSearch = async function (event) {
+    event.preventDefault();
+    normalizeFrontendCollections();
+    syncHiddenQueryInput();
+    if (!safeArray(state.search.selectedDatasourceIDs).length) {
+      toast(s("请先选择至少一个查询数据源。", "Select at least one search datasource."), "error");
+      return;
+    }
+    const page = Number((byId("search-page") && byId("search-page").value) || 1);
+    const pageSize = Number((byId("search-page-size") && byId("search-page-size").value) || 500);
+    state.search.page = page;
+    state.search.pageSize = pageSize;
+    state.search.useCache = byId("search-use-cache") ? byId("search-use-cache").checked : true;
+    const primaryLayer = getPrimaryLayer();
+    const payload = buildCurrentSearchPayload(page, pageSize);
+    setSearchLoading(true);
+    try {
+      try {
+        state.search.response = await request("/api/query/search", { method: "POST", body: JSON.stringify(payload) });
+      } catch (error) {
+        if (primaryLayer.mode !== "keyword" || !payload.keyword) throw error;
+        const fallbackPayload = { ...payload, keyword: "" };
+        state.search.response = await request("/api/query/search", { method: "POST", body: JSON.stringify(fallbackPayload) });
+      }
+      state.search.response = safeObject(state.search.response);
+      state.search.response.results = safeArray(state.search.response.results);
+      state.search.response.sources = safeArray(state.search.response.sources);
+      state.search.levelFilter = "all";
+      const results = getVisibleResults();
+      state.search.selectedResultKey = results[0] ? String(results[0]._index) : "";
+      state.ui.detailOpen = false;
+      renderSearchResults();
+      toast(results.length ? s("查询已完成。", "Search completed.") : s("查询完成，但当前条件下没有数据。", "Search completed, but no data matched the current filters."), results.length ? "success" : "info");
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      setSearchLoading(false);
+    }
+  };
+
+  renderSearchControls = function () {
+    normalizeFrontendCollections();
+    renderSearchToolbar();
+    renderSearchCatalogDatasourceOptions();
+    renderSearchServiceOptions();
+    renderSearchTimePanel();
+    renderSearchContext();
+    renderSearchCatalogs();
+    renderSearchLevelFilters();
+    renderSearchHighlightPalette();
+    renderSearchLoadingState();
+    syncSearchMenuState();
+    renderSearchFloatingExportDock();
+  };
+
+  renderSearchContext = function () {
+    normalizeFrontendCollections();
+    const catalog = findByID(state.datasources, state.search.catalogDatasourceID);
+    const serviceLabel = safeArray(state.search.serviceNames).length ? `${state.search.serviceNames.length} ${s("个服务", "services")}` : s("全部服务", "ALL services");
+    const filters = Object.keys(normalizeFilters(state.search.activeFilters)).length;
+    const layers = safeArray(state.search.queryLayers).filter((layer) => String(layer && layer.value || "").trim()).length;
+    const node = byId("search-context-note");
+    if (!node) return;
+    node.textContent = `${s("查询源", "Sources")}: ${safeArray(state.search.selectedDatasourceIDs).length || "ALL"} · ${s("主目录", "Catalog")}: ${catalog ? catalog.name : s("无", "None")} · ${s("服务", "Services")}: ${serviceLabel} · ${s("标签过滤", "Tag filters")}: ${filters} · ${s("递归过滤层", "Recursive layers")}: ${layers}`;
+  };
+})();

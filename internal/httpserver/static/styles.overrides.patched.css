@@ -159,3 +159,70 @@ mark.highlight-tone-purple{background:rgba(176,132,245,.28);color:#e7d3ff}
 @media (min-width:1180px){.datasource-detail-grid{grid-template-columns:minmax(0,1.15fr) minmax(340px,.85fr)}}
 @media (max-width:1100px){.summary-strip-compact{grid-template-columns:repeat(2,minmax(0,1fr))}.datasource-toolbar{grid-template-columns:1fr}.search-workbench{grid-template-columns:1fr}.search-rail{position:relative;top:0;width:100%;min-width:0;max-width:none;max-height:none;resize:none}.query-composer-toolbar{justify-content:flex-start}}
 @media (max-width:860px){.search-toolbar-row,.query-composer-head{flex-direction:column}.toolbar-cluster,.toolbar-trigger,#search-service-menu,#search-time-menu{width:100%}.toolbar-menu-panel,#search-service-menu,#search-time-menu{left:0;right:auto;width:100%}.datasource-list-actions,.highlight-palette,.summary-strip-compact{grid-template-columns:1fr}.inline-dock-block{align-items:flex-start}}
+
+
+/* ===== compact typography + searchable dropdown + floating export patch ===== */
+:root{
+  --vilog-font-xxs:.64rem;
+  --vilog-font-xs:.68rem;
+  --vilog-font-sm:.72rem;
+  --vilog-font-md:.78rem;
+  --vilog-font-lg:.84rem;
+}
+.workspace-main{padding:10px 12px 14px}
+.topbar-compact{padding:8px 12px}
+.compact-copy strong,.section-title,.card-title,.inspector-title{font-size:var(--vilog-font-lg)}
+.compact-copy span,.breadcrumb-bar,.section-head p,.tiny,.metric-subtitle,.query-composer-copy span,.query-layer-copy span,.search-rail-copy span,.search-context-line,.menu-meta-tip{font-size:var(--vilog-font-xs)!important;line-height:1.35}
+.status-pill,.chip,.chip-button,.button-small,.mode-button,.locale-button,.tab-button,.toolbar-trigger,.toolbar-inline-field,.toolbar-inline-check,.query-layer-foot,.datasource-list-meta,.datasource-toolbar input,.datasource-toolbar select,.table-wrap-compact td,.table-wrap-compact th,.log-results-table td,.log-results-table th,.compact-log-message,.log-cell-message,.search-rail-section-title{font-size:var(--vilog-font-sm)}
+.toolbar-trigger{min-height:34px;padding:6px 9px}
+.toolbar-trigger strong{font-size:var(--vilog-font-md)}
+.toolbar-trigger-label,.toolbar-inline-field span{font-size:var(--vilog-font-xs)}
+.toolbar-inline-field input{width:68px}
+.toolbar-inline-field input,.toolbar-inline-field select,.datasource-toolbar input,.datasource-toolbar select,.menu-search-input{padding:6px 8px;font-size:var(--vilog-font-sm)}
+.query-composer-head{gap:10px}
+.query-composer-copy strong,.query-layer-copy strong{font-size:var(--vilog-font-md)}
+.query-composer-hint{max-width:760px}
+.query-layer-stack{max-height:280px}
+.query-layer-card{padding:9px}
+.query-layer-input{min-height:52px;padding:6px 8px;font-size:var(--vilog-font-sm);line-height:1.4}
+.search-rail{width:208px;min-width:176px}
+.search-rail-body,.search-main,.search-panel,.search-rail-section{gap:10px}
+.search-rail-actions .button,.search-rail-actions .mode-button{min-height:28px}
+.summary-strip-compact{gap:8px}
+.summary-card{padding:11px}
+.summary-card strong{font-size:1.06rem}
+.summary-card .metric-label,.summary-card .metric-subtitle{font-size:var(--vilog-font-xs)}
+.histogram-track-fine{min-height:128px}
+.histogram-axis-label{font-size:var(--vilog-font-xxs)}
+.compact-source-card{padding:10px}
+.table-wrap-compact td,.table-wrap-compact th{padding:7px 6px}
+.log-results-table th{font-size:var(--vilog-font-xs)}
+.log-cell-message,.compact-log-message{font-size:var(--vilog-font-sm);line-height:1.42}
+.compact-log-entry{padding:10px 11px}
+.compact-log-entry .chip,.compact-log-entry .chip-button,.compact-log-entry .button-small{font-size:var(--vilog-font-xs)}
+.raw-view pre,.detail-dialog pre,.output-box pre{font-size:var(--vilog-font-xs);line-height:1.42}
+.datasource-list-item{padding:10px}
+.datasource-list-meta.small{font-size:var(--vilog-font-xs)}
+.datasource-modal .section-title{font-size:var(--vilog-font-lg)}
+.datasource-modal .section-head p,.datasource-modal .field label,.datasource-toolbar span,.datasource-list-card .section-head p{font-size:var(--vilog-font-xs)}
+.datasource-form-compact input,.datasource-form-compact textarea,.datasource-form-compact select{padding:6px 8px;font-size:var(--vilog-font-sm)}
+.menu-search-row{display:grid;gap:8px}
+.menu-search-input{width:100%;border:1px solid var(--line);border-radius:10px;background:var(--bg-input);color:var(--ink)}
+.menu-selection-strip.compact{max-height:58px;overflow:auto}
+.menu-meta-tip{color:var(--ink-muted)}
+.menu-check-item{min-height:46px;padding:8px 10px 8px 36px}
+.menu-check-main small{font-size:var(--vilog-font-xs)}
+.toolbar-mini-meta{padding:4px 8px;border:1px solid var(--line);border-radius:999px;background:rgba(255,255,255,.03);font-size:var(--vilog-font-xxs);color:var(--ink-muted)}
+.search-toolbar-row-mini-meta{flex-wrap:wrap}
+.floating-export-dock{position:fixed;right:16px;bottom:16px;z-index:46;pointer-events:none}
+.floating-export-card{display:grid;gap:8px;min-width:240px;max-width:min(360px,calc(100vw - 24px));padding:10px 12px;border:1px solid rgba(87,148,242,.28);border-radius:14px;background:rgba(14,19,27,.96);box-shadow:var(--shadow-xl);pointer-events:auto}
+.floating-export-card.is-busy{opacity:.75}
+.floating-export-copy{display:grid;gap:3px}
+.floating-export-copy strong{font-size:var(--vilog-font-sm);color:#f4f8ff}
+.floating-export-copy span{font-size:var(--vilog-font-xxs);color:var(--ink-muted);line-height:1.35}
+.floating-export-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
+.floating-export-actions .button-small{min-height:28px;padding:5px 7px;font-size:var(--vilog-font-xs)}
+@media (max-width:860px){
+  .floating-export-dock{left:12px;right:12px;bottom:12px}
+  .floating-export-card{max-width:none;min-width:0}
+}
