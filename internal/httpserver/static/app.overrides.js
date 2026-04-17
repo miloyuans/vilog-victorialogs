@@ -20,10 +20,12 @@ function ensureEnhancedState() {
   state.ui.navCollapsed = !!state.ui.navCollapsed;
   state.ui.railCollapsed = !!state.ui.railCollapsed;
   state.ui.detailOpen = !!state.ui.detailOpen;
+  state.ui.datasourceModalOpen = !!state.ui.datasourceModalOpen;
   state.ui.openMenu = state.ui.openMenu || "";
   state.ui.searchLoading = !!state.ui.searchLoading;
   state.ui.datasourceSearch = state.ui.datasourceSearch || "";
   state.ui.datasourceSort = state.ui.datasourceSort || "name";
+  state.ui.datasourceSelectedId = state.ui.datasourceSelectedId || "";
   state.search.selectedDatasourceIDs = state.search.selectedDatasourceIDs || [];
   state.search.serviceNames = state.search.serviceNames || [];
   state.search.services = state.search.services || [];
@@ -287,6 +289,33 @@ function renderSearchToolbar() {
   `;
 }
 
+function renderSelectedMenuTokens(items, kind) {
+  if (!items.length) return `<span class="menu-selection-empty">${esc(s("当前为 ALL", "Currently ALL"))}</span>`;
+  return items
+    .map((item) => {
+      const label = kind === "datasource" ? item.name : item;
+      const attr = kind === "datasource" ? `data-search-datasource-id="${esc(item.id)}"` : `data-search-service-name="${esc(item)}"`;
+      return `<span class="menu-selection-token">${esc(label)}<button class="menu-token-close" type="button" ${attr} aria-label="${esc(s("ç§»é™¤", "Remove"))}">x</button></span>`;
+    })
+    .join("");
+}
+
+function setDatasourceModalOpen(open) {
+  state.ui.datasourceModalOpen = !!open;
+  const modal = byId("datasource-modal");
+  if (modal) modal.classList.toggle("open", !!open);
+}
+
+function upsertDatasourceRecord(saved) {
+  if (!saved || !saved.id) return;
+  const index = state.datasources.findIndex((item) => item.id === saved.id);
+  if (index >= 0) {
+    state.datasources[index] = { ...state.datasources[index], ...saved };
+    return;
+  }
+  state.datasources = [saved].concat(state.datasources || []);
+}
+
 renderExploreTabs = function () {
   return `
     <nav class="nav-tabs nav-tabs-explore">
@@ -431,11 +460,16 @@ renderDatasourceMarkup = function () {
           <div id="datasource-list"></div>
         </div>
       </div>
-      <div class="datasource-detail-grid">
-        <div class="card surface-card"><div class="card-body compact-card-body"><div class="section-head"><div><h2 class="section-title" id="datasource-form-title">${esc(s("创建数据源", "Create Datasource"))}</h2><p>${esc(s("保存时自动执行 test；如果失败，会保留结果并提示你修正配置。", "Saving automatically runs a test; failing results stay visible so you can adjust the configuration."))}</p></div></div><form id="datasource-form" class="stack"></form></div></div>
-        <div class="stack">
-          <div class="card surface-card"><div class="card-body compact-card-body"><div class="section-head"><div><h2 class="section-title">${esc(s("发现快照", "Discovery Snapshot"))}</h2><p>${esc(s("展示最近一次 Discover / Snapshot 的字段结果。", "Shows the latest Discover / Snapshot field output."))}</p></div></div><div class="summary-grid" id="datasource-snapshot"></div></div></div>
-          <div class="card surface-card"><div class="card-body compact-card-body"><div class="section-head"><div><h2 class="section-title">${esc(s("测试与调试输出", "Test and Debug Output"))}</h2><p>${esc(s("自动测试、手动 test、discover 和 snapshot 的结果都会落到这里。", "Auto-test, manual test, discover, and snapshot responses all land here."))}</p></div></div><div class="output-box" id="datasource-output"></div></div></div>
+      <div class="datasource-modal ${state.ui.datasourceModalOpen ? "open" : ""}" id="datasource-modal">
+        <button class="datasource-modal-backdrop" type="button" data-action="close-datasource-modal" aria-label="${esc(s("关闭", "Close"))}"></button>
+        <div class="datasource-modal-dialog">
+          <div class="datasource-detail-grid">
+            <div class="card surface-card"><div class="card-body compact-card-body"><div class="section-head"><div><h2 class="section-title" id="datasource-form-title">${esc(s("创建数据源", "Create Datasource"))}</h2><p>${esc(s("保存时自动执行 test；如果失败，会保留结果并提示你修正配置。", "Saving automatically runs a test; failing results stay visible so you can adjust the configuration."))}</p></div><button class="icon-button" type="button" data-action="close-datasource-modal">x</button></div><form id="datasource-form" class="stack datasource-form-compact"></form></div></div>
+            <div class="stack">
+              <div class="card surface-card"><div class="card-body compact-card-body"><div class="section-head"><div><h2 class="section-title">${esc(s("发现快照", "Discovery Snapshot"))}</h2><p>${esc(s("展示最近一次 Discover / Snapshot 的字段结果。", "Shows the latest Discover / Snapshot field output."))}</p></div></div><div class="summary-grid" id="datasource-snapshot"></div></div></div>
+              <div class="card surface-card"><div class="card-body compact-card-body"><div class="section-head"><div><h2 class="section-title">${esc(s("测试与调试输出", "Test and Debug Output"))}</h2><p>${esc(s("自动测试、手动 test、discover 和 snapshot 的结果都会落到这里。", "Auto-test, manual test, discover, and snapshot responses all land here."))}</p></div></div><div class="output-box" id="datasource-output"></div></div></div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -654,6 +688,10 @@ handleClick = function (event) {
   const action = button.getAttribute("data-action");
   const id = button.getAttribute("data-id");
   if (action === "apply-custom-time") return applyCustomTime();
+  if (action === "close-datasource-modal") {
+    setDatasourceModalOpen(false);
+    return;
+  }
   if (action === "close-search-detail") {
     state.ui.detailOpen = false;
     renderSearchInspector();
@@ -672,6 +710,7 @@ handleClick = function (event) {
   }
   if (action === "export-search-json") return exportSearchResults("json");
   if (action === "export-search-stream") return exportSearchResults("stream");
+  if (action === "inspect-datasource" && id) return fillDatasourceForm(findByID(state.datasources, id));
   if (action === "edit-datasource" && id) return fillDatasourceForm(findByID(state.datasources, id));
   if (action === "delete-datasource" && id) return removeDatasourceDefinition(id, button);
   if (action === "test-datasource" && id) return runDatasourceTest(id, button);
@@ -770,7 +809,8 @@ renderSearchCatalogDatasourceOptions = function () {
   if (trigger) trigger.textContent = getSearchDatasourceLabel();
   if (!menu) return;
   if (!state.datasources.length) return void (menu.innerHTML = empty(s("暂无数据源。", "No datasource.")));
-  menu.innerHTML = `<div class="toolbar-menu-section"><div class="menu-section-title">${esc(s("查询数据源", "Search Datasources"))}</div><div class="menu-action-row"><button class="chip-button ${state.search.selectedDatasourceIDs.length >= state.datasources.length ? "active" : ""}" type="button" data-search-datasource-all="1">ALL</button></div><div class="menu-check-list">${state.datasources.map((item) => { const selected = state.search.selectedDatasourceIDs.indexOf(item.id) >= 0; const isCatalog = item.id === state.search.catalogDatasourceID; return `<button class="menu-check-item ${selected ? "active" : ""}" type="button" data-search-datasource-id="${esc(item.id)}"><span class="menu-check-main"><strong>${esc(item.name)}</strong><small>${esc(item.base_url || "-")}</small></span><span class="menu-check-meta">${pill(isCatalog ? s("主目录", "Catalog") : item.enabled ? s("启用", "Enabled") : s("停用", "Disabled"), isCatalog ? "tone-neutral" : item.enabled ? "tone-ok" : "tone-warn")}</span></button>`; }).join("")}</div></div>`;
+  const selectedItems = state.datasources.filter((item) => state.search.selectedDatasourceIDs.indexOf(item.id) >= 0);
+  menu.innerHTML = `<div class="toolbar-menu-section"><div class="menu-section-title">${esc(s("查询数据源", "Search Datasources"))}</div><div class="menu-selection-strip">${renderSelectedMenuTokens(selectedItems, "datasource")}</div><div class="menu-action-row"><button class="chip-button ${state.search.selectedDatasourceIDs.length >= state.datasources.length ? "active" : ""}" type="button" data-search-datasource-all="1">ALL</button></div><div class="menu-check-list">${state.datasources.map((item) => { const selected = state.search.selectedDatasourceIDs.indexOf(item.id) >= 0; const isCatalog = item.id === state.search.catalogDatasourceID; return `<button class="menu-check-item ${selected ? "active" : ""}" type="button" data-search-datasource-id="${esc(item.id)}"><span class="menu-check-indicator">${selected ? "✓" : ""}</span><span class="menu-check-main"><strong>${esc(item.name)}</strong><small>${esc(item.base_url || "-")}</small></span><span class="menu-check-meta">${pill(isCatalog ? s("主目录", "Catalog") : item.enabled ? s("启用", "Enabled") : s("停用", "Disabled"), isCatalog ? "tone-neutral" : item.enabled ? "tone-ok" : "tone-warn")}</span></button>`; }).join("")}</div></div>`;
 };
 
 renderSearchServiceOptions = function () {
@@ -780,7 +820,7 @@ renderSearchServiceOptions = function () {
   if (!menu) return;
   if (!state.search.catalogDatasourceID) return void (menu.innerHTML = empty(s("先选择数据源。", "Pick a datasource first.")));
   if (!state.search.services.length) return void (menu.innerHTML = empty(s("服务目录为空，请先执行 Discover。", "Service catalog is empty. Run Discover first.")));
-  menu.innerHTML = `<div class="toolbar-menu-section"><div class="menu-section-title">${esc(s("服务目录", "Service Catalog"))}</div><div class="menu-action-row"><button class="chip-button ${state.search.serviceNames.length === 0 || state.search.serviceNames.length >= state.search.services.length ? "active" : ""}" type="button" data-search-service-all="1">ALL</button></div><div class="menu-check-list">${state.search.services.map((name) => `<button class="menu-check-item ${state.search.serviceNames.indexOf(name) >= 0 ? "active" : ""}" type="button" data-search-service-name="${esc(name)}"><span class="menu-check-main"><strong>${esc(name)}</strong><small>${esc(s("支持单选、多选或 ALL；单服务时标签目录会更精确。", "Supports single, multi, or ALL; single-service selection yields a narrower tag catalog."))}</small></span></button>`).join("")}</div></div>`;
+  menu.innerHTML = `<div class="toolbar-menu-section"><div class="menu-section-title">${esc(s("服务目录", "Service Catalog"))}</div><div class="menu-selection-strip">${renderSelectedMenuTokens(state.search.serviceNames, "service")}</div><div class="menu-action-row"><button class="chip-button ${state.search.serviceNames.length === 0 || state.search.serviceNames.length >= state.search.services.length ? "active" : ""}" type="button" data-search-service-all="1">ALL</button></div><div class="menu-check-list">${state.search.services.map((name) => `<button class="menu-check-item ${state.search.serviceNames.indexOf(name) >= 0 ? "active" : ""}" type="button" data-search-service-name="${esc(name)}"><span class="menu-check-indicator">${state.search.serviceNames.indexOf(name) >= 0 ? "✓" : ""}</span><span class="menu-check-main"><strong>${esc(name)}</strong><small>${esc(s("支持单选、多选或 ALL；单服务时标签目录会更精确。", "Supports single, multi, or ALL; single-service selection yields a narrower tag catalog."))}</small></span></button>`).join("")}</div></div>`;
 };
 
 renderSearchTimePanel = function () {
@@ -1091,10 +1131,104 @@ applyCustomTime = function () {
   renderSearchTimePanel();
 };
 
+resetDatasourceForm = function (event, options) {
+  const invokedByClick = !!(event && typeof event.preventDefault === "function");
+  if (invokedByClick) event.preventDefault();
+  const shouldOpen = options && typeof options.open === "boolean" ? options.open : invokedByClick;
+  state.datasourceEditingId = "";
+  state.ui.datasourceSelectedId = "";
+  byId("datasource-form-title").textContent = s("åˆ›å»ºæ•°æ®æº", "Create Datasource");
+  byId("datasource-submit").textContent = s("ä¿å­˜æ•°æ®æº", "Save Datasource");
+  byId("ds-name").value = "";
+  byId("ds-base-url").value = "";
+  byId("ds-timeout").value = 15;
+  byId("ds-enabled").checked = true;
+  byId("ds-supports-delete").checked = false;
+  byId("ds-header-account").value = "";
+  byId("ds-header-project").value = "";
+  byId("ds-header-auth").value = "";
+  byId("ds-field-service").value = "";
+  byId("ds-field-pod").value = "";
+  byId("ds-field-message").value = "";
+  byId("ds-field-time").value = defaults.fieldMapping.time_field;
+  applyDatasourceDefaults();
+  renderDatasourceList();
+  setDatasourceModalOpen(shouldOpen);
+};
+
+fillDatasourceForm = function (item, options) {
+  if (!item) return;
+  state.datasourceEditingId = item.id;
+  state.ui.datasourceSelectedId = item.id;
+  byId("datasource-form-title").textContent = s("æ›´æ–°æ•°æ®æº", "Update Datasource");
+  byId("datasource-submit").textContent = s("æ›´æ–°æ•°æ®æº", "Update Datasource");
+  byId("ds-name").value = item.name || "";
+  byId("ds-base-url").value = item.base_url || "";
+  byId("ds-timeout").value = item.timeout_seconds || 15;
+  byId("ds-enabled").checked = !!item.enabled;
+  byId("ds-supports-delete").checked = !!item.supports_delete;
+  byId("ds-header-account").value = (item.headers && item.headers.AccountID) || "";
+  byId("ds-header-project").value = (item.headers && item.headers.ProjectID) || "";
+  byId("ds-header-auth").value = (item.headers && item.headers.Authorization) || "";
+  byId("ds-field-service").value = (item.field_mapping && item.field_mapping.service_field) || "";
+  byId("ds-field-pod").value = (item.field_mapping && item.field_mapping.pod_field) || "";
+  byId("ds-field-message").value = (item.field_mapping && item.field_mapping.message_field) || "";
+  byId("ds-field-time").value = (item.field_mapping && item.field_mapping.time_field) || defaults.fieldMapping.time_field;
+  byId("ds-path-query").value = (item.query_paths && item.query_paths.query) || defaults.queryPaths.query;
+  byId("ds-path-field-names").value = (item.query_paths && item.query_paths.field_names) || defaults.queryPaths.field_names;
+  byId("ds-path-field-values").value = (item.query_paths && item.query_paths.field_values) || defaults.queryPaths.field_values;
+  byId("ds-path-stream-field-names").value = (item.query_paths && item.query_paths.stream_field_names) || defaults.queryPaths.stream_field_names;
+  byId("ds-path-stream-field-values").value = (item.query_paths && item.query_paths.stream_field_values) || defaults.queryPaths.stream_field_values;
+  byId("ds-path-facets").value = (item.query_paths && item.query_paths.facets) || defaults.queryPaths.facets;
+  byId("ds-path-delete-run").value = (item.query_paths && item.query_paths.delete_run_task) || defaults.queryPaths.delete_run_task;
+  byId("ds-path-delete-active").value = (item.query_paths && item.query_paths.delete_active_tasks) || defaults.queryPaths.delete_active_tasks;
+  byId("ds-path-delete-stop").value = (item.query_paths && item.query_paths.delete_stop_task) || defaults.queryPaths.delete_stop_task;
+  setPanel("datasources");
+  renderDatasourceList();
+  setDatasourceModalOpen(!(options && options.open === false));
+};
+
+renderDatasourceList = function () {
+  const node = byId("datasource-list");
+  if (!node) return;
+  const items = filteredDatasourceItems();
+  if (!state.datasources.length) return void (node.innerHTML = empty(s("è¿˜æ²¡æœ‰é…ç½®ä»»ä½•æ•°æ®æºã€‚", "No datasource configured yet.")));
+  if (!items.length) return void (node.innerHTML = empty(s("æ²¡æœ‰åŒ¹é…å½“å‰æœç´¢æ¡ä»¶çš„æ•°æ®æºã€‚", "No datasource matches the current search filter.")));
+  node.innerHTML = `<div class="datasource-list-grid">${items.map((item) => { const mapping = item.field_mapping || {}; const active = state.ui.datasourceSelectedId === item.id; return `<article class="datasource-list-item ${active ? "active" : ""}"><button class="datasource-list-main datasource-list-main-button" type="button" data-action="inspect-datasource" data-id="${esc(item.id)}"><div class="datasource-badge">VL</div><div class="datasource-list-copy"><div class="datasource-list-head"><strong>${esc(item.name || "-")}</strong><div class="chip-row">${pill(item.enabled ? s("å¯ç”¨", "Enabled") : s("åœç”¨", "Disabled"), item.enabled ? "tone-ok" : "tone-warn")}${pill(item.supports_delete ? s("å…è®¸åˆ é™¤", "Delete On") : s("åªè¯»", "Read Only"), item.supports_delete ? "tone-warn" : "tone-soft")}</div></div><div class="datasource-list-meta"><span>VictoriaLogs</span><span class="datasource-sep">|</span><span class="mono">${esc(item.base_url || "-")}</span></div><div class="datasource-list-meta small"><span>${esc(s("æœåŠ¡å­—æ®µ", "Service"))}: ${esc(mapping.service_field || "service")}</span><span>${esc(s("æ¶ˆæ¯å­—æ®µ", "Message"))}: ${esc(mapping.message_field || "_msg")}</span><span>${esc(s("æ—¶é—´å­—æ®µ", "Time"))}: ${esc(mapping.time_field || "_time")}</span><span>${esc(s("æ›´æ–°", "Updated"))}: ${esc(formatDate(item.updated_at))}</span></div></div></button><div class="datasource-list-actions"><button class="button button-small" type="button" data-action="explore-datasource" data-id="${esc(item.id)}">${esc(s("Explore", "Explore"))}</button><button class="button button-small" type="button" data-action="edit-datasource" data-id="${esc(item.id)}">${esc(s("ç¼–è¾‘", "Edit"))}</button><button class="button button-small" type="button" data-action="test-datasource" data-id="${esc(item.id)}">${esc(s("æµ‹è¯•", "Test"))}</button><button class="button button-small" type="button" data-action="discover-datasource" data-id="${esc(item.id)}">Discover</button><button class="button button-small" type="button" data-action="snapshot-datasource" data-id="${esc(item.id)}">Snapshot</button><button class="button button-small button-danger" type="button" data-action="delete-datasource" data-id="${esc(item.id)}">${esc(s("åˆ é™¤", "Delete"))}</button></div></article>`; }).join("")}</div>`;
+};
+
+submitDatasource = async function (event) {
+  event.preventDefault();
+  const isUpdate = !!state.datasourceEditingId;
+  const payload = { name: byId("ds-name").value.trim(), base_url: byId("ds-base-url").value.trim(), enabled: byId("ds-enabled").checked, timeout_seconds: Number(byId("ds-timeout").value || 15), headers: { AccountID: byId("ds-header-account").value.trim(), ProjectID: byId("ds-header-project").value.trim(), Authorization: byId("ds-header-auth").value.trim() }, field_mapping: { service_field: byId("ds-field-service").value.trim(), pod_field: byId("ds-field-pod").value.trim(), message_field: byId("ds-field-message").value.trim(), time_field: byId("ds-field-time").value.trim() }, query_paths: { query: byId("ds-path-query").value.trim(), field_names: byId("ds-path-field-names").value.trim(), field_values: byId("ds-path-field-values").value.trim(), stream_field_names: byId("ds-path-stream-field-names").value.trim(), stream_field_values: byId("ds-path-stream-field-values").value.trim(), facets: byId("ds-path-facets").value.trim(), delete_run_task: byId("ds-path-delete-run").value.trim(), delete_active_tasks: byId("ds-path-delete-active").value.trim(), delete_stop_task: byId("ds-path-delete-stop").value.trim() }, supports_delete: byId("ds-supports-delete").checked };
+  await busy(byId("datasource-submit"), async () => {
+    const saved = state.datasourceEditingId ? await request("/api/datasources/" + encodeURIComponent(state.datasourceEditingId), { method: "PUT", body: JSON.stringify(payload) }) : await request("/api/datasources", { method: "POST", body: JSON.stringify(payload) });
+    let testResult;
+    try { testResult = await request("/api/datasources/" + encodeURIComponent(saved.id) + "/test", { method: "POST" }); } catch (error) { testResult = { ok: false, message: error.message }; }
+    state.datasourceOutput = { datasource: saved, test: testResult };
+    upsertDatasourceRecord(saved);
+    state.datasourceEditingId = saved.id;
+    state.ui.datasourceSelectedId = saved.id;
+    state.ui.datasourceModalOpen = true;
+    renderDatasourceList();
+    await loadDatasources();
+    normalizeDatasourceState();
+    renderAll();
+    fillDatasourceForm(findByID(state.datasources, saved.id) || saved);
+    if (state.search.catalogDatasourceID) await loadSearchCatalogs();
+    toast(testResult && testResult.ok ? (isUpdate ? s("æ•°æ®æºå·²æ›´æ–°å¹¶é€šè¿‡æµ‹è¯•ã€‚", "Datasource updated and test passed.") : s("æ•°æ®æºå·²åˆ›å»ºå¹¶é€šè¿‡æµ‹è¯•ã€‚", "Datasource created and test passed.")) : (isUpdate ? s("æ•°æ®æºå·²æ›´æ–°ï¼Œä½†æµ‹è¯•å¤±è´¥ã€‚", "Datasource updated, but test failed.") : s("æ•°æ®æºå·²åˆ›å»ºï¼Œä½†æµ‹è¯•å¤±è´¥ã€‚", "Datasource created, but test failed.")), testResult && testResult.ok ? "success" : "error");
+  });
+};
+
 removeDatasourceDefinition = async function (id, button) {
   if (!window.confirm(s("确认删除这个数据源吗？", "Delete this datasource?"))) return;
   await busy(button, async () => {
     await request("/api/datasources/" + encodeURIComponent(id), { method: "DELETE" });
+    if (state.ui.datasourceSelectedId === id) {
+      state.ui.datasourceSelectedId = "";
+      state.datasourceEditingId = "";
+      setDatasourceModalOpen(false);
+    }
     await loadDatasources();
     normalizeDatasourceState();
     renderAll();
@@ -1156,6 +1290,106 @@ getSearchTimeLabel = function () {
   if (state.search.timePreset !== "custom") return presetLabels[state.search.timePreset] || presetLabels["1h"];
   if (!byId("search-start").value || !byId("search-end").value) return s("自定义", "Custom");
   return `${byId("search-start").value.replace("T", " ")} ~ ${byId("search-end").value.replace("T", " ")}`;
+};
+
+renderSelectedMenuTokens = function (items, kind) {
+  if (!items.length) return `<span class="menu-selection-empty">${esc(s("当前为 ALL", "Currently ALL"))}</span>`;
+  return items
+    .map((item) => {
+      const label = kind === "datasource" ? item.name : item;
+      const attr = kind === "datasource" ? `data-search-datasource-id="${esc(item.id)}"` : `data-search-service-name="${esc(item)}"`;
+      return `<span class="menu-selection-token">${esc(label)}<button class="menu-token-close" type="button" ${attr} aria-label="${esc(s("移除", "Remove"))}">x</button></span>`;
+    })
+    .join("");
+};
+
+resetDatasourceForm = function (event, options) {
+  const invokedByClick = !!(event && typeof event.preventDefault === "function");
+  if (invokedByClick) event.preventDefault();
+  const shouldOpen = options && typeof options.open === "boolean" ? options.open : invokedByClick;
+  state.datasourceEditingId = "";
+  state.ui.datasourceSelectedId = "";
+  byId("datasource-form-title").textContent = s("创建数据源", "Create Datasource");
+  byId("datasource-submit").textContent = s("保存数据源", "Save Datasource");
+  byId("ds-name").value = "";
+  byId("ds-base-url").value = "";
+  byId("ds-timeout").value = 15;
+  byId("ds-enabled").checked = true;
+  byId("ds-supports-delete").checked = false;
+  byId("ds-header-account").value = "";
+  byId("ds-header-project").value = "";
+  byId("ds-header-auth").value = "";
+  byId("ds-field-service").value = "";
+  byId("ds-field-pod").value = "";
+  byId("ds-field-message").value = "";
+  byId("ds-field-time").value = defaults.fieldMapping.time_field;
+  applyDatasourceDefaults();
+  renderDatasourceList();
+  setDatasourceModalOpen(shouldOpen);
+};
+
+fillDatasourceForm = function (item, options) {
+  if (!item) return;
+  state.datasourceEditingId = item.id;
+  state.ui.datasourceSelectedId = item.id;
+  byId("datasource-form-title").textContent = s("更新数据源", "Update Datasource");
+  byId("datasource-submit").textContent = s("更新数据源", "Update Datasource");
+  byId("ds-name").value = item.name || "";
+  byId("ds-base-url").value = item.base_url || "";
+  byId("ds-timeout").value = item.timeout_seconds || 15;
+  byId("ds-enabled").checked = !!item.enabled;
+  byId("ds-supports-delete").checked = !!item.supports_delete;
+  byId("ds-header-account").value = (item.headers && item.headers.AccountID) || "";
+  byId("ds-header-project").value = (item.headers && item.headers.ProjectID) || "";
+  byId("ds-header-auth").value = (item.headers && item.headers.Authorization) || "";
+  byId("ds-field-service").value = (item.field_mapping && item.field_mapping.service_field) || "";
+  byId("ds-field-pod").value = (item.field_mapping && item.field_mapping.pod_field) || "";
+  byId("ds-field-message").value = (item.field_mapping && item.field_mapping.message_field) || "";
+  byId("ds-field-time").value = (item.field_mapping && item.field_mapping.time_field) || defaults.fieldMapping.time_field;
+  byId("ds-path-query").value = (item.query_paths && item.query_paths.query) || defaults.queryPaths.query;
+  byId("ds-path-field-names").value = (item.query_paths && item.query_paths.field_names) || defaults.queryPaths.field_names;
+  byId("ds-path-field-values").value = (item.query_paths && item.query_paths.field_values) || defaults.queryPaths.field_values;
+  byId("ds-path-stream-field-names").value = (item.query_paths && item.query_paths.stream_field_names) || defaults.queryPaths.stream_field_names;
+  byId("ds-path-stream-field-values").value = (item.query_paths && item.query_paths.stream_field_values) || defaults.queryPaths.stream_field_values;
+  byId("ds-path-facets").value = (item.query_paths && item.query_paths.facets) || defaults.queryPaths.facets;
+  byId("ds-path-delete-run").value = (item.query_paths && item.query_paths.delete_run_task) || defaults.queryPaths.delete_run_task;
+  byId("ds-path-delete-active").value = (item.query_paths && item.query_paths.delete_active_tasks) || defaults.queryPaths.delete_active_tasks;
+  byId("ds-path-delete-stop").value = (item.query_paths && item.query_paths.delete_stop_task) || defaults.queryPaths.delete_stop_task;
+  setPanel("datasources");
+  renderDatasourceList();
+  setDatasourceModalOpen(!(options && options.open === false));
+};
+
+renderDatasourceList = function () {
+  const node = byId("datasource-list");
+  if (!node) return;
+  const items = filteredDatasourceItems();
+  if (!state.datasources.length) return void (node.innerHTML = empty(s("还没有配置任何数据源。", "No datasource configured yet.")));
+  if (!items.length) return void (node.innerHTML = empty(s("没有匹配当前搜索条件的数据源。", "No datasource matches the current search filter.")));
+  node.innerHTML = `<div class="datasource-list-grid">${items.map((item) => { const mapping = item.field_mapping || {}; const active = state.ui.datasourceSelectedId === item.id; return `<article class="datasource-list-item ${active ? "active" : ""}"><button class="datasource-list-main datasource-list-main-button" type="button" data-action="inspect-datasource" data-id="${esc(item.id)}"><div class="datasource-badge">VL</div><div class="datasource-list-copy"><div class="datasource-list-head"><strong>${esc(item.name || "-")}</strong><div class="chip-row">${pill(item.enabled ? s("启用", "Enabled") : s("停用", "Disabled"), item.enabled ? "tone-ok" : "tone-warn")}${pill(item.supports_delete ? s("允许删除", "Delete On") : s("只读", "Read Only"), item.supports_delete ? "tone-warn" : "tone-soft")}</div></div><div class="datasource-list-meta"><span>VictoriaLogs</span><span class="datasource-sep">|</span><span class="mono">${esc(item.base_url || "-")}</span></div><div class="datasource-list-meta small"><span>${esc(s("服务字段", "Service"))}: ${esc(mapping.service_field || "service")}</span><span>${esc(s("消息字段", "Message"))}: ${esc(mapping.message_field || "_msg")}</span><span>${esc(s("时间字段", "Time"))}: ${esc(mapping.time_field || "_time")}</span><span>${esc(s("更新", "Updated"))}: ${esc(formatDate(item.updated_at))}</span></div></div></button><div class="datasource-list-actions"><button class="button button-small" type="button" data-action="explore-datasource" data-id="${esc(item.id)}">${esc(s("Explore", "Explore"))}</button><button class="button button-small" type="button" data-action="edit-datasource" data-id="${esc(item.id)}">${esc(s("编辑", "Edit"))}</button><button class="button button-small" type="button" data-action="test-datasource" data-id="${esc(item.id)}">${esc(s("测试", "Test"))}</button><button class="button button-small" type="button" data-action="discover-datasource" data-id="${esc(item.id)}">Discover</button><button class="button button-small" type="button" data-action="snapshot-datasource" data-id="${esc(item.id)}">Snapshot</button><button class="button button-small button-danger" type="button" data-action="delete-datasource" data-id="${esc(item.id)}">${esc(s("删除", "Delete"))}</button></div></article>`; }).join("")}</div>`;
+};
+
+submitDatasource = async function (event) {
+  event.preventDefault();
+  const isUpdate = !!state.datasourceEditingId;
+  const payload = { name: byId("ds-name").value.trim(), base_url: byId("ds-base-url").value.trim(), enabled: byId("ds-enabled").checked, timeout_seconds: Number(byId("ds-timeout").value || 15), headers: { AccountID: byId("ds-header-account").value.trim(), ProjectID: byId("ds-header-project").value.trim(), Authorization: byId("ds-header-auth").value.trim() }, field_mapping: { service_field: byId("ds-field-service").value.trim(), pod_field: byId("ds-field-pod").value.trim(), message_field: byId("ds-field-message").value.trim(), time_field: byId("ds-field-time").value.trim() }, query_paths: { query: byId("ds-path-query").value.trim(), field_names: byId("ds-path-field-names").value.trim(), field_values: byId("ds-path-field-values").value.trim(), stream_field_names: byId("ds-path-stream-field-names").value.trim(), stream_field_values: byId("ds-path-stream-field-values").value.trim(), facets: byId("ds-path-facets").value.trim(), delete_run_task: byId("ds-path-delete-run").value.trim(), delete_active_tasks: byId("ds-path-delete-active").value.trim(), delete_stop_task: byId("ds-path-delete-stop").value.trim() }, supports_delete: byId("ds-supports-delete").checked };
+  await busy(byId("datasource-submit"), async () => {
+    const saved = state.datasourceEditingId ? await request("/api/datasources/" + encodeURIComponent(state.datasourceEditingId), { method: "PUT", body: JSON.stringify(payload) }) : await request("/api/datasources", { method: "POST", body: JSON.stringify(payload) });
+    let testResult;
+    try { testResult = await request("/api/datasources/" + encodeURIComponent(saved.id) + "/test", { method: "POST" }); } catch (error) { testResult = { ok: false, message: error.message }; }
+    state.datasourceOutput = { datasource: saved, test: testResult };
+    upsertDatasourceRecord(saved);
+    state.datasourceEditingId = saved.id;
+    state.ui.datasourceSelectedId = saved.id;
+    state.ui.datasourceModalOpen = true;
+    renderDatasourceList();
+    await loadDatasources();
+    normalizeDatasourceState();
+    renderAll();
+    fillDatasourceForm(findByID(state.datasources, saved.id) || saved);
+    if (state.search.catalogDatasourceID) await loadSearchCatalogs();
+    toast(testResult && testResult.ok ? (isUpdate ? s("数据源已更新并通过测试。", "Datasource updated and test passed.") : s("数据源已创建并通过测试。", "Datasource created and test passed.")) : (isUpdate ? s("数据源已更新，但测试失败。", "Datasource updated, but test failed.") : s("数据源已创建，但测试失败。", "Datasource created, but test failed.")), testResult && testResult.ok ? "success" : "error");
+  });
 };
 
 highlight = function (text) {
