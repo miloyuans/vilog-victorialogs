@@ -40,12 +40,22 @@ logging:
   development: true
 
 cache:
+  query_ttl: 5m
+  service_list_ttl: 30m
+  tag_values_ttl: 30m
+  local_query_dir: ./data/query-cache
+  local_query_retention: 24h
+  source_chunk_size: 1000
+  source_request_limit: 10000
+  max_query_window: 100000
+
+#cache:
   # 查询结果缓存 TTL。建议保守设置，避免误以为是实时结果。
-  query_ttl: 300s
+#  query_ttl: 300s
   # 服务列表缓存 TTL。
-  service_list_ttl: 1800s
+# service_list_ttl: 1800s
   # 标签值缓存 TTL。
-  tag_values_ttl: 1800s
+#  tag_values_ttl: 1800s
 
 victorialogs:
   # 对单次 VictoriaLogs 请求的重试次数，不含首次请求。
