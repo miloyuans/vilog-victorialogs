@@ -52,7 +52,7 @@ function ensureEnhancedState() {
 ensureEnhancedState();
 
 function unique(list) {
-  return Array.from(new Set(list.filter(Boolean)));
+  return Array.from(new Set((Array.isArray(list) ? list : []).filter(Boolean)));
 }
 
 function splitKeywordTokens(value) {
@@ -117,7 +117,7 @@ function getQueryTerms() {
 
 function syncHiddenQueryInput() {
   const hidden = byId("search-keyword");
-  if (hidden) hidden.value = buildBackendQueryFromLayer(getPrimaryLayer());
+  if (hidden) hidden.value = getPrimaryLayer().mode === "logsql" ? buildBackendQueryFromLayer(getPrimaryLayer()) : "";
 }
 
 function searchableText(item) {
@@ -1403,8 +1403,6 @@ highlight = function (text) {
   }
 };
 
-bootstrap();
-
 
 /* ===== UX compact + searchable dropdown + floating export patch ===== */
 (function () {
@@ -1414,6 +1412,48 @@ bootstrap();
 
   function safeObject(value) {
     return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  }
+
+  const PAGE_SIZE_PRESETS = [100, 200, 500, 1000];
+  const BACKEND_SEARCH_PAGE_SIZE = 1000;
+  const SEARCH_EXPORT_LIMIT = 100000;
+
+  function getResolvedSearchPageSize(value) {
+    const candidate = Number(value || state.search && state.search.pageSizeCustom || state.search && state.search.pageSize || 500);
+    if (!Number.isFinite(candidate)) return 500;
+    return Math.min(50000, Math.max(50, Math.floor(candidate)));
+  }
+
+  function getActivePageSizeMode() {
+    const size = getResolvedSearchPageSize(state.search && state.search.pageSize || 500);
+    return PAGE_SIZE_PRESETS.indexOf(size) >= 0 ? String(size) : "custom";
+  }
+
+  function resolveSearchPageSizeFromDOM() {
+    const select = byId("search-page-size");
+    const custom = byId("search-page-size-custom");
+    if (select && select.value === "custom") return getResolvedSearchPageSize(custom && custom.value);
+    return getResolvedSearchPageSize(select && select.value);
+  }
+
+  function getBackendPrimaryQuery(layer) {
+    if (!layer) return "";
+    return layer.mode === "logsql" ? buildBackendQueryFromLayer(layer) : "";
+  }
+
+  function mergeSourceDiagnostics(target, items) {
+    safeArray(items).forEach((item, index) => {
+      const source = safeObject(item);
+      const key = String(
+        source.datasource_id
+        || source.id
+        || source.datasource
+        || source.name
+        || source.base_url
+        || index
+      );
+      target.set(key, source);
+    });
   }
 
   function normalizeFrontendCollections() {
@@ -1435,7 +1475,16 @@ bootstrap();
     state.search.tagValues = safeObject(state.search.tagValues);
     state.search.activeFilters = safeObject(state.search.activeFilters);
     state.search.queryLayers = safeArray(state.search.queryLayers).length ? state.search.queryLayers : [createQueryLayer("keyword", "")];
+    state.search.page = Math.max(1, Number(state.search.page || 1) || 1);
+    state.search.pageSize = getResolvedSearchPageSize(state.search.pageSize || 500);
+    state.search.pageSizeCustom = getResolvedSearchPageSize(state.search.pageSizeCustom || state.search.pageSize || 1500);
+    state.search.pageSizeMode = String(state.search.pageSizeMode || getActivePageSizeMode());
+    if (state.search.pageSizeMode !== "custom" && PAGE_SIZE_PRESETS.indexOf(Number(state.search.pageSizeMode)) >= 0) {
+      state.search.pageSize = getResolvedSearchPageSize(state.search.pageSizeMode);
+    }
     state.search.exporting = !!state.search.exporting;
+    state.search.exportStatusText = String(state.search.exportStatusText || "");
+    state.search.exportStatusTone = String(state.search.exportStatusTone || "idle");
   }
 
   if (!ensureEnhancedState.__base) {
@@ -1491,15 +1540,66 @@ bootstrap();
     syncHiddenQueryInput();
     const primaryLayer = getPrimaryLayer();
     return {
-      keyword: buildBackendQueryFromLayer(primaryLayer),
+      keyword: getBackendPrimaryQuery(primaryLayer),
       start: localToRFC3339((byId("search-start") && byId("search-start").value) || ""),
       end: localToRFC3339((byId("search-end") && byId("search-end").value) || ""),
       datasource_ids: safeArray(state.search.selectedDatasourceIDs).slice(),
       service_names: safeArray(state.search.serviceNames).slice(),
       tags: normalizeFilters(state.search.activeFilters),
       page: Number(page || state.search.page || 1),
-      page_size: Number(pageSize || state.search.pageSize || 500),
+      page_size: getResolvedSearchPageSize(pageSize || state.search.pageSize || 500),
       use_cache: state.search.useCache !== false,
+    };
+  }
+
+  async function requestSearchWindow(page, pageSize) {
+    normalizeFrontendCollections();
+    const requestedPage = Math.max(1, Number(page || state.search.page || 1) || 1);
+    const requestedSize = getResolvedSearchPageSize(pageSize || state.search.pageSize || 500);
+    const backendPageSize = Math.min(BACKEND_SEARCH_PAGE_SIZE, requestedSize);
+    const offset = (requestedPage - 1) * requestedSize;
+    const firstBackendPage = Math.floor(offset / backendPageSize) + 1;
+    const innerOffset = offset % backendPageSize;
+    const needed = innerOffset + requestedSize;
+    const sourceMap = new Map();
+    let merged = [];
+    let total = 0;
+    let partial = false;
+    let cacheHit = false;
+    let tookMs = 0;
+    let currentPage = firstBackendPage;
+    let lastPayload = null;
+
+    while (merged.length < needed && currentPage < firstBackendPage + 200) {
+      lastPayload = buildCurrentSearchPayload(currentPage, backendPageSize);
+      const response = safeObject(await request("/api/query/search", {
+        method: "POST",
+        body: JSON.stringify(lastPayload),
+      }));
+      const rows = safeArray(response.results);
+      mergeSourceDiagnostics(sourceMap, response.sources);
+      total = Math.max(total, Number(response.total || 0));
+      partial = partial || !!response.partial;
+      cacheHit = cacheHit || !!response.cache_hit;
+      tookMs += Number(response.took_ms || 0);
+      if (!rows.length) break;
+      merged = merged.concat(rows);
+      if ((total && currentPage * backendPageSize >= total) || rows.length < backendPageSize) break;
+      currentPage += 1;
+    }
+
+    return {
+      keyword: lastPayload ? lastPayload.keyword : "",
+      start: lastPayload ? lastPayload.start : "",
+      end: lastPayload ? lastPayload.end : "",
+      results: merged.slice(innerOffset, innerOffset + requestedSize),
+      total: total || merged.length,
+      page: requestedPage,
+      page_size: requestedSize,
+      partial,
+      cache_hit: cacheHit,
+      took_ms: tookMs,
+      sources: Array.from(sourceMap.values()),
     };
   }
 
@@ -1526,7 +1626,7 @@ bootstrap();
 
   async function fetchAllResultsForExport() {
     normalizeFrontendCollections();
-    const hardLimit = 20000;
+    const hardLimit = SEARCH_EXPORT_LIMIT;
     const exportPageSize = Math.min(1000, Math.max(200, Number(state.search.pageSize || 500)));
     let page = 1;
     let merged = [];
@@ -1559,39 +1659,75 @@ bootstrap();
     return "logs-" + (allResults ? "all" : "page") + "-" + range + "." + ext;
   }
 
-  function downloadDecoratedResults(format, results, allResults) {
+  function triggerBlobDownload(filename, blob) {
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  async function downloadCompressedExport(filename, text, mimeType) {
+    if (typeof CompressionStream === "undefined") {
+      downloadTextFile(filename, text, mimeType);
+      return { filename, compressed: false };
+    }
+    try {
+      const source = new Blob([text], { type: mimeType + ";charset=utf-8" });
+      const stream = source.stream().pipeThrough(new CompressionStream("gzip"));
+      const compressed = await new Response(stream).blob();
+      const downloadName = filename + ".gz";
+      triggerBlobDownload(downloadName, compressed);
+      return { filename: downloadName, compressed: true };
+    } catch (error) {
+      downloadTextFile(filename, text, mimeType);
+      return { filename, compressed: false };
+    }
+  }
+
+  async function downloadDecoratedResults(format, results, allResults) {
     if (!safeArray(results).length) {
+      throw new Error("No query results to export.");
       toast(s("没有可导出的查询结果。", "No query results to export."), "error");
       return;
     }
     if (format === "json") {
       downloadTextFile(exportFilename("json", allResults), JSON.stringify(results.map(stripRuntimeFields), null, 2), "application/json");
+      return { filename: exportFilename("json", allResults), compressed: false };
       return;
     }
     const text = results
       .map((item) => `[${formatDate(item.timestamp)}] ${item.datasource || "-"} ${item.service || "-"} ${item.message || ""}`)
       .join("\n");
-    downloadTextFile(exportFilename("txt", allResults), text, "text/plain");
+    return downloadCompressedExport(exportFilename("txt", allResults), text, "text/plain");
   }
 
   async function runExport(format, options) {
     normalizeFrontendCollections();
     const allResults = !!(options && options.all);
-    if (allResults) {
-      state.search.exporting = true;
+    state.search.exporting = true;
+    state.search.exportStatusTone = "busy";
+    state.search.exportStatusText = allResults
+      ? "Preparing the full export in chunks."
+      : "Preparing the current-page export.";
+    renderSearchFloatingExportDock();
+    try {
+      const results = allResults ? await fetchAllResultsForExport() : getVisibleResults();
+      const exported = await downloadDecoratedResults(format, results, allResults);
+      state.search.exportStatusTone = "ok";
+      state.search.exportStatusText = "Export ready: " + exported.filename;
+      toast(state.search.exportStatusText, "success");
+    } catch (error) {
+      state.search.exportStatusTone = "error";
+      state.search.exportStatusText = error.message || String(error);
+      toast(state.search.exportStatusText, "error");
+    } finally {
+      state.search.exporting = false;
       renderSearchFloatingExportDock();
-      try {
-        const results = await fetchAllResultsForExport();
-        downloadDecoratedResults(format, results, true);
-      } catch (error) {
-        toast(error.message || String(error), "error");
-      } finally {
-        state.search.exporting = false;
-        renderSearchFloatingExportDock();
-      }
-      return;
     }
-    downloadDecoratedResults(format, getVisibleResults(), false);
   }
 
   exportSearchResults = function (format, options) {
@@ -1636,21 +1772,27 @@ bootstrap();
       return;
     }
 
-    const serviceParams = new URLSearchParams({ datasource_id: state.search.catalogDatasourceID });
+    const selectedDatasourceIDs = safeArray(state.search.selectedDatasourceIDs).length
+      ? safeArray(state.search.selectedDatasourceIDs)
+      : [state.search.catalogDatasourceID];
     const tagParams = new URLSearchParams({ datasource_id: state.search.catalogDatasourceID });
     if (safeArray(state.search.serviceNames).length === 1) tagParams.set("service", state.search.serviceNames[0]);
 
-    const responses = await Promise.allSettled([
-      request("/api/query/services?" + serviceParams.toString()),
+    const serviceResponses = await Promise.allSettled(
+      selectedDatasourceIDs.map((id) => request("/api/query/services?datasource_id=" + encodeURIComponent(id))),
+    );
+    const tagResponse = await Promise.allSettled([
       request("/api/query/tags?" + tagParams.toString()),
     ]);
 
-    const servicePayload = responses[0].status === "fulfilled" ? responses[0].value : {};
-    const tagPayload = responses[1].status === "fulfilled" ? responses[1].value : {};
-    state.search.services = safeArray(servicePayload && servicePayload.services);
+    const mergedServices = unique(serviceResponses.flatMap((entry) => {
+      if (entry.status !== "fulfilled") return [];
+      return safeArray(entry.value && entry.value.services);
+    }));
+    state.search.services = mergedServices.sort((left, right) => String(left).localeCompare(String(right)));
     state.search.serviceNames = safeArray(state.search.serviceNames).filter((name) => state.search.services.indexOf(name) >= 0);
-    state.search.tagCatalog = safeArray(tagPayload && tagPayload.tags);
-    if (responses[1].status !== "fulfilled") {
+    state.search.tagCatalog = safeArray(tagResponse[0] && tagResponse[0].status === "fulfilled" ? tagResponse[0].value && tagResponse[0].value.tags : []);
+    if (!tagResponse[0] || tagResponse[0].status !== "fulfilled") {
       state.search.activeFilters = {};
       state.search.tagValues = {};
     }
@@ -1711,6 +1853,9 @@ bootstrap();
     const serviceCount = safeArray(state.search.serviceNames).length;
     const resultCount = getVisibleResults().length;
     const exportBusy = state.search.exporting;
+    const pageSize = getResolvedSearchPageSize(state.search.pageSize || 500);
+    const pageSizeMode = state.search.pageSizeMode === "custom" ? "custom" : getActivePageSizeMode();
+    const customPageSize = getResolvedSearchPageSize(state.search.pageSizeCustom || pageSize);
     const target = byId("search-toolbar-controls");
     if (!target) return;
     syncHiddenQueryInput();
@@ -1738,11 +1883,13 @@ bootstrap();
           <label class="toolbar-inline-field">
             <span>${esc(s("条数", "Rows"))}</span>
             <select id="search-page-size">
-              <option value="100" ${state.search.pageSize === 100 ? "selected" : ""}>100</option>
-              <option value="200" ${state.search.pageSize === 200 ? "selected" : ""}>200</option>
-              <option value="500" ${state.search.pageSize == null || state.search.pageSize === 500 ? "selected" : ""}>500</option>
-              <option value="1000" ${state.search.pageSize === 1000 ? "selected" : ""}>1000</option>
+              <option value="100" ${pageSizeMode === "100" ? "selected" : ""}>100</option>
+              <option value="200" ${pageSizeMode === "200" ? "selected" : ""}>200</option>
+              <option value="500" ${pageSizeMode === "500" ? "selected" : ""}>500</option>
+              <option value="1000" ${pageSizeMode === "1000" ? "selected" : ""}>1000</option>
+              <option value="custom" ${pageSizeMode === "custom" ? "selected" : ""}>${esc(s("è‡ªå®šä¹‰", "Custom"))}</option>
             </select>
+            <input id="search-page-size-custom" class="${pageSizeMode === "custom" ? "" : "is-hidden"}" type="number" min="50" step="50" value="${pageSizeMode === "custom" ? esc(String(customPageSize)) : ""}" placeholder="${esc(s("è‡ªå®šä¹‰", "Custom"))}" />
           </label>
           <label class="toolbar-inline-check">
             <input id="search-use-cache" type="checkbox" ${state.search.useCache === false ? "" : "checked"} />
@@ -1928,11 +2075,22 @@ bootstrap();
       return;
     }
     const visible = getVisibleResults();
+    const exportTone = state.search.exportStatusTone === "error"
+      ? "tone-warn"
+      : state.search.exportStatusTone === "ok"
+        ? "tone-ok"
+        : "tone-soft";
+    const exportStatusText = state.search.exportStatusText
+      || "Text export defaults to GZIP compression.";
     target.innerHTML = `
       <div class="floating-export-card ${state.search.exporting ? "is-busy" : ""}">
         <div class="floating-export-copy">
           <strong>${esc(s("结果导出", "Result Export"))}</strong>
           <span>${esc(s("悬浮下载当前查询结果；支持当前页和全部结果导出。", "Floating export for the current query; supports current page and full-result export."))}</span>
+        </div>
+        <div class="floating-export-status">
+          ${pill(state.search.exporting ? "Exporting" : "Export Status", exportTone)}
+          <span>${esc(exportStatusText)}</span>
         </div>
         <div class="floating-export-actions">
           <button class="button button-small" type="button" data-action="export-search-json" ${visible.length ? "" : "disabled"}>${esc(s("当前页 JSON", "Page JSON"))}</button>
@@ -2026,6 +2184,47 @@ bootstrap();
       setMenuSearchValue("service", target.value);
       renderSearchServiceOptions();
       syncSearchMenuState();
+      return;
+    }
+
+    if (target.id === "search-page-size-custom") {
+      state.search.pageSizeMode = "custom";
+      state.search.pageSizeCustom = getResolvedSearchPageSize(target.value);
+      state.search.pageSize = state.search.pageSizeCustom;
+    }
+  };
+
+  handleChange = function (event) {
+    normalizeFrontendCollections();
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) return;
+
+    if (target.id === "datasource-sort") {
+      state.ui.datasourceSort = target.value || "name";
+      renderDatasourceList();
+      return;
+    }
+
+    if (target.id === "search-page-size") {
+      const mode = String(target.value || "500");
+      state.search.pageSizeMode = mode;
+      if (mode === "custom") {
+        state.search.pageSizeCustom = getResolvedSearchPageSize(state.search.pageSizeCustom || 1500);
+        state.search.pageSize = state.search.pageSizeCustom;
+      } else {
+        state.search.pageSize = getResolvedSearchPageSize(mode);
+      }
+      renderSearchToolbar();
+      renderSearchCatalogDatasourceOptions();
+      renderSearchServiceOptions();
+      renderSearchLevelFilters();
+      renderSearchHighlightPalette();
+      syncSearchMenuState();
+      return;
+    }
+
+    if (target.id === "search-use-cache") {
+      state.search.useCache = !!target.checked;
     }
   };
 
@@ -2238,8 +2437,12 @@ bootstrap();
     state.search.highlightTone = "yellow";
     state.ui.detailOpen = false;
     state.ui.menuSearch = { datasource: "", service: "" };
+    state.search.pageSize = 500;
+    state.search.pageSizeCustom = 1500;
+    state.search.pageSizeMode = "500";
     if (byId("search-page")) byId("search-page").value = "1";
     if (byId("search-page-size")) byId("search-page-size").value = "500";
+    if (byId("search-page-size-custom")) byId("search-page-size-custom").value = "";
     normalizeDatasourceState();
     if (state.search.catalogDatasourceID) await loadSearchCatalogs();
     else renderSearchControls();
@@ -2255,25 +2458,21 @@ bootstrap();
       return;
     }
     const page = Number((byId("search-page") && byId("search-page").value) || 1);
-    const pageSize = Number((byId("search-page-size") && byId("search-page-size").value) || 500);
+    const pageSize = resolveSearchPageSizeFromDOM();
     state.search.page = page;
     state.search.pageSize = pageSize;
+    state.search.pageSizeCustom = pageSize;
+    state.search.pageSizeMode = byId("search-page-size") ? byId("search-page-size").value || getActivePageSizeMode() : getActivePageSizeMode();
     state.search.useCache = byId("search-use-cache") ? byId("search-use-cache").checked : true;
-    const primaryLayer = getPrimaryLayer();
-    const payload = buildCurrentSearchPayload(page, pageSize);
     setSearchLoading(true);
     try {
-      try {
-        state.search.response = await request("/api/query/search", { method: "POST", body: JSON.stringify(payload) });
-      } catch (error) {
-        if (primaryLayer.mode !== "keyword" || !payload.keyword) throw error;
-        const fallbackPayload = { ...payload, keyword: "" };
-        state.search.response = await request("/api/query/search", { method: "POST", body: JSON.stringify(fallbackPayload) });
-      }
+      state.search.response = await requestSearchWindow(page, pageSize);
       state.search.response = safeObject(state.search.response);
       state.search.response.results = safeArray(state.search.response.results);
       state.search.response.sources = safeArray(state.search.response.sources);
       state.search.levelFilter = "all";
+      state.search.exportStatusTone = "idle";
+      state.search.exportStatusText = "Export ready.";
       const results = getVisibleResults();
       state.search.selectedResultKey = results[0] ? String(results[0]._index) : "";
       state.ui.detailOpen = false;
@@ -2312,3 +2511,5 @@ bootstrap();
     node.textContent = `${s("查询源", "Sources")}: ${safeArray(state.search.selectedDatasourceIDs).length || "ALL"} · ${s("主目录", "Catalog")}: ${catalog ? catalog.name : s("无", "None")} · ${s("服务", "Services")}: ${serviceLabel} · ${s("标签过滤", "Tag filters")}: ${filters} · ${s("递归过滤层", "Recursive layers")}: ${layers}`;
   };
 })();
+
+bootstrap();
