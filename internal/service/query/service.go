@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"vilog-victorialogs/internal/client/victorialogs"
+	"vilog-victorialogs/internal/config"
 	"vilog-victorialogs/internal/model"
 	"vilog-victorialogs/internal/service/cache"
 	mongostore "vilog-victorialogs/internal/store/mongo"
@@ -21,18 +22,15 @@ type Service struct {
 	store  *mongostore.Store
 	cache  *cache.Service
 	client *victorialogs.Client
+	cfg    config.CacheConfig
 }
 
-const (
-	maxDatasourceWindow = 100000
-	remoteChunkLimit    = 1000
-)
-
-func New(store *mongostore.Store, cacheService *cache.Service, client *victorialogs.Client) *Service {
+func New(store *mongostore.Store, cacheService *cache.Service, client *victorialogs.Client, cfg config.CacheConfig) *Service {
 	return &Service{
 		store:  store,
 		cache:  cacheService,
 		client: client,
+		cfg:    cfg,
 	}
 }
 
@@ -188,8 +186,8 @@ func (s *Service) fetchDatasourceWindow(
 	if requestedWindow <= 0 {
 		requestedWindow = 200
 	}
-	if requestedWindow > maxDatasourceWindow {
-		requestedWindow = maxDatasourceWindow
+	if requestedWindow > s.sourceWindowLimit() {
+		requestedWindow = s.sourceWindowLimit()
 	}
 
 	normalizedRows := make([]model.SearchResult, 0, requestedWindow)
@@ -199,7 +197,7 @@ func (s *Service) fetchDatasourceWindow(
 	lastBatchLimit := 0
 
 	for offset < requestedWindow {
-		limit := remoteChunkLimit
+		limit := s.sourceChunkLimit()
 		if remaining := requestedWindow - offset; remaining < limit {
 			limit = remaining
 		}
@@ -410,7 +408,35 @@ func shouldMergeContinuation(current []model.SearchResult, row model.SearchResul
 	if len(current) == 0 {
 		return false
 	}
-	return strings.TrimSpace(row.Timestamp) == ""
+	previous := current[len(current)-1]
+	if !sameResultSource(previous, row) {
+		return false
+	}
+
+	message := strings.TrimSpace(row.Message)
+	if message == "" {
+		return true
+	}
+	if strings.TrimSpace(row.Timestamp) == "" {
+		return true
+	}
+	if !looksLikeContinuationLine(message) {
+		return false
+	}
+	if row.Timestamp == previous.Timestamp {
+		return true
+	}
+
+	rowTime := parseTimestamp(row.Timestamp)
+	previousTime := parseTimestamp(previous.Timestamp)
+	if rowTime.IsZero() || previousTime.IsZero() {
+		return false
+	}
+	delta := rowTime.Sub(previousTime)
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta <= 2*time.Second
 }
 
 func mergeIntoPrevious(previous *model.SearchResult, continuation model.SearchResult) {
@@ -454,6 +480,62 @@ func statusLabelForRows(truncated, empty bool) string {
 		return "empty"
 	}
 	return "ok"
+}
+
+func sameResultSource(left, right model.SearchResult) bool {
+	if left.Datasource != right.Datasource {
+		return false
+	}
+	if strings.TrimSpace(left.Service) != "" && strings.TrimSpace(right.Service) != "" && left.Service != right.Service {
+		return false
+	}
+	if strings.TrimSpace(left.Pod) != "" && strings.TrimSpace(right.Pod) != "" && left.Pod != right.Pod {
+		return false
+	}
+	return true
+}
+
+func looksLikeContinuationLine(message string) bool {
+	trimmed := strings.TrimSpace(message)
+	lower := strings.ToLower(trimmed)
+	if trimmed == "" {
+		return false
+	}
+	switch {
+	case strings.HasPrefix(lower, "at "):
+		return true
+	case strings.HasPrefix(lower, "caused by:"):
+		return true
+	case strings.HasPrefix(lower, "suppressed:"):
+		return true
+	case strings.HasPrefix(lower, "wrapped by:"):
+		return true
+	case strings.HasPrefix(lower, "... ") && strings.HasSuffix(lower, " more"):
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) sourceChunkLimit() int {
+	chunkSize := s.cfg.SourceChunkSize
+	if chunkSize <= 0 {
+		chunkSize = 1000
+	}
+	if s.cfg.SourceRequestLimit > 0 && chunkSize > s.cfg.SourceRequestLimit {
+		chunkSize = s.cfg.SourceRequestLimit
+	}
+	if chunkSize <= 0 {
+		return 1000
+	}
+	return chunkSize
+}
+
+func (s *Service) sourceWindowLimit() int {
+	if s.cfg.MaxQueryWindow > 0 {
+		return s.cfg.MaxQueryWindow
+	}
+	return 100000
 }
 
 func extractValue(row map[string]any, primary string, fallbacks ...string) any {

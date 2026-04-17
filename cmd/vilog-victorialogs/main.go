@@ -70,7 +70,7 @@ func main() {
 	telegramService := telegram.New(cfg.Telegram)
 	datasourceService := datasource.New(store, victoriaClient)
 	discoveryService := discovery.New(store, cacheService, datasourceService, victoriaClient, telegramService, cfg.Discovery, cfg.VictoriaLogs)
-	queryService := query.New(store, cacheService, victoriaClient)
+	queryService := query.New(store, cacheService, victoriaClient, cfg.Cache)
 	retentionService := retention.New(store, victoriaClient, cfg.Retention)
 	schedulerManager := scheduler.New(store, retentionService)
 

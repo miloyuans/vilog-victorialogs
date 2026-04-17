@@ -52,9 +52,14 @@ type LoggingConfig struct {
 }
 
 type CacheConfig struct {
-	QueryTTL       time.Duration `yaml:"query_ttl"`
-	ServiceListTTL time.Duration `yaml:"service_list_ttl"`
-	TagValuesTTL   time.Duration `yaml:"tag_values_ttl"`
+	QueryTTL           time.Duration `yaml:"query_ttl"`
+	ServiceListTTL     time.Duration `yaml:"service_list_ttl"`
+	TagValuesTTL       time.Duration `yaml:"tag_values_ttl"`
+	LocalQueryDir      string        `yaml:"local_query_dir"`
+	LocalQueryRetention time.Duration `yaml:"local_query_retention"`
+	SourceChunkSize    int           `yaml:"source_chunk_size"`
+	SourceRequestLimit int           `yaml:"source_request_limit"`
+	MaxQueryWindow     int           `yaml:"max_query_window"`
 }
 
 type VictoriaLogsConfig struct {
@@ -117,9 +122,14 @@ func Default() Config {
 			Development: true,
 		},
 		Cache: CacheConfig{
-			QueryTTL:       5 * time.Minute,
-			ServiceListTTL: 30 * time.Minute,
-			TagValuesTTL:   30 * time.Minute,
+			QueryTTL:            5 * time.Minute,
+			ServiceListTTL:      30 * time.Minute,
+			TagValuesTTL:        30 * time.Minute,
+			LocalQueryDir:       "./data/query-cache",
+			LocalQueryRetention: 24 * time.Hour,
+			SourceChunkSize:     1000,
+			SourceRequestLimit:  10000,
+			MaxQueryWindow:      100000,
 		},
 		VictoriaLogs: VictoriaLogsConfig{
 			RequestRetries: 1,
@@ -171,12 +181,23 @@ func Load(path string) (Config, string, error) {
 	if err := applyEnvOverrides(&cfg); err != nil {
 		return Config{}, "", err
 	}
+	if err := resolveLocalPaths(&cfg, resolved); err != nil {
+		return Config{}, "", err
+	}
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, "", err
 	}
 
 	return cfg, resolved, nil
+}
+
+func resolveLocalPaths(cfg *Config, configPath string) error {
+	baseDir := filepath.Dir(configPath)
+	if strings.TrimSpace(cfg.Cache.LocalQueryDir) != "" && !filepath.IsAbs(cfg.Cache.LocalQueryDir) {
+		cfg.Cache.LocalQueryDir = filepath.Clean(filepath.Join(baseDir, cfg.Cache.LocalQueryDir))
+	}
+	return nil
 }
 
 func resolvePath(path string) (string, error) {
@@ -217,6 +238,12 @@ func (c Config) Validate() error {
 	}
 	if c.Cache.QueryTTL <= 0 || c.Cache.ServiceListTTL <= 0 || c.Cache.TagValuesTTL <= 0 {
 		return fmt.Errorf("cache ttls must be positive")
+	}
+	if c.Cache.LocalQueryRetention <= 0 {
+		return fmt.Errorf("cache.local_query_retention must be positive")
+	}
+	if c.Cache.SourceChunkSize <= 0 || c.Cache.SourceRequestLimit <= 0 || c.Cache.MaxQueryWindow <= 0 {
+		return fmt.Errorf("cache source limits must be positive")
 	}
 	if c.VictoriaLogs.RequestRetries < 0 || c.VictoriaLogs.DiscoveryLimit <= 0 || c.VictoriaLogs.TagValueLimit <= 0 {
 		return fmt.Errorf("victorialogs settings must be positive")
@@ -293,6 +320,19 @@ func applyEnvOverrides(cfg *Config) error {
 		return err
 	}
 	if err := setDuration("VILOG_CACHE_TAG_VALUES_TTL", &cfg.Cache.TagValuesTTL); err != nil {
+		return err
+	}
+	setString("VILOG_CACHE_LOCAL_QUERY_DIR", &cfg.Cache.LocalQueryDir)
+	if err := setDuration("VILOG_CACHE_LOCAL_QUERY_RETENTION", &cfg.Cache.LocalQueryRetention); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_CACHE_SOURCE_CHUNK_SIZE", &cfg.Cache.SourceChunkSize); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_CACHE_SOURCE_REQUEST_LIMIT", &cfg.Cache.SourceRequestLimit); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_CACHE_MAX_QUERY_WINDOW", &cfg.Cache.MaxQueryWindow); err != nil {
 		return err
 	}
 

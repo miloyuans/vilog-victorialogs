@@ -373,3 +373,20 @@ mark.highlight-tone-purple{background:rgba(176,132,245,.28);color:#e7d3ff}
 .floating-export-copy span,.floating-export-status span{font-size:.56rem}
 .floating-export-status-row{gap:4px}
 .floating-export-status-row .button-small{min-height:20px;padding:3px 7px;font-size:.58rem}
+.floating-export-dock{display:none!important}
+.toolbar-export-inline{display:inline-flex;align-items:center;gap:6px;flex-wrap:nowrap;margin-left:auto}
+.toolbar-export-inline-button{min-height:22px!important;padding:3px 8px!important;font-size:.58rem!important;white-space:nowrap}
+.toolbar-mini-export-status{white-space:nowrap}
+.toolbar-mini-export-status.tone-ok{border-color:rgba(87,191,125,.28);background:rgba(87,191,125,.08);color:#b8f0ca}
+.toolbar-mini-export-status.tone-warn{border-color:rgba(242,107,107,.28);background:rgba(242,107,107,.08);color:#ffc7c7}
+.toolbar-mini-export-status.tone-soft{border-color:rgba(255,255,255,.08);background:rgba(255,255,255,.03)}
+.log-results-table{border-collapse:collapse}
+.log-results-table td,.log-results-table th{padding:4px 6px!important;vertical-align:top}
+.log-results-table th{line-height:1.05}
+.log-results-table td:first-child,.log-results-table th:first-child{width:96px;white-space:nowrap}
+.log-results-table td:nth-child(2),.log-results-table th:nth-child(2){width:58px}
+.log-results-table td:nth-child(3),.log-results-table th:nth-child(3){width:120px}
+.log-results-table td:nth-child(4),.log-results-table th:nth-child(4){width:54px}
+.log-results-table .button-small{min-height:20px;padding:2px 7px;font-size:.56rem}
+.log-cell-message,.compact-log-message{line-height:1.08!important}
+.table-wrap-compact td,.table-wrap-compact th{padding:4px 6px!important}

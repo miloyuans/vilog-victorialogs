@@ -2740,6 +2740,9 @@ highlight = function (text) {
   async function runSearchWindow(pageOverride, options) {
     normalizeFrontendCollections();
     syncHiddenQueryInput();
+    if (state.search.timePreset !== "custom") {
+      applyQuickRange(state.search.timePreset || "1h");
+    }
     if (!safeArray(state.search.selectedDatasourceIDs).length) {
       toast(s("\u8bf7\u5148\u9009\u62e9\u81f3\u5c11\u4e00\u4e2a\u67e5\u8be2\u6570\u636e\u6e90\u3002", "Select at least one search datasource."), "error");
       return false;
@@ -2860,6 +2863,12 @@ highlight = function (text) {
     const serviceCount = safeArray(state.search.serviceNames).length;
     const resultCount = getVisibleResults().length;
     const exportBusy = state.search.exporting;
+    const exportTone = state.search.exportStatusTone === "error"
+      ? "tone-warn"
+      : state.search.exportStatusTone === "ok"
+        ? "tone-ok"
+        : "tone-soft";
+    const exportStatusText = state.search.exportStatusText || s("\u5c31\u7eea", "Ready");
     const pageInfo = getSearchPageSizeFromState();
     const target = byId("search-toolbar-controls");
     if (!target) return;
@@ -2930,7 +2939,10 @@ highlight = function (text) {
         <div class="toolbar-mini-meta">${esc(s("\u67e5\u8be2\u6570\u636e\u6e90", "Query datasources"))}: ${esc(String(selectedCount || "ALL"))}</div>
         <div class="toolbar-mini-meta">${esc(s("\u670d\u52a1\u76ee\u5f55", "Services"))}: ${esc(String(serviceCount || "ALL"))}</div>
         <div class="toolbar-mini-meta">${esc(s("\u5f53\u524d\u53ef\u89c1", "Visible"))}: ${esc(String(resultCount))}</div>
-        <div class="toolbar-mini-meta">${esc(s("\u5bfc\u51fa\u72b6\u6001", "Export"))}: ${esc(exportBusy ? s("\u5bfc\u51fa\u4e2d", "Exporting") : s("\u5c31\u7eea", "Ready"))}</div>
+        <div class="toolbar-export-inline">
+          <button class="button button-small button-primary toolbar-export-inline-button" type="button" data-action="export-search-all" ${exportBusy || !resultCount ? "disabled" : ""}>${esc(s("\u5168\u90e8\u4e0b\u8f7d", "Download All"))}</button>
+          <div class="toolbar-mini-meta toolbar-mini-export-status ${exportTone}">${esc(s("\u5bfc\u51fa\u72b6\u6001", "Export"))}: ${esc(exportBusy ? s("\u5bfc\u51fa\u4e2d", "Exporting") : exportStatusText)}</div>
+        </div>
         ${!pageInfo.valid ? `<div class="toolbar-mini-meta tone-warn">${esc(s("\u81ea\u5b9a\u4e49\u6761\u6570\u6700\u5927\u4e0d\u80fd\u8d85\u8fc7 10000", "Custom rows cannot exceed 10000"))}</div>` : ""}
       </div>
     `;
@@ -3041,33 +3053,7 @@ highlight = function (text) {
     normalizeFrontendCollections();
     const target = byId("floating-export-dock");
     if (!target) return;
-    if (!state.search.response) {
-      target.innerHTML = "";
-      return;
-    }
-    const visible = getVisibleResults();
-    const exportTone = state.search.exportStatusTone === "error"
-      ? "tone-warn"
-      : state.search.exportStatusTone === "ok"
-        ? "tone-ok"
-        : "tone-soft";
-    const exportStatusText = state.search.exportStatusText || s("\u5c31\u7eea", "Ready");
-    const formatLabel = getCurrentExportFormat() === "json" ? "JSON" : "TXT.GZ";
-    target.innerHTML = `
-      <div class="floating-export-card ${state.search.exporting ? "is-busy" : ""}">
-        <div class="floating-export-copy">
-          <strong>${esc(s("\u7ed3\u679c\u5bfc\u51fa", "Result Export"))}</strong>
-          <span>${esc(s("\u6839\u636e\u5f53\u524d\u89c6\u56fe\u683c\u5f0f\u5bfc\u51fa\u5168\u90e8\u67e5\u8be2\u7ed3\u679c\uff1a", "Download the full query result using the current result format:"))} ${esc(formatLabel)}</span>
-        </div>
-        <div class="floating-export-status-row">
-          <div class="floating-export-status">
-            ${pill(state.search.exporting ? s("\u5bfc\u51fa\u4e2d", "Exporting") : s("\u5bfc\u51fa\u72b6\u6001", "Export Status"), exportTone)}
-            <span>${esc(exportStatusText)}</span>
-          </div>
-          <button class="button button-small button-primary" type="button" data-action="export-search-all" ${state.search.exporting || !visible.length ? "disabled" : ""}>${esc(s("\u5168\u90e8\u4e0b\u8f7d", "Download All"))}</button>
-        </div>
-      </div>
-    `;
+    target.innerHTML = "";
   };
 
   handleInput = function (event) {
