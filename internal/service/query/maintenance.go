@@ -3,12 +3,14 @@ package query
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
 
+	"vilog-victorialogs/internal/client/victorialogs"
 	"vilog-victorialogs/internal/model"
 )
 
@@ -97,6 +99,13 @@ func (s *Service) ensureHotCache(ctx context.Context, reason string) error {
 
 	now := time.Now().UTC()
 	days := s.hotCacheDays(now)
+	trackedServices, trackedErr := s.trackedHotServicesByDatasource()
+	if trackedErr != nil {
+		s.logger.Warn("list tracked log partitions for hot cache check failed",
+			zap.Error(trackedErr),
+			zap.String("reason", reason),
+		)
+	}
 	concurrency := s.cfg.LocalLogCheckConcurrency
 	if concurrency <= 0 {
 		concurrency = 4
@@ -133,9 +142,20 @@ func (s *Service) ensureHotCache(ctx context.Context, reason string) error {
 			continue
 		}
 
-		serviceNames := uniqueServiceNames(services)
+		serviceNames := uniqueStrings(append(uniqueServiceNames(services), trackedServices[ds.ID]...))
 		if len(serviceNames) == 0 {
-			s.logger.Debug("hot cache check skipped datasource with empty service catalog",
+			discovered, discoverErr := s.discoverServiceNamesForHotCache(ctx, ds, days, now)
+			if discoverErr != nil {
+				s.logger.Warn("discover service catalog for hot cache check failed",
+					zap.Error(discoverErr),
+					zap.String("datasource", ds.Name),
+					zap.String("reason", reason),
+				)
+			}
+			serviceNames = uniqueStrings(append(serviceNames, discovered...))
+		}
+		if len(serviceNames) == 0 {
+			s.logger.Info("hot cache check skipped datasource with no known services",
 				zap.String("datasource", ds.Name),
 				zap.String("reason", reason),
 			)
@@ -201,8 +221,11 @@ func (s *Service) ensureHotPartition(
 				zap.String("service", displayServiceName(serviceName)),
 				zap.String("day", cacheDay(day).Format("2006-01-02")),
 			)
-			_, _, err = s.refreshPartitionIncremental(ctx, datasource, snapshot, tagDefinitions, serviceName, day, now, partition)
-			return err
+			task, _ := s.startPartitionSync(day, datasource, serviceName, "hot-refresh-"+reason, func(syncCtx context.Context) error {
+				_, _, refreshErr := s.refreshPartitionIncremental(syncCtx, datasource, snapshot, tagDefinitions, serviceName, day, time.Now().UTC(), partition)
+				return refreshErr
+			})
+			return s.waitPartitionSync(ctx, task)
 		}
 		s.logger.Debug("hot partition already present",
 			zap.String("reason", reason),
@@ -220,8 +243,11 @@ func (s *Service) ensureHotPartition(
 		zap.String("service", displayServiceName(serviceName)),
 		zap.String("day", cacheDay(day).Format("2006-01-02")),
 	)
-	_, _, err = s.buildPartitionFromSource(ctx, datasource, snapshot, tagDefinitions, serviceName, day, now)
-	return err
+	task, _ := s.startPartitionSync(day, datasource, serviceName, "hot-build-"+reason, func(syncCtx context.Context) error {
+		_, _, buildErr := s.buildPartitionFromSource(syncCtx, datasource, snapshot, tagDefinitions, serviceName, day, time.Now().UTC())
+		return buildErr
+	})
+	return s.waitPartitionSync(ctx, task)
 }
 
 func (s *Service) hotCacheDays(now time.Time) []time.Time {
@@ -245,4 +271,93 @@ func uniqueServiceNames(entries []model.ServiceCatalogEntry) []string {
 		}
 	}
 	return uniqueStrings(names)
+}
+
+func (s *Service) trackedHotServicesByDatasource() (map[string][]string, error) {
+	if s.cache == nil {
+		return map[string][]string{}, nil
+	}
+	metas, err := s.cache.ListTrackedLogPartitions()
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string][]string)
+	for _, meta := range metas {
+		if strings.TrimSpace(meta.DatasourceID) == "" || strings.TrimSpace(meta.Service) == "" {
+			continue
+		}
+		result[meta.DatasourceID] = append(result[meta.DatasourceID], meta.Service)
+	}
+	for key, items := range result {
+		result[key] = uniqueStrings(items)
+	}
+	return result, nil
+}
+
+func (s *Service) discoverServiceNamesForHotCache(
+	ctx context.Context,
+	datasource model.Datasource,
+	days []time.Time,
+	now time.Time,
+) ([]string, error) {
+	if len(days) == 0 {
+		return nil, nil
+	}
+	serviceField := strings.TrimSpace(datasource.FieldMapping.ServiceField)
+	if serviceField == "" {
+		serviceField = model.DefaultDatasourceFieldMapping().ServiceField
+	}
+
+	rangeStart := cacheDay(days[len(days)-1])
+	rangeEnd := now
+	limit := s.cfg.SourceRequestLimit
+	switch {
+	case limit <= 0:
+		limit = 1000
+	case limit > 2000:
+		limit = 2000
+	}
+
+	req := victorialogs.FieldValuesRequest{
+		Query:       "*",
+		Field:       serviceField,
+		Start:       rangeStart,
+		End:         rangeEnd,
+		Limit:       limit,
+		IgnorePipes: true,
+	}
+
+	values, err := s.client.StreamFieldValues(ctx, datasource, req)
+	if err != nil {
+		values, err = s.client.FieldValues(ctx, datasource, req)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	services := make([]string, 0, len(values))
+	for _, item := range values {
+		if trimmed := strings.TrimSpace(item.Value); trimmed != "" {
+			services = append(services, trimmed)
+		}
+	}
+	services = uniqueStrings(services)
+	sort.Strings(services)
+	if len(services) == 0 {
+		return nil, nil
+	}
+
+	if err := s.store.ReplaceServiceCatalog(ctx, datasource.ID, serviceField, services, s.cache.ServiceListTTL()); err != nil {
+		s.logger.Warn("persist discovered hot cache service catalog failed",
+			zap.Error(err),
+			zap.String("datasource", datasource.Name),
+			zap.String("service_field", serviceField),
+		)
+	}
+	s.logger.Info("discovered services for hot cache check",
+		zap.String("datasource", datasource.Name),
+		zap.String("service_field", serviceField),
+		zap.Int("service_count", len(services)),
+	)
+	return services, nil
 }

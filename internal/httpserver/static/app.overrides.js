@@ -1598,7 +1598,7 @@ highlight = function (text) {
     state.search.pageSizeCustomRaw = String(state.search.pageSizeCustomRaw || state.search.pageSizeCustom || 1500);
     state.search.pageSizeMode = String(state.search.pageSizeMode || getActivePageSizeMode());
     state.search.pageSizeError = !!state.search.pageSizeError;
-    state.search.autoRefreshEnabled = state.search.autoRefreshEnabled === true;
+    state.search.autoRefreshEnabled = state.search.autoRefreshEnabled !== false;
     state.search.autoRefreshInterval = normalizeAutoRefreshInterval(state.search.autoRefreshInterval || "5s");
     state.search.columnWidths = safeObject(state.search.columnWidths);
     state.search.useCache = true;
@@ -2890,7 +2890,12 @@ highlight = function (text) {
       renderSearchControls();
       renderSearchResults();
       if (!(options && options.silentSuccess)) {
-        toast(results.length ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\u3002", "Search completed.") : s("\u67e5\u8be2\u5b8c\u6210\uff0c\u4f46\u5f53\u524d\u6761\u4ef6\u4e0b\u6ca1\u6709\u6570\u636e\u3002", "Search completed, but no data matched the current filters."), results.length ? "success" : "info");
+        const successMessage = response.partial && !results.length
+          ? s("\u672c\u5730\u7f13\u5b58\u6b63\u5728\u540e\u53f0\u8865\u6570\uff0c\u7ed3\u679c\u4f1a\u968f auto \u67e5\u8be2\u9010\u6b65\u5237\u65b0\u3002", "Local cache backfill is running in the background. Results will appear incrementally through auto refresh.")
+          : results.length
+            ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\u3002", "Search completed.")
+            : s("\u67e5\u8be2\u5b8c\u6210\uff0c\u4f46\u5f53\u524d\u6761\u4ef6\u4e0b\u6ca1\u6709\u6570\u636e\u3002", "Search completed, but no data matched the current filters.");
+        toast(successMessage, results.length ? "success" : "info");
       }
       return true;
     } catch (error) {
@@ -3020,6 +3025,8 @@ highlight = function (text) {
         ${!pageInfo.valid ? `<div class="toolbar-mini-meta tone-warn">${esc(s("\u81ea\u5b9a\u4e49\u6761\u6570\u6700\u5927\u4e0d\u80fd\u8d85\u8fc7 10000", "Custom rows cannot exceed 10000"))}</div>` : ""}
       </div>
     `;
+    const autoButton = byId("search-auto-toggle");
+    if (autoButton) autoButton.textContent = s("auto查询", "Auto Query");
   };
 
   renderSearchMarkup = function () {
@@ -3101,7 +3108,9 @@ highlight = function (text) {
     ensureSelectedResult(results);
     let content = "";
     if (!results.length) {
-      content = empty(s("\u5f53\u524d\u6761\u4ef6\u4e0b\u6ca1\u6709\u65e5\u5fd7\u7ed3\u679c\u3002", "No logs matched the current query."));
+      content = empty((state.search.response && state.search.response.partial)
+        ? s("\u540e\u53f0\u6b63\u5728\u8865\u9f50\u672c\u5730\u7f13\u5b58\uff0c\u7ed3\u679c\u4f1a\u968f auto \u67e5\u8be2\u9010\u6b65\u51fa\u73b0\u3002", "Background cache backfill is running. Results will appear incrementally through auto refresh.")
+        : s("\u5f53\u524d\u6761\u4ef6\u4e0b\u6ca1\u6709\u65e5\u5fd7\u7ed3\u679c\u3002", "No logs matched the current query."));
     } else if (state.search.view === "json") {
       content = `<div class="raw-view compact-raw-view"><pre>${esc(JSON.stringify(results.map(stripRuntimeFields), null, 2))}</pre></div>`;
     } else if (state.search.view === "table") {
@@ -3213,7 +3222,7 @@ highlight = function (text) {
     state.search.page = 1;
     state.search.pageSize = 500;
     state.search.pageSizeCustom = 1500;
-    state.search.autoRefreshEnabled = false;
+    state.search.autoRefreshEnabled = true;
     state.search.autoRefreshInterval = "5s";
     if (byId("search-page-size")) byId("search-page-size").value = "500";
     if (byId("search-page-size-custom")) byId("search-page-size-custom").value = "";

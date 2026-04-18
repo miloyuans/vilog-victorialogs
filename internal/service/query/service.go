@@ -27,11 +27,19 @@ type Service struct {
 	client *victorialogs.Client
 	cfg    config.CacheConfig
 	logger *zap.Logger
+
+	partitionSyncMu   sync.Mutex
+	partitionSyncs    map[string]*partitionSyncTask
+	partitionSyncSem  chan struct{}
 }
 
 func New(store *mongostore.Store, cacheService *cache.Service, client *victorialogs.Client, cfg config.CacheConfig, logger *zap.Logger) *Service {
 	if logger == nil {
 		logger = zap.NewNop()
+	}
+	concurrency := cfg.LocalLogCheckConcurrency
+	if concurrency <= 0 {
+		concurrency = 4
 	}
 	return &Service{
 		store:  store,
@@ -39,6 +47,8 @@ func New(store *mongostore.Store, cacheService *cache.Service, client *victorial
 		client: client,
 		cfg:    cfg,
 		logger: logger,
+		partitionSyncs:   make(map[string]*partitionSyncTask),
+		partitionSyncSem: make(chan struct{}, concurrency),
 	}
 }
 
@@ -264,7 +274,11 @@ func (s *Service) refreshTrackedHotPartitions(ctx context.Context) error {
 			snapshotCache[datasource.ID] = loaded
 		}
 
-		if _, _, refreshErr := s.refreshPartitionIncremental(ctx, datasource, snapshot, tagDefinitions, meta.Service, day, now, partition); refreshErr != nil {
+		task, _ := s.startPartitionSync(day, datasource, meta.Service, "tracked-refresh", func(syncCtx context.Context) error {
+			_, _, refreshErr := s.refreshPartitionIncremental(syncCtx, datasource, snapshot, tagDefinitions, meta.Service, day, time.Now().UTC(), partition)
+			return refreshErr
+		})
+		if refreshErr := s.waitPartitionSync(ctx, task); refreshErr != nil {
 			s.logger.Warn("tracked hot partition incremental refresh failed",
 				zap.Error(refreshErr),
 				zap.String("datasource", datasource.Name),
@@ -367,29 +381,39 @@ func (s *Service) loadPartitionWindow(
 				zap.Int("rows", len(partition.Rows)),
 			)
 			if s.cache.LogPartitionNeedsRefresh(partition.Meta, day, now) {
-				s.logger.Info("refreshing hot log partition",
+				s.logger.Info("queueing hot log partition refresh",
 					zap.String("datasource", datasource.Name),
 					zap.String("service", displayServiceName(serviceName)),
 					zap.String("day", cacheDay(day).Format("2006-01-02")),
 					zap.Time("last_sync_at", partition.Meta.LastSyncAt),
 				)
-				refreshed, refreshPartial, refreshErr := s.refreshPartitionIncremental(ctx, datasource, snapshot, tagDefinitions, serviceName, day, now, partition)
-				if refreshErr != nil {
-					s.logger.Warn("refresh hot log partition failed, serving cached copy",
-						zap.Error(refreshErr),
-						zap.String("datasource", datasource.Name),
-						zap.String("service", displayServiceName(serviceName)),
-						zap.String("day", cacheDay(day).Format("2006-01-02")),
-					)
-					return partition, true, partition.Meta.Partial, nil
-				}
-				return refreshed, true, refreshPartial, nil
+				s.startPartitionSync(day, datasource, serviceName, "query-refresh", func(syncCtx context.Context) error {
+					_, _, refreshErr := s.refreshPartitionIncremental(syncCtx, datasource, snapshot, tagDefinitions, serviceName, day, time.Now().UTC(), partition)
+					return refreshErr
+				})
+				return partition, true, true, nil
 			}
 			return partition, true, partition.Meta.Partial, nil
 		}
 	}
 
-	s.logger.Info("building log partition from source",
+	if useCache {
+		s.logger.Info("queueing log partition build from source",
+			zap.String("datasource", datasource.Name),
+			zap.String("service", displayServiceName(serviceName)),
+			zap.String("day", cacheDay(day).Format("2006-01-02")),
+		)
+		s.startPartitionSync(day, datasource, serviceName, "query-build", func(syncCtx context.Context) error {
+			_, _, buildErr := s.buildPartitionFromSource(syncCtx, datasource, snapshot, tagDefinitions, serviceName, day, time.Now().UTC())
+			return buildErr
+		})
+		return cache.LocalLogPartition{
+			Meta: s.cache.PrepareLogPartitionMeta(day, serviceName, datasource, 0, now, true),
+			Rows: []model.SearchResult{},
+		}, false, true, nil
+	}
+
+	s.logger.Info("building log partition from source synchronously",
 		zap.String("datasource", datasource.Name),
 		zap.String("service", displayServiceName(serviceName)),
 		zap.String("day", cacheDay(day).Format("2006-01-02")),
