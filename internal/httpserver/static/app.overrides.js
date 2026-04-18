@@ -147,6 +147,20 @@ function layerMatches(item, layer) {
   return haystack.indexOf(raw.toLowerCase()) >= 0;
 }
 
+function matchesActiveFilters(item) {
+  const active = normalizeFilters(state.search.activeFilters);
+  const keys = Object.keys(active || {});
+  if (!keys.length) return true;
+  return keys.every((key) => {
+    const expected = safeArray(active[key]).map((value) => String(value || "").trim()).filter(Boolean);
+    if (!expected.length) return true;
+    const candidates = [];
+    if (item.labels && item.labels[key] != null) candidates.push(String(item.labels[key]).trim());
+    if (item.raw && item.raw[key] != null) candidates.push(String(item.raw[key]).trim());
+    return expected.some((value) => candidates.some((candidate) => candidate === value || candidate.indexOf(value) >= 0));
+  });
+}
+
 function getRawDecoratedResults() {
   return ((state.search.response && state.search.response.results) || []).map((item, index) => ({
     ...item,
@@ -1585,52 +1599,25 @@ highlight = function (text) {
 
   async function requestSearchWindow(page, pageSize) {
     normalizeFrontendCollections();
-    const requestedPage = Math.max(1, Number(page || state.search.page || 1) || 1);
+    const requestedPage = 1;
     const requestedSize = getResolvedSearchPageSize(pageSize || state.search.pageSize || 500);
-    const backendPageSize = Math.min(BACKEND_SEARCH_PAGE_SIZE, requestedSize);
-    const offset = (requestedPage - 1) * requestedSize;
-    const firstBackendPage = Math.floor(offset / backendPageSize) + 1;
-    const innerOffset = offset % backendPageSize;
-    const needed = innerOffset + requestedSize;
-    const sourceMap = new Map();
-    let merged = [];
-    let total = 0;
-    let partial = false;
-    let cacheHit = false;
-    let tookMs = 0;
-    let currentPage = firstBackendPage;
-    let lastPayload = null;
-
-    while (merged.length < needed && currentPage < firstBackendPage + 200) {
-      lastPayload = buildCurrentSearchPayload(currentPage, backendPageSize);
-      const response = safeObject(await request("/api/query/search", {
-        method: "POST",
-        body: JSON.stringify(lastPayload),
-      }));
-      const rows = safeArray(response.results);
-      mergeSourceDiagnostics(sourceMap, response.sources);
-      total = Math.max(total, Number(response.total || 0));
-      partial = partial || !!response.partial;
-      cacheHit = cacheHit || !!response.cache_hit;
-      tookMs += Number(response.took_ms || 0);
-      if (!rows.length) break;
-      merged = merged.concat(rows);
-      if ((total && currentPage * backendPageSize >= total) || rows.length < backendPageSize) break;
-      currentPage += 1;
-    }
-
+    const payload = buildCurrentSearchPayload(requestedPage, requestedSize);
+    const response = safeObject(await request("/api/query/search", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }));
     return {
-      keyword: lastPayload ? lastPayload.keyword : "",
-      start: lastPayload ? lastPayload.start : "",
-      end: lastPayload ? lastPayload.end : "",
-      results: merged.slice(innerOffset, innerOffset + requestedSize),
-      total: total || merged.length,
+      keyword: payload.keyword || "",
+      start: payload.start || "",
+      end: payload.end || "",
+      results: safeArray(response.results),
+      total: Math.max(Number(response.total || 0), safeArray(response.results).length),
       page: requestedPage,
       page_size: requestedSize,
-      partial,
-      cache_hit: cacheHit,
-      took_ms: tookMs,
-      sources: Array.from(sourceMap.values()),
+      partial: !!response.partial,
+      cache_hit: !!response.cache_hit,
+      took_ms: Number(response.took_ms || 0),
+      sources: safeArray(response.sources),
     };
   }
 
@@ -1644,7 +1631,7 @@ highlight = function (text) {
 
   function applyClientSideResultFilters(items) {
     let decorated = decorateExportResults(items);
-    const layers = safeArray(state.search.queryLayers).filter((layer, index) => index !== 0 || layer.mode === "keyword");
+    const layers = safeArray(state.search.queryLayers);
     decorated = layers.reduce((list, layer) => {
       if (!String(layer && layer.value || "").trim()) return list;
       return safeArray(list).filter((item) => layerMatches(item, layer));
@@ -1841,8 +1828,8 @@ highlight = function (text) {
   };
 
   getDecoratedResults = function () {
-    const results = getRawDecoratedResults();
-    const layers = safeArray(state.search.queryLayers).filter((layer, index) => index !== 0 || layer.mode === "keyword");
+    const results = getRawDecoratedResults().filter((item) => matchesActiveFilters(item));
+    const layers = safeArray(state.search.queryLayers);
     return layers.reduce((items, layer) => {
       if (!String(layer && layer.value || "").trim()) return items;
       return safeArray(items).filter((item) => layerMatches(item, layer));
@@ -2587,10 +2574,9 @@ highlight = function (text) {
             <span>${esc(getLayerNote(index, layer))}</span>
           </div>
           <div class="query-layer-actions">
-            ${layer.mode === "keyword" ? `<div class="mode-switch query-operator-switch"><button class="mode-button ${layer.operator !== "or" ? "active" : ""}" type="button" data-query-operator="and" data-layer-id="${esc(layer.id)}">AND</button><button class="mode-button ${layer.operator === "or" ? "active" : ""}" type="button" data-query-operator="or" data-layer-id="${esc(layer.id)}">OR</button></div>` : ""}
+            <div class="mode-switch query-operator-switch"><button class="mode-button ${layer.operator !== "or" ? "active" : ""}" type="button" data-query-operator="and" data-layer-id="${esc(layer.id)}">AND</button><button class="mode-button ${layer.operator === "or" ? "active" : ""}" type="button" data-query-operator="or" data-layer-id="${esc(layer.id)}">OR</button></div>
             <div class="mode-switch query-mode-switch">
-              <button class="mode-button ${layer.mode === "keyword" ? "active" : ""}" type="button" data-query-layer-mode="keyword" data-layer-id="${esc(layer.id)}">${esc(s("\u5173\u952e\u8bcd", "Keyword"))}</button>
-              <button class="mode-button ${layer.mode === "logsql" ? "active" : ""}" type="button" data-query-layer-mode="logsql" data-layer-id="${esc(layer.id)}">LogsQL</button>
+              <button class="mode-button active" type="button" data-query-layer-mode="keyword" data-layer-id="${esc(layer.id)}">${esc(s("\u5173\u952e\u8bcd", "Keyword"))}</button>
             </div>
             ${index > 0 ? `<button class="icon-button" type="button" data-action="remove-query-layer" data-layer-id="${esc(layer.id)}">x</button>` : ""}
           </div>
@@ -2606,15 +2592,14 @@ highlight = function (text) {
   buildCurrentSearchPayload = function (page, pageSize) {
     normalizeFrontendCollections();
     syncHiddenQueryInput();
-    const primaryLayer = getPrimaryLayer();
     return {
-      keyword: primaryLayer.mode === "logsql" ? getBackendPrimaryQuery(primaryLayer) : "",
+      keyword: "",
       start: localToRFC3339((byId("search-start") && byId("search-start").value) || ""),
       end: localToRFC3339((byId("search-end") && byId("search-end").value) || ""),
       datasource_ids: safeArray(state.search.selectedDatasourceIDs).slice(),
       service_names: safeArray(state.search.serviceNames).slice(),
-      tags: normalizeFilters(state.search.activeFilters),
-      page: Number(page || state.search.page || 1),
+      tags: {},
+      page: 1,
       page_size: getResolvedSearchPageSize(pageSize || state.search.pageSize || 500),
       use_cache: state.search.useCache !== false,
     };
@@ -2754,14 +2739,13 @@ highlight = function (text) {
       toast(s("\u81ea\u5b9a\u4e49\u6761\u6570\u6700\u5927\u4e0d\u80fd\u8d85\u8fc7 10000\u3002", "Custom rows cannot exceed 10000."), "error");
       return false;
     }
-    const page = Math.max(1, Number(pageOverride || (byId("search-page") && byId("search-page").value) || state.search.page || 1) || 1);
+    const page = 1;
     state.search.page = page;
     state.search.pageSize = pageInfo.value;
     state.search.pageSizeCustom = pageInfo.mode === "custom" ? pageInfo.value : state.search.pageSizeCustom;
     state.search.pageSizeCustomRaw = pageInfo.raw;
     state.search.pageSizeMode = pageInfo.mode;
     state.search.useCache = byId("search-use-cache") ? byId("search-use-cache").checked : true;
-    if (byId("search-page")) byId("search-page").value = String(page);
     setSearchLoading(true);
     try {
       const response = safeObject(await requestSearchWindow(page, pageInfo.value));
@@ -2789,55 +2773,13 @@ highlight = function (text) {
     }
   }
 
-  async function navigateSearchPage(delta) {
-    normalizeFrontendCollections();
-    if (!state.search.response) return;
-    const currentPage = Math.max(1, Number(state.search.page || 1) || 1);
-    const pageSize = getSearchPageSizeFromState().value;
-    const pageCount = getSearchPageCount(getSearchTotalCount(), pageSize);
-    if (delta < 0 && currentPage <= 1) {
-      toast(s("\u5df2\u7ecf\u662f\u7b2c\u4e00\u9875\u3002", "Already on the first page."), "info");
-      return;
-    }
-    if (delta > 0 && currentPage >= pageCount) {
-      toast(s("\u5df2\u7ecf\u662f\u6700\u540e\u4e00\u9875\u3002", "Already on the last page."), "info");
-      return;
-    }
-    await runSearchWindow(currentPage + delta, { silentSuccess: true });
-  }
-
   function exportCurrentSearchResults() {
     return runExport(getCurrentExportFormat(), { all: true });
   }
 
   fetchAllResultsForExport = async function () {
     normalizeFrontendCollections();
-    const hardLimit = SEARCH_EXPORT_LIMIT;
-    const exportPageSize = Math.min(1000, Math.max(200, Number(state.search.pageSize || 500)));
-    let page = 1;
-    let merged = [];
-    let total = 0;
-    while (page <= 200) {
-      const payload = buildCurrentSearchPayload(page, exportPageSize);
-      const response = await request("/api/query/search", {
-        method: "POST",
-        body: JSON.stringify(payload),
-      });
-      const rows = safeArray(response && response.results);
-      total = Number(response && response.total || total || 0);
-      if (!rows.length) break;
-      merged = merged.concat(rows);
-      if ((total && merged.length >= total) || rows.length < exportPageSize) break;
-      if (merged.length >= hardLimit) {
-        toast(
-          s("\u5bfc\u51fa\u7ed3\u679c\u8fc7\u5927\uff0c\u5df2\u622a\u65ad\u5230\u524d 100000 \u6761\u3002\u5efa\u8bae\u5148\u7f29\u5c0f\u67e5\u8be2\u8303\u56f4\u3002", "Export is too large. Truncated to the first 100,000 rows. Narrow the query for a full export."),
-          "info",
-        );
-        break;
-      }
-      page += 1;
-    }
-    return applyClientSideResultFilters(merged);
+    return applyClientSideResultFilters(safeArray(state.search.response && state.search.response.results));
   };
 
   renderSearchSummary = function () {
@@ -2891,10 +2833,6 @@ highlight = function (text) {
             <strong id="search-time-trigger">${esc(getSearchTimeLabel())}</strong>
           </button>
           <label class="toolbar-inline-field">
-            <span>${esc(s("\u9875\u7801", "Page"))}</span>
-            <input id="search-page" type="number" min="1" step="1" value="${esc(String(state.search.page || 1))}" />
-          </label>
-          <label class="toolbar-inline-field">
             <span>${esc(s("\u6761\u6570", "Rows"))}</span>
             <select id="search-page-size">
               <option value="100" ${pageInfo.mode === "100" ? "selected" : ""}>100</option>
@@ -2920,8 +2858,8 @@ highlight = function (text) {
         <div class="query-composer">
           <div class="query-composer-head">
             <div class="query-composer-copy">
-              <strong>${esc(s("\u5173\u952e\u5b57 / LogsQL \u9012\u5f52\u8fc7\u6ee4\u5668", "Keyword / LogsQL Recursive Filters"))}</strong>
-              <span class="query-composer-hint">${esc(s("\u5148\u786e\u5b9a\u6570\u636e\u6e90\u548c\u670d\u52a1\uff0c\u518d\u901a\u8fc7\u4e3b\u67e5\u8be2\u547d\u4e2d\u7ed3\u679c\uff0c\u540e\u7eed\u5c42\u6309\u987a\u5e8f\u7ee7\u7eed\u8fc7\u6ee4\u3002", "Pick datasources and services first, then run the primary query and keep narrowing with recursive filters."))}</span>
+              <strong>${esc(s("\u5173\u952e\u5b57\u9012\u5f52\u8fc7\u6ee4\u5668", "Keyword Recursive Filters"))}</strong>
+              <span class="query-composer-hint">${esc(s("\u5148\u786e\u5b9a\u6570\u636e\u6e90\u548c\u670d\u52a1\uff0c\u540e\u7aef\u5148\u6309\u65f6\u95f4\u8303\u56f4\u62c9\u53d6\u6700\u65b0\u65e5\u5fd7\uff0c\u518d\u5728\u672c\u5730\u6309\u5173\u952e\u5b57\u9012\u5f52\u8fc7\u6ee4\u3002", "Pick datasources and services first. The backend pulls the latest logs for the time window, then keyword layers keep filtering locally."))}</span>
             </div>
             <div class="query-composer-toolbar">
               <div id="search-level-filters" class="inline-dock-block"></div>
@@ -3004,7 +2942,7 @@ highlight = function (text) {
               <section class="search-main">
                 <div class="summary-strip summary-strip-compact" id="search-summary"></div>
                 <div class="card search-panel search-panel-volume"><div class="card-body compact-card-body"><div class="section-head search-panel-head"><div><h3 class="card-title">Logs volume</h3><p>${esc(s("\u67f1\u72b6\u56fe\u53ea\u4fdd\u7559\u8d8b\u52bf\u6982\u89c8\uff0c\u628a\u66f4\u591a\u7a7a\u95f4\u8ba9\u7ed9\u65e5\u5fd7\u5185\u5bb9\u3002", "The histogram stays compact so the log results keep most of the screen."))}</p></div></div><div id="search-histogram"></div><div class="divider"></div><div class="source-grid compact-source-grid" id="search-source-grid"></div></div></div>
-                <div class="card search-panel search-panel-results"><div class="card-body compact-card-body"><div class="section-head search-panel-head"><div><h3 class="card-title">${esc(s("\u65e5\u5fd7\u7ed3\u679c", "Logs"))}</h3><p>${esc(s("\u4e3b\u7a97\u53e3\u4fdd\u6301\u7d27\u51d1\u6d4f\u89c8\uff0c\u7ffb\u9875\u901a\u8fc7\u900f\u660e\u60ac\u6d6e\u533a\u57df\u5feb\u901f\u5207\u6362\u3002", "The main window stays compact and pages switch through transparent hover zones."))}</p></div></div><div id="search-results-body"></div></div></div>
+                <div class="card search-panel search-panel-results"><div class="card-body compact-card-body"><div class="section-head search-panel-head"><div><h3 class="card-title">${esc(s("\u65e5\u5fd7\u7ed3\u679c", "Logs"))}</h3><p>${esc(s("\u4e3b\u7a97\u53e3\u4fdd\u6301\u7d27\u51d1\u6d4f\u89c8\uff0c\u884c\u6570\u53ef\u4ee5\u52a8\u6001\u8c03\u6574\uff0c\u9ed8\u8ba4\u6309\u6700\u65b0\u65f6\u95f4\u5012\u5e8f\u5c55\u793a\u3002", "The main window stays compact, the row count can be changed dynamically, and the newest rows stay on top."))}</p></div></div><div id="search-results-body"></div></div></div>
               </section>
             </div>
           </div>
@@ -3025,28 +2963,17 @@ highlight = function (text) {
     }
     const results = getVisibleResults();
     ensureSelectedResult(results);
-    const total = getSearchTotalCount();
-    const pageSize = getSearchPageSizeFromState().value;
-    const pageCount = getSearchPageCount(total, pageSize);
-    const page = Math.max(1, Number(state.search.page || 1) || 1);
     let content = "";
     if (!results.length) {
       content = empty(s("\u5f53\u524d\u6761\u4ef6\u4e0b\u6ca1\u6709\u65e5\u5fd7\u7ed3\u679c\u3002", "No logs matched the current query."));
     } else if (state.search.view === "json") {
       content = `<div class="raw-view compact-raw-view"><pre>${esc(JSON.stringify(results.map(stripRuntimeFields), null, 2))}</pre></div>`;
     } else if (state.search.view === "table") {
-      content = `<div class="table-wrap table-wrap-compact"><table class="log-results-table"><thead><tr><th>${esc(s("\u65f6\u95f4", "Timestamp"))}</th><th>${esc(s("\u6570\u636e\u6e90", "Datasource"))}</th><th>${esc(s("\u670d\u52a1", "Service"))}</th><th>${esc(s("\u7ea7\u522b", "Level"))}</th><th>${esc(s("\u65e5\u5fd7\u5185\u5bb9", "Message"))}</th><th>${esc(s("\u64cd\u4f5c", "Action"))}</th></tr></thead><tbody>${results.map((item) => `<tr class="${String(item._index) === state.search.selectedResultKey ? "active" : ""}"><td>${esc(formatDate(item.timestamp))}</td><td>${esc(item.datasource || "-")}</td><td>${esc(item.service || "-")}</td><td>${pill(item._level.toUpperCase(), levelTone(item._level))}</td><td><div class="log-cell-message ${state.search.wrap ? "clamped" : ""}" title="${esc(item.message || "")}">${highlight(item.message || "", "")}</div></td><td><button class="button button-small" type="button" data-select-result="${esc(String(item._index))}">${esc(s("\u8be6\u60c5", "Detail"))}</button></td></tr>`).join("")}</tbody></table></div>`;
+      content = `<div class="table-wrap table-wrap-compact"><table class="log-results-table"><thead><tr><th>${esc(s("\u65f6\u95f4", "Timestamp"))}</th><th>${esc(s("\u6570\u636e\u6e90", "Datasource"))}</th><th>${esc(s("Pod", "Pod"))}</th><th>${esc(s("\u7ea7\u522b", "Level"))}</th><th>${esc(s("\u65e5\u5fd7\u5185\u5bb9", "Message"))}</th><th>${esc(s("\u64cd\u4f5c", "Action"))}</th></tr></thead><tbody>${results.map((item) => { const pod = item.pod || item.service || "-"; return `<tr class="${String(item._index) === state.search.selectedResultKey ? "active" : ""}"><td>${esc(formatDate(item.timestamp))}</td><td>${esc(item.datasource || "-")}</td><td><div class="log-cell-pod" title="${esc(pod)}">${esc(pod)}</div></td><td>${pill(item._level.toUpperCase(), levelTone(item._level))}</td><td><div class="log-cell-message ${state.search.wrap ? "clamped" : ""}" title="${esc(item.message || "")}">${highlight(item.message || "", "")}</div></td><td><button class="button button-small" type="button" data-select-result="${esc(String(item._index))}">${esc(s("\u8be6\u60c5", "Detail"))}</button></td></tr>`; }).join("")}</tbody></table></div>`;
     } else {
       content = `<div class="logs-list compact-logs-list">${results.map(renderLogEntry).join("")}</div>`;
     }
-    node.innerHTML = `
-      <div class="results-viewport">
-        <div class="results-page-indicator">${esc(s("\u7b2c", "Page"))} ${esc(String(page))} / ${esc(String(pageCount))}</div>
-        <button class="result-page-hitbox result-page-hitbox-prev ${page <= 1 ? "is-edge" : ""}" type="button" data-action="search-page-prev" aria-label="${esc(s("\u4e0a\u4e00\u9875", "Previous page"))}"><span>${esc(s("\u4e0a\u4e00\u9875", "Previous"))}</span></button>
-        <button class="result-page-hitbox result-page-hitbox-next ${page >= pageCount ? "is-edge" : ""}" type="button" data-action="search-page-next" aria-label="${esc(s("\u4e0b\u4e00\u9875", "Next page"))}"><span>${esc(s("\u4e0b\u4e00\u9875", "Next"))}</span></button>
-        <div class="results-viewport-body">${content}</div>
-      </div>
-    `;
+    node.innerHTML = `<div class="results-viewport results-viewport-single"><div class="results-viewport-body">${content}</div></div>`;
   };
 
   renderSearchFloatingExportDock = function () {
@@ -3072,7 +2999,7 @@ highlight = function (text) {
     }
   };
 
-  handleChange = function (event) {
+  handleChange = async function (event) {
     const target = event.target;
     if (!(target instanceof HTMLElement)) return;
     if (target.id === "search-page-size") {
@@ -3088,20 +3015,49 @@ highlight = function (text) {
         state.search.pageSize = getResolvedSearchPageSize(mode);
       }
       renderSearchControls();
+      if (!state.search.pageSizeError) {
+        await runSearchWindow(1, { silentSuccess: true });
+      }
       return;
     }
-    __baseHandleChange(event);
+    if (target.id === "search-page-size-custom") {
+      if (state.search.pageSizeMode === "custom" && !state.search.pageSizeError) {
+        await runSearchWindow(1, { silentSuccess: true });
+      }
+      return;
+    }
+    if (target.id === "search-use-cache") {
+      __baseHandleChange(event);
+      await runSearchWindow(1, { silentSuccess: true });
+      return;
+    }
+    return __baseHandleChange(event);
   };
 
-  handleClick = function (event) {
+  handleClick = async function (event) {
     const button = event.target.closest("button");
     if (button) {
       const action = button.getAttribute("data-action");
       if (action === "export-search-all") return exportCurrentSearchResults();
-      if (action === "search-page-prev") return navigateSearchPage(-1);
-      if (action === "search-page-next") return navigateSearchPage(1);
+      if (button.getAttribute("data-query-layer-mode") === "logsql") return;
     }
-    return __baseHandleClick(event);
+    const shouldAutoReload = !!(button && (
+      button.hasAttribute("data-search-datasource-id") ||
+      button.hasAttribute("data-search-datasource-all") ||
+      button.hasAttribute("data-search-service-name") ||
+      button.hasAttribute("data-search-service-all") ||
+      button.hasAttribute("data-toggle-tag-value-field") ||
+      button.hasAttribute("data-remove-tag") ||
+      button.getAttribute("data-range") != null ||
+      button.getAttribute("data-action") === "apply-custom-time"
+    ));
+    const result = __baseHandleClick(event);
+    if (shouldAutoReload) {
+      await Promise.resolve(result);
+      await runSearchWindow(1, { silentSuccess: true });
+      return;
+    }
+    return result;
   };
 
   clearSearchFilters = async function () {
@@ -3112,7 +3068,6 @@ highlight = function (text) {
     state.search.page = 1;
     state.search.pageSize = 500;
     state.search.pageSizeCustom = 1500;
-    if (byId("search-page")) byId("search-page").value = "1";
     if (byId("search-page-size")) byId("search-page-size").value = "500";
     if (byId("search-page-size-custom")) byId("search-page-size-custom").value = "";
     state.search.selectedDatasourceIDs = [];

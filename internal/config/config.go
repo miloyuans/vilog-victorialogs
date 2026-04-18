@@ -52,14 +52,18 @@ type LoggingConfig struct {
 }
 
 type CacheConfig struct {
-	QueryTTL           time.Duration `yaml:"query_ttl"`
-	ServiceListTTL     time.Duration `yaml:"service_list_ttl"`
-	TagValuesTTL       time.Duration `yaml:"tag_values_ttl"`
-	LocalQueryDir      string        `yaml:"local_query_dir"`
-	LocalQueryRetention time.Duration `yaml:"local_query_retention"`
-	SourceChunkSize    int           `yaml:"source_chunk_size"`
-	SourceRequestLimit int           `yaml:"source_request_limit"`
-	MaxQueryWindow     int           `yaml:"max_query_window"`
+	QueryTTL                time.Duration `yaml:"query_ttl"`
+	ServiceListTTL          time.Duration `yaml:"service_list_ttl"`
+	TagValuesTTL            time.Duration `yaml:"tag_values_ttl"`
+	LocalQueryDir           string        `yaml:"local_query_dir"`
+	LocalQueryRetention     time.Duration `yaml:"local_query_retention"`
+	LocalLogDir             string        `yaml:"local_log_dir"`
+	LocalLogHotDays         int           `yaml:"local_log_hot_days"`
+	LocalLogRefreshInterval time.Duration `yaml:"local_log_refresh_interval"`
+	LocalLogHistoryTTL      time.Duration `yaml:"local_log_history_ttl"`
+	SourceChunkSize         int           `yaml:"source_chunk_size"`
+	SourceRequestLimit      int           `yaml:"source_request_limit"`
+	MaxQueryWindow          int           `yaml:"max_query_window"`
 }
 
 type VictoriaLogsConfig struct {
@@ -122,14 +126,18 @@ func Default() Config {
 			Development: true,
 		},
 		Cache: CacheConfig{
-			QueryTTL:            5 * time.Minute,
-			ServiceListTTL:      30 * time.Minute,
-			TagValuesTTL:        30 * time.Minute,
-			LocalQueryDir:       "./data/query-cache",
-			LocalQueryRetention: 24 * time.Hour,
-			SourceChunkSize:     1000,
-			SourceRequestLimit:  10000,
-			MaxQueryWindow:      100000,
+			QueryTTL:                5 * time.Minute,
+			ServiceListTTL:          30 * time.Minute,
+			TagValuesTTL:            30 * time.Minute,
+			LocalQueryDir:           "./data/query-cache",
+			LocalQueryRetention:     24 * time.Hour,
+			LocalLogDir:             "./data/log-cache",
+			LocalLogHotDays:         2,
+			LocalLogRefreshInterval: 10 * time.Second,
+			LocalLogHistoryTTL:      1 * time.Hour,
+			SourceChunkSize:         1000,
+			SourceRequestLimit:      10000,
+			MaxQueryWindow:          100000,
 		},
 		VictoriaLogs: VictoriaLogsConfig{
 			RequestRetries: 1,
@@ -197,6 +205,9 @@ func resolveLocalPaths(cfg *Config, configPath string) error {
 	if strings.TrimSpace(cfg.Cache.LocalQueryDir) != "" && !filepath.IsAbs(cfg.Cache.LocalQueryDir) {
 		cfg.Cache.LocalQueryDir = filepath.Clean(filepath.Join(baseDir, cfg.Cache.LocalQueryDir))
 	}
+	if strings.TrimSpace(cfg.Cache.LocalLogDir) != "" && !filepath.IsAbs(cfg.Cache.LocalLogDir) {
+		cfg.Cache.LocalLogDir = filepath.Clean(filepath.Join(baseDir, cfg.Cache.LocalLogDir))
+	}
 	return nil
 }
 
@@ -241,6 +252,15 @@ func (c Config) Validate() error {
 	}
 	if c.Cache.LocalQueryRetention <= 0 {
 		return fmt.Errorf("cache.local_query_retention must be positive")
+	}
+	if c.Cache.LocalLogHotDays <= 0 {
+		return fmt.Errorf("cache.local_log_hot_days must be positive")
+	}
+	if c.Cache.LocalLogRefreshInterval <= 0 {
+		return fmt.Errorf("cache.local_log_refresh_interval must be positive")
+	}
+	if c.Cache.LocalLogHistoryTTL <= 0 {
+		return fmt.Errorf("cache.local_log_history_ttl must be positive")
 	}
 	if c.Cache.SourceChunkSize <= 0 || c.Cache.SourceRequestLimit <= 0 || c.Cache.MaxQueryWindow <= 0 {
 		return fmt.Errorf("cache source limits must be positive")
@@ -324,6 +344,16 @@ func applyEnvOverrides(cfg *Config) error {
 	}
 	setString("VILOG_CACHE_LOCAL_QUERY_DIR", &cfg.Cache.LocalQueryDir)
 	if err := setDuration("VILOG_CACHE_LOCAL_QUERY_RETENTION", &cfg.Cache.LocalQueryRetention); err != nil {
+		return err
+	}
+	setString("VILOG_CACHE_LOCAL_LOG_DIR", &cfg.Cache.LocalLogDir)
+	if err := setInt("VILOG_CACHE_LOCAL_LOG_HOT_DAYS", &cfg.Cache.LocalLogHotDays); err != nil {
+		return err
+	}
+	if err := setDuration("VILOG_CACHE_LOCAL_LOG_REFRESH_INTERVAL", &cfg.Cache.LocalLogRefreshInterval); err != nil {
+		return err
+	}
+	if err := setDuration("VILOG_CACHE_LOCAL_LOG_HISTORY_TTL", &cfg.Cache.LocalLogHistoryTTL); err != nil {
 		return err
 	}
 	if err := setInt("VILOG_CACHE_SOURCE_CHUNK_SIZE", &cfg.Cache.SourceChunkSize); err != nil {

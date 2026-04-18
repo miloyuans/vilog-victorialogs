@@ -10,12 +10,13 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
 	"vilog-victorialogs/internal/client/victorialogs"
 	"vilog-victorialogs/internal/config"
 	"vilog-victorialogs/internal/model"
 	"vilog-victorialogs/internal/service/cache"
 	mongostore "vilog-victorialogs/internal/store/mongo"
-	"vilog-victorialogs/internal/util"
 )
 
 type Service struct {
@@ -23,36 +24,27 @@ type Service struct {
 	cache  *cache.Service
 	client *victorialogs.Client
 	cfg    config.CacheConfig
+	logger *zap.Logger
 }
 
-func New(store *mongostore.Store, cacheService *cache.Service, client *victorialogs.Client, cfg config.CacheConfig) *Service {
+func New(store *mongostore.Store, cacheService *cache.Service, client *victorialogs.Client, cfg config.CacheConfig, logger *zap.Logger) *Service {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	return &Service{
 		store:  store,
 		cache:  cacheService,
 		client: client,
 		cfg:    cfg,
+		logger: logger,
 	}
 }
 
 func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.SearchResponse, error) {
-	startedAt := time.Now()
-	normalized, start, end, page, pageSize, err := normalizeRequest(req)
+	startedAt := time.Now().UTC()
+	normalized, start, end, _, pageSize, err := normalizeRequest(req)
 	if err != nil {
 		return model.SearchResponse{}, err
-	}
-
-	cacheKey, err := util.HashJSON(normalized)
-	if err != nil {
-		return model.SearchResponse{}, err
-	}
-
-	if req.UseCache {
-		var cached model.SearchResponse
-		cacheHit, cacheErr := s.cache.Get(ctx, cache.KindQuery, cacheKey, &cached)
-		if cacheErr == nil && cacheHit {
-			cached.CacheHit = true
-			return cached, nil
-		}
 	}
 
 	datasources, err := s.resolveDatasources(ctx, req.DatasourceIDs)
@@ -63,10 +55,22 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 	if err != nil {
 		return model.SearchResponse{}, err
 	}
+	now := time.Now().UTC()
+
+	s.logger.Info("search started",
+		zap.Time("start", start),
+		zap.Time("end", end),
+		zap.Int("datasource_count", len(datasources)),
+		zap.Int("requested_service_count", len(normalized.ServiceNames)),
+		zap.Int("page_size", pageSize),
+		zap.Bool("use_cache", normalized.UseCache),
+	)
 
 	type sourceResult struct {
 		results []model.SearchResult
 		status  model.QuerySourceStatus
+		cacheHit bool
+		partial bool
 	}
 
 	resultsCh := make(chan sourceResult, len(datasources))
@@ -79,17 +83,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 			defer wg.Done()
 
 			snapshot, _ := s.store.GetSnapshot(ctx, ds.ID)
-			logsql := buildLogsQL(ds, snapshot, tagDefinitions, req.Keyword, req.ServiceNames, req.Tags)
-			rows, truncated, queryErr := s.fetchDatasourceWindow(
-				ctx,
-				ds,
-				snapshot,
-				tagDefinitions,
-				logsql,
-				start,
-				end,
-				page*pageSize,
-			)
+			rows, status, cacheHit, sourcePartial, queryErr := s.searchDatasource(ctx, ds, snapshot, tagDefinitions, normalized, start, end, now)
 			if queryErr != nil {
 				resultsCh <- sourceResult{
 					status: model.QuerySourceStatus{
@@ -98,29 +92,17 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 						Hits:       0,
 						Error:      queryErr.Error(),
 					},
-				}
-				return
-			}
-
-			if len(rows) == 0 {
-				resultsCh <- sourceResult{
-					results: []model.SearchResult{},
-					status: model.QuerySourceStatus{
-						Datasource: ds.Name,
-						Status:     statusLabelForRows(truncated, true),
-						Hits:       0,
-					},
+					cacheHit: false,
+					partial:  true,
 				}
 				return
 			}
 
 			resultsCh <- sourceResult{
 				results: rows,
-				status: model.QuerySourceStatus{
-					Datasource: ds.Name,
-					Status:     statusLabelForRows(truncated, false),
-					Hits:       len(rows),
-				},
+				status:  status,
+				cacheHit: cacheHit,
+				partial: sourcePartial,
 			}
 		}()
 	}
@@ -131,12 +113,19 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 	allResults := make([]model.SearchResult, 0)
 	sourceStatuses := make([]model.QuerySourceStatus, 0, len(datasources))
 	partial := false
+	cacheHit := len(datasources) > 0
 	for item := range resultsCh {
 		allResults = append(allResults, item.results...)
 		sourceStatuses = append(sourceStatuses, item.status)
-		if item.status.Status == "error" || item.status.Status == "partial" {
+		if item.status.Status == "error" || item.status.Status == "partial" || item.partial {
 			partial = true
 		}
+		if !item.cacheHit {
+			cacheHit = false
+		}
+	}
+	if len(datasources) == 0 {
+		cacheHit = false
 	}
 
 	sort.Slice(allResults, func(i, j int) bool {
@@ -156,21 +145,309 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 		return left.After(right)
 	})
 
-	pageResults := paginateResults(allResults, page, pageSize)
+	if len(allResults) > pageSize {
+		allResults = allResults[:pageSize]
+	}
 	response := model.SearchResponse{
-		Results:  pageResults,
+		Results:  allResults,
 		Sources:  sourceStatuses,
-		Total:    len(allResults),
+		Total:    countSourceHits(sourceStatuses),
 		Partial:  partial,
-		CacheHit: false,
+		CacheHit: cacheHit,
 		TookMS:   time.Since(startedAt).Milliseconds(),
 	}
-
-	if req.UseCache {
-		_ = s.cache.Set(ctx, cache.KindQuery, cacheKey, response, s.cache.QueryTTL())
-	}
+	s.logger.Info("search completed",
+		zap.Int("total", response.Total),
+		zap.Int("visible", len(response.Results)),
+		zap.Bool("cache_hit", response.CacheHit),
+		zap.Bool("partial", response.Partial),
+		zap.Int64("took_ms", response.TookMS),
+	)
 
 	return response, nil
+}
+
+func (s *Service) searchDatasource(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	req model.SearchRequest,
+	start, end, now time.Time,
+) ([]model.SearchResult, model.QuerySourceStatus, bool, bool, error) {
+	services, err := s.resolveServiceTargets(ctx, datasource.ID, req.ServiceNames)
+	if err != nil {
+		return nil, model.QuerySourceStatus{}, false, true, err
+	}
+
+	rows := make([]model.SearchResult, 0)
+	cacheHit := true
+	partial := false
+	for _, serviceName := range services {
+		serviceRows, serviceCacheHit, servicePartial, err := s.searchServiceWindow(ctx, datasource, snapshot, tagDefinitions, serviceName, start, end, now, req.UseCache)
+		if err != nil {
+			return nil, model.QuerySourceStatus{}, false, true, err
+		}
+		rows = append(rows, serviceRows...)
+		cacheHit = cacheHit && serviceCacheHit
+		partial = partial || servicePartial
+	}
+
+	return rows, model.QuerySourceStatus{
+		Datasource: datasource.Name,
+		Status:     statusLabelForRows(partial, len(rows) == 0),
+		Hits:       len(rows),
+	}, cacheHit, partial, nil
+}
+
+func (s *Service) searchServiceWindow(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	serviceName string,
+	start, end, now time.Time,
+	useCache bool,
+) ([]model.SearchResult, bool, bool, error) {
+	rows := make([]model.SearchResult, 0)
+	cacheHit := true
+	partial := false
+	for day := cacheDay(start); !day.After(cacheDay(end)); day = day.Add(24 * time.Hour) {
+		partition, partitionCacheHit, partitionPartial, err := s.loadPartitionWindow(ctx, datasource, snapshot, tagDefinitions, serviceName, day, now, useCache)
+		if err != nil {
+			return nil, false, true, err
+		}
+		rows = append(rows, filterRowsByWindow(partition.Rows, start, end)...)
+		cacheHit = cacheHit && partitionCacheHit
+		partial = partial || partitionPartial || partition.Meta.Partial
+	}
+	return rows, cacheHit, partial, nil
+}
+
+func (s *Service) loadPartitionWindow(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	serviceName string,
+	day, now time.Time,
+	useCache bool,
+) (cache.LocalLogPartition, bool, bool, error) {
+	if useCache {
+		partition, hit, err := s.cache.LoadLogPartition(day, serviceName, datasource)
+		if err != nil {
+			s.logger.Warn("load log partition failed",
+				zap.Error(err),
+				zap.String("datasource", datasource.Name),
+				zap.String("service", displayServiceName(serviceName)),
+				zap.String("day", cacheDay(day).Format("2006-01-02")),
+			)
+		} else if hit {
+			s.logger.Debug("log partition cache hit",
+				zap.String("datasource", datasource.Name),
+				zap.String("service", displayServiceName(serviceName)),
+				zap.String("day", cacheDay(day).Format("2006-01-02")),
+				zap.Int("rows", len(partition.Rows)),
+			)
+			if s.cache.LogPartitionNeedsRefresh(partition.Meta, day, now) {
+				s.logger.Info("refreshing hot log partition",
+					zap.String("datasource", datasource.Name),
+					zap.String("service", displayServiceName(serviceName)),
+					zap.String("day", cacheDay(day).Format("2006-01-02")),
+					zap.Time("last_sync_at", partition.Meta.LastSyncAt),
+				)
+				refreshed, refreshPartial, refreshErr := s.refreshPartitionIncremental(ctx, datasource, snapshot, tagDefinitions, serviceName, day, now, partition)
+				if refreshErr != nil {
+					s.logger.Warn("refresh hot log partition failed, serving cached copy",
+						zap.Error(refreshErr),
+						zap.String("datasource", datasource.Name),
+						zap.String("service", displayServiceName(serviceName)),
+						zap.String("day", cacheDay(day).Format("2006-01-02")),
+					)
+					return partition, true, partition.Meta.Partial, nil
+				}
+				return refreshed, true, refreshPartial, nil
+			}
+			return partition, true, partition.Meta.Partial, nil
+		}
+	}
+
+	s.logger.Info("building log partition from source",
+		zap.String("datasource", datasource.Name),
+		zap.String("service", displayServiceName(serviceName)),
+		zap.String("day", cacheDay(day).Format("2006-01-02")),
+	)
+	partition, partial, err := s.buildPartitionFromSource(ctx, datasource, snapshot, tagDefinitions, serviceName, day, now)
+	if err != nil {
+		return cache.LocalLogPartition{}, false, true, err
+	}
+	return partition, false, partial, nil
+}
+
+func (s *Service) buildPartitionFromSource(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	serviceName string,
+	day, now time.Time,
+) (cache.LocalLogPartition, bool, error) {
+	rangeStart, rangeEnd := dayBounds(day, now)
+	rows, partial, err := s.fetchCompleteSourceRange(ctx, datasource, snapshot, tagDefinitions, serviceName, rangeStart, rangeEnd)
+	if err != nil {
+		return cache.LocalLogPartition{}, partial, err
+	}
+	partition := cache.LocalLogPartition{
+		Meta: s.cache.PrepareLogPartitionMeta(day, serviceName, datasource, len(rows), now, partial),
+		Rows: dedupeRows(rows),
+	}
+	if err := s.cache.StoreLogPartition(partition); err != nil {
+		s.logger.Warn("store log partition failed",
+			zap.Error(err),
+			zap.String("datasource", datasource.Name),
+			zap.String("service", displayServiceName(serviceName)),
+			zap.String("day", cacheDay(day).Format("2006-01-02")),
+		)
+	}
+	return partition, partial, nil
+}
+
+func (s *Service) refreshPartitionIncremental(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	serviceName string,
+	day, now time.Time,
+	partition cache.LocalLogPartition,
+) (cache.LocalLogPartition, bool, error) {
+	rangeStart, rangeEnd := dayBounds(day, now)
+	refreshStart := partition.Meta.LastSyncAt.Add(-2 * time.Second)
+	if refreshStart.Before(rangeStart) {
+		refreshStart = rangeStart
+	}
+	if !rangeEnd.After(refreshStart) {
+		partition.Meta.LastSyncAt = now
+		partition.Meta.LastAccessAt = now
+		if err := s.cache.StoreLogPartition(partition); err != nil {
+			s.logger.Warn("persist hot partition heartbeat failed",
+				zap.Error(err),
+				zap.String("datasource", datasource.Name),
+				zap.String("service", displayServiceName(serviceName)),
+				zap.String("day", cacheDay(day).Format("2006-01-02")),
+			)
+		}
+		return partition, partition.Meta.Partial, nil
+	}
+
+	rows, partial, err := s.fetchCompleteSourceRange(ctx, datasource, snapshot, tagDefinitions, serviceName, refreshStart, rangeEnd)
+	if err != nil {
+		return cache.LocalLogPartition{}, true, err
+	}
+	partition.Rows = dedupeRows(append(partition.Rows, rows...))
+	partition.Meta = s.cache.PrepareLogPartitionMeta(day, serviceName, datasource, len(partition.Rows), now, partition.Meta.Partial || partial)
+	if err := s.cache.StoreLogPartition(partition); err != nil {
+		s.logger.Warn("store refreshed hot partition failed",
+			zap.Error(err),
+			zap.String("datasource", datasource.Name),
+			zap.String("service", displayServiceName(serviceName)),
+			zap.String("day", cacheDay(day).Format("2006-01-02")),
+		)
+	}
+	return partition, partition.Meta.Partial, nil
+}
+
+func (s *Service) fetchCompleteSourceRange(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	serviceName string,
+	start, end time.Time,
+) ([]model.SearchResult, bool, error) {
+	return s.fetchSourceRangeRecursive(ctx, datasource, snapshot, tagDefinitions, serviceName, start, end, 0)
+}
+
+func (s *Service) fetchSourceRangeRecursive(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	serviceName string,
+	start, end time.Time,
+	depth int,
+) ([]model.SearchResult, bool, error) {
+	if !end.After(start) {
+		return []model.SearchResult{}, false, nil
+	}
+
+	logsql := buildSourceLogsQL(datasource, snapshot, serviceName)
+	rows, truncated, err := s.fetchDatasourceWindow(
+		ctx,
+		datasource,
+		snapshot,
+		tagDefinitions,
+		logsql,
+		start,
+		end,
+		s.cfg.SourceRequestLimit,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	if !truncated {
+		return dedupeRows(rows), false, nil
+	}
+	if end.Sub(start) <= time.Second {
+		s.logger.Warn("source range truncated at minimum split window",
+			zap.String("datasource", datasource.Name),
+			zap.String("service", displayServiceName(serviceName)),
+			zap.Time("start", start),
+			zap.Time("end", end),
+			zap.Int("depth", depth),
+		)
+		return dedupeRows(rows), true, nil
+	}
+
+	mid := start.Add(end.Sub(start) / 2)
+	if !mid.After(start) || !end.After(mid) {
+		return dedupeRows(rows), true, nil
+	}
+	s.logger.Debug("splitting truncated source window",
+		zap.String("datasource", datasource.Name),
+		zap.String("service", displayServiceName(serviceName)),
+		zap.Time("start", start),
+		zap.Time("mid", mid),
+		zap.Time("end", end),
+		zap.Int("depth", depth),
+	)
+	leftRows, leftPartial, err := s.fetchSourceRangeRecursive(ctx, datasource, snapshot, tagDefinitions, serviceName, start, mid, depth+1)
+	if err != nil {
+		return nil, false, err
+	}
+	rightRows, rightPartial, err := s.fetchSourceRangeRecursive(ctx, datasource, snapshot, tagDefinitions, serviceName, mid, end, depth+1)
+	if err != nil {
+		return nil, false, err
+	}
+	return dedupeRows(append(leftRows, rightRows...)), leftPartial || rightPartial, nil
+}
+
+func (s *Service) resolveServiceTargets(ctx context.Context, datasourceID string, requested []string) ([]string, error) {
+	if items := uniqueStrings(requested); len(items) > 0 {
+		return items, nil
+	}
+	entries, err := s.store.ListServiceCatalog(ctx, datasourceID)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return []string{""}, nil
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.ServiceName)
+	}
+	return uniqueStrings(names), nil
 }
 
 func (s *Service) fetchDatasourceWindow(
@@ -269,16 +546,13 @@ func normalizeRequest(req model.SearchRequest) (model.SearchRequest, time.Time, 
 		return model.SearchRequest{}, time.Time{}, time.Time{}, 0, 0, fmt.Errorf("start must be before end")
 	}
 
-	page := req.Page
-	if page <= 0 {
-		page = 1
-	}
+	page := 1
 	pageSize := req.PageSize
 	if pageSize <= 0 {
-		pageSize = 200
+		pageSize = 500
 	}
-	if pageSize > 1000 {
-		pageSize = 1000
+	if pageSize > 10000 {
+		pageSize = 10000
 	}
 
 	normalized := req
@@ -325,6 +599,15 @@ func buildLogsQL(datasource model.Datasource, snapshot model.DatasourceTagSnapsh
 		return "*"
 	}
 	return strings.Join(parts, " ")
+}
+
+func buildSourceLogsQL(datasource model.Datasource, snapshot model.DatasourceTagSnapshot, serviceName string) string {
+	serviceName = strings.TrimSpace(serviceName)
+	if serviceName == "" {
+		return "*"
+	}
+	serviceField := firstNonEmpty(datasource.FieldMapping.ServiceField, snapshot.ServiceField, "service")
+	return buildExactFieldFilter(serviceField, []string{serviceName})
 }
 
 func resolveTagField(datasourceID, tagName string, tags []model.TagDefinition) string {
@@ -472,8 +755,8 @@ func mergeIntoPrevious(previous *model.SearchResult, continuation model.SearchRe
 	previous.Raw["_merged_continuations"] = append(existing, continuation.Raw)
 }
 
-func statusLabelForRows(truncated, empty bool) string {
-	if truncated {
+func statusLabelForRows(partial, empty bool) string {
+	if partial {
 		return "partial"
 	}
 	if empty {
@@ -609,16 +892,69 @@ func parseTimestamp(value string) time.Time {
 	return parsed
 }
 
-func paginateResults(results []model.SearchResult, page, pageSize int) []model.SearchResult {
-	start := (page - 1) * pageSize
-	if start >= len(results) {
-		return []model.SearchResult{}
+func filterRowsByWindow(rows []model.SearchResult, start, end time.Time) []model.SearchResult {
+	filtered := make([]model.SearchResult, 0, len(rows))
+	for _, row := range rows {
+		parsed := parseTimestamp(row.Timestamp)
+		if !parsed.IsZero() && (parsed.Before(start) || parsed.After(end)) {
+			continue
+		}
+		filtered = append(filtered, row)
 	}
-	end := start + pageSize
-	if end > len(results) {
-		end = len(results)
+	return filtered
+}
+
+func dedupeRows(rows []model.SearchResult) []model.SearchResult {
+	seen := make(map[string]struct{}, len(rows))
+	filtered := make([]model.SearchResult, 0, len(rows))
+	for _, row := range rows {
+		key := searchResultKey(row)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		filtered = append(filtered, row)
 	}
-	return results[start:end]
+	return filtered
+}
+
+func searchResultKey(row model.SearchResult) string {
+	return strings.Join([]string{
+		row.Timestamp,
+		row.Datasource,
+		row.Service,
+		row.Pod,
+		row.Message,
+	}, "\x00")
+}
+
+func countSourceHits(items []model.QuerySourceStatus) int {
+	total := 0
+	for _, item := range items {
+		total += item.Hits
+	}
+	return total
+}
+
+func cacheDay(value time.Time) time.Time {
+	return time.Date(value.UTC().Year(), value.UTC().Month(), value.UTC().Day(), 0, 0, 0, 0, time.UTC)
+}
+
+func dayBounds(day, now time.Time) (time.Time, time.Time) {
+	start := cacheDay(day)
+	end := start.Add(24 * time.Hour)
+	nowUTC := now.UTC()
+	if cacheDay(nowUTC).Equal(start) && nowUTC.Before(end) {
+		end = nowUTC
+	}
+	return start, end
+}
+
+func displayServiceName(serviceName string) string {
+	if strings.TrimSpace(serviceName) == "" {
+		return "__all__"
+	}
+	return serviceName
 }
 
 func uniqueStrings(items []string) []string {

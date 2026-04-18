@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
 	"vilog-victorialogs/internal/config"
 	"vilog-victorialogs/internal/model"
 	mongostore "vilog-victorialogs/internal/store/mongo"
@@ -23,19 +25,28 @@ const (
 )
 
 type Service struct {
-	store           *mongostore.Store
-	cfg             config.CacheConfig
-	cleanupMu       sync.Mutex
-	lastLocalCleanup time.Time
+	store              *mongostore.Store
+	cfg                config.CacheConfig
+	logger             *zap.Logger
+	cleanupMu          sync.Mutex
+	lastLocalCleanup   time.Time
+	lastLogDirCleanup  time.Time
 }
 
-func New(store *mongostore.Store, cfg config.CacheConfig) *Service {
+func New(store *mongostore.Store, cfg config.CacheConfig, logger *zap.Logger) *Service {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	service := &Service{
 		store: store,
 		cfg:   cfg,
+		logger: logger,
 	}
 	if strings.TrimSpace(cfg.LocalQueryDir) != "" {
 		_ = os.MkdirAll(cfg.LocalQueryDir, 0o755)
+	}
+	if strings.TrimSpace(cfg.LocalLogDir) != "" {
+		_ = os.MkdirAll(cfg.LocalLogDir, 0o755)
 	}
 	return service
 }

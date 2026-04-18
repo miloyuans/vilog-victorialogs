@@ -45,6 +45,10 @@ cache:
   tag_values_ttl: 30m
   local_query_dir: ./data/query-cache
   local_query_retention: 24h
+  local_log_dir: ./data/log-cache
+  local_log_hot_days: 2
+  local_log_refresh_interval: 10s
+  local_log_history_ttl: 1h
   source_chunk_size: 1000
   source_request_limit: 10000
   max_query_window: 100000
