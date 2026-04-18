@@ -2,6 +2,7 @@ package model
 
 type SearchRequest struct {
 	Keyword       string              `json:"keyword"`
+	KeywordMode   string              `json:"keyword_mode"`
 	Start         string              `json:"start"`
 	End           string              `json:"end"`
 	DatasourceIDs []string            `json:"datasource_ids"`

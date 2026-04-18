@@ -83,6 +83,7 @@ func main() {
 	if cfg.Discovery.StartupEnabled {
 		go discoveryService.RunStartupDiscovery(context.Background())
 	}
+	go queryService.StartHotSync(ctx)
 
 	server, err := httpserver.New(cfg, logger, []httpserver.ReadinessChecker{store}, httpserver.BuildInfo{
 		Version: version,

@@ -1481,7 +1481,12 @@ highlight = function (text) {
 
   function getBackendPrimaryQuery(layer) {
     if (!layer) return "";
-    return layer.mode === "logsql" ? buildBackendQueryFromLayer(layer) : "";
+    return layer.mode === "keyword" ? String(layer.value || "").trim() : "";
+  }
+
+  function getBackendPrimaryKeywordMode(layer) {
+    if (!layer) return "and";
+    return layer.operator === "or" ? "or" : "and";
   }
 
   function mergeSourceDiagnostics(target, items) {
@@ -1586,6 +1591,7 @@ highlight = function (text) {
     const primaryLayer = getPrimaryLayer();
     return {
       keyword: getBackendPrimaryQuery(primaryLayer),
+      keyword_mode: getBackendPrimaryKeywordMode(primaryLayer),
       start: localToRFC3339((byId("search-start") && byId("search-start").value) || ""),
       end: localToRFC3339((byId("search-end") && byId("search-end").value) || ""),
       datasource_ids: safeArray(state.search.selectedDatasourceIDs).slice(),
@@ -1829,7 +1835,7 @@ highlight = function (text) {
 
   getDecoratedResults = function () {
     const results = getRawDecoratedResults().filter((item) => matchesActiveFilters(item));
-    const layers = safeArray(state.search.queryLayers);
+    const layers = safeArray(state.search.queryLayers).slice(1);
     return layers.reduce((items, layer) => {
       if (!String(layer && layer.value || "").trim()) return items;
       return safeArray(items).filter((item) => layerMatches(item, layer));
@@ -3085,9 +3091,59 @@ highlight = function (text) {
     renderSearchResults();
   };
 
+  applyClientSideResultFilters = function (items) {
+    let decorated = decorateExportResults(items);
+    const layers = safeArray(state.search.queryLayers).slice(1);
+    decorated = layers.reduce((list, layer) => {
+      if (!String(layer && layer.value || "").trim()) return list;
+      return safeArray(list).filter((item) => layerMatches(item, layer));
+    }, decorated);
+    if (state.search.levelFilter && state.search.levelFilter !== "all") {
+      decorated = decorated.filter((item) => item._level === state.search.levelFilter);
+    }
+    return decorated;
+  };
+
+  fetchAllResultsForExport = async function () {
+    normalizeFrontendCollections();
+    const current = safeArray(state.search.response && state.search.response.results);
+    const responseTotal = Number(state.search.response && state.search.response.total || 0);
+    if (current.length && current.length >= responseTotal) {
+      return applyClientSideResultFilters(current);
+    }
+    const payload = buildCurrentSearchPayload(1, MAX_UI_PAGE_SIZE);
+    const response = await request("/api/query/search", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    return applyClientSideResultFilters(safeArray(response && response.results));
+  };
+
+  downloadDecoratedResults = async function (format, results, allResults) {
+    if (!safeArray(results).length) {
+      throw new Error("No query results to export.");
+    }
+    if (format === "json") {
+      downloadTextFile(exportFilename("json", allResults), JSON.stringify(results.map(stripRuntimeFields), null, 2), "application/json");
+      return { filename: exportFilename("json", allResults), compressed: false };
+    }
+    const text = results
+      .map((item) => {
+        const pod = item.pod || item.service || "-";
+        return `[${item.timestamp || ""}] ${item.datasource || "-"} ${pod} ${item.message || ""}`.trim();
+      })
+      .join("\n");
+    return downloadCompressedExport(exportFilename("txt", allResults), text, "text/plain");
+  };
+
   submitSearch = async function (event) {
     event.preventDefault();
     await runSearchWindow();
+  };
+
+  renderLogEntry = function (item) {
+    const pod = item.pod || item.service || "-";
+    return `<div class="log-entry compact-log-entry ${String(item._index) === state.search.selectedResultKey ? "active" : ""}"><div class="log-meta">${pill(formatDate(item.timestamp), "tone-soft")}${pill(item.datasource || "-", "tone-neutral")}<span class="log-meta-pod" title="${esc(pod)}">${esc(pod)}</span>${pill(item._level.toUpperCase(), levelTone(item._level))}</div><p class="log-message compact-log-message ${state.search.wrap ? "clamped" : ""}" title="${esc(item.message || "")}">${highlight(item.message || "", "")}</p><div class="log-labels">${renderLabelChips(item.labels)}</div><div class="form-actions"><button class="button button-small" type="button" data-select-result="${esc(String(item._index))}">${esc(s("\u8be6\u60c5", "Detail"))}</button></div></div>`;
   };
 })();
 

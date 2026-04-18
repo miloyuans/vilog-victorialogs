@@ -75,6 +75,12 @@ func (s *Service) LoadLogPartition(day time.Time, service string, datasource mod
 	if err := s.writeJSONAtomic(metaPath, meta); err != nil {
 		s.logger.Warn("touch log partition meta failed", zap.Error(err), zap.String("path", metaPath))
 	}
+	s.logger.Debug("loaded log partition",
+		zap.String("datasource", datasource.Name),
+		zap.String("service", defaultPartitionService(service)),
+		zap.String("date", meta.Date),
+		zap.Int("rows", len(rows)),
+	)
 
 	return LocalLogPartition{
 		Meta: meta,
@@ -125,6 +131,12 @@ func (s *Service) StoreLogPartition(partition LocalLogPartition) error {
 	if err := s.writeGzipTextAtomic(textPath, s.renderPartitionText(partition.Rows)); err != nil {
 		return err
 	}
+	s.logger.Debug("stored log partition",
+		zap.String("datasource", partition.Meta.DatasourceName),
+		zap.String("service", defaultPartitionService(partition.Meta.Service)),
+		zap.String("date", partition.Meta.Date),
+		zap.Int("rows", len(partition.Rows)),
+	)
 	return nil
 }
 
@@ -153,6 +165,35 @@ func (s *Service) LogPartitionNeedsRefresh(meta LocalLogPartitionMeta, day, now 
 		return true
 	}
 	return now.UTC().Sub(meta.LastSyncAt.UTC()) >= s.cfg.LocalLogRefreshInterval
+}
+
+func (s *Service) ListTrackedLogPartitions() ([]LocalLogPartitionMeta, error) {
+	baseDir := strings.TrimSpace(s.cfg.LocalLogDir)
+	if baseDir == "" {
+		return nil, nil
+	}
+	s.maybeCleanupLocalLogPartitions()
+
+	metas := make([]LocalLogPartitionMeta, 0)
+	err := filepath.WalkDir(baseDir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if d.IsDir() || d.Name() != logPartitionMetaFile {
+			return nil
+		}
+		meta, readErr := s.readLogPartitionMeta(path)
+		if readErr != nil {
+			s.logger.Warn("read tracked log partition meta failed", zap.Error(readErr), zap.String("path", path))
+			return nil
+		}
+		metas = append(metas, meta)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return metas, nil
 }
 
 func (s *Service) maybeCleanupLocalLogPartitions() {
@@ -188,6 +229,12 @@ func (s *Service) maybeCleanupLocalLogPartitions() {
 		}
 		now := time.Now().UTC()
 		if !meta.ExpireAt.IsZero() && now.After(meta.ExpireAt) && !s.isHotLogDay(day, now) {
+			s.logger.Info("removing expired log partition",
+				zap.String("datasource", meta.DatasourceName),
+				zap.String("service", defaultPartitionService(meta.Service)),
+				zap.String("date", meta.Date),
+				zap.String("path", filepath.Dir(path)),
+			)
 			_ = os.RemoveAll(filepath.Dir(path))
 		}
 		return nil

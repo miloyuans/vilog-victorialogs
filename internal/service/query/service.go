@@ -2,6 +2,7 @@ package query
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -17,6 +18,7 @@ import (
 	"vilog-victorialogs/internal/model"
 	"vilog-victorialogs/internal/service/cache"
 	mongostore "vilog-victorialogs/internal/store/mongo"
+	"vilog-victorialogs/internal/util"
 )
 
 type Service struct {
@@ -40,6 +42,38 @@ func New(store *mongostore.Store, cacheService *cache.Service, client *victorial
 	}
 }
 
+func (s *Service) StartHotSync(ctx context.Context) {
+	if s.cache == nil || strings.TrimSpace(s.cfg.LocalLogDir) == "" || s.cfg.LocalLogRefreshInterval <= 0 {
+		return
+	}
+
+	s.logger.Info("starting tracked hot log cache sync",
+		zap.String("dir", s.cfg.LocalLogDir),
+		zap.Duration("interval", s.cfg.LocalLogRefreshInterval),
+	)
+
+	s.runHotSyncCycle(ctx)
+
+	ticker := time.NewTicker(s.cfg.LocalLogRefreshInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.logger.Info("stopping tracked hot log cache sync")
+			return
+		case <-ticker.C:
+			s.runHotSyncCycle(ctx)
+		}
+	}
+}
+
+func (s *Service) runHotSyncCycle(ctx context.Context) {
+	if err := s.refreshTrackedHotPartitions(ctx); err != nil {
+		s.logger.Warn("refresh tracked hot log partitions failed", zap.Error(err))
+	}
+}
+
 func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.SearchResponse, error) {
 	startedAt := time.Now().UTC()
 	normalized, start, end, _, pageSize, err := normalizeRequest(req)
@@ -47,7 +81,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 		return model.SearchResponse{}, err
 	}
 
-	datasources, err := s.resolveDatasources(ctx, req.DatasourceIDs)
+	datasources, err := s.resolveDatasources(ctx, normalized.DatasourceIDs)
 	if err != nil {
 		return model.SearchResponse{}, err
 	}
@@ -62,6 +96,9 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 		zap.Time("end", end),
 		zap.Int("datasource_count", len(datasources)),
 		zap.Int("requested_service_count", len(normalized.ServiceNames)),
+		zap.Int("keyword_group_count", len(splitKeywords(normalized.Keyword))),
+		zap.String("keyword_mode", normalized.KeywordMode),
+		zap.Int("tag_filter_count", len(normalized.Tags)),
 		zap.Int("page_size", pageSize),
 		zap.Bool("use_cache", normalized.UseCache),
 	)
@@ -128,6 +165,13 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 		cacheHit = false
 	}
 
+	preFilterCount := len(allResults)
+	allResults = applySearchFilters(allResults, normalized)
+	s.logger.Debug("search filters applied",
+		zap.Int("before", preFilterCount),
+		zap.Int("after", len(allResults)),
+	)
+
 	sort.Slice(allResults, func(i, j int) bool {
 		left := parseTimestamp(allResults[i].Timestamp)
 		right := parseTimestamp(allResults[j].Timestamp)
@@ -145,13 +189,14 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 		return left.After(right)
 	})
 
+	totalMatches := len(allResults)
 	if len(allResults) > pageSize {
 		allResults = allResults[:pageSize]
 	}
 	response := model.SearchResponse{
 		Results:  allResults,
 		Sources:  sourceStatuses,
-		Total:    countSourceHits(sourceStatuses),
+		Total:    totalMatches,
 		Partial:  partial,
 		CacheHit: cacheHit,
 		TookMS:   time.Since(startedAt).Milliseconds(),
@@ -165,6 +210,92 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 	)
 
 	return response, nil
+}
+
+func (s *Service) refreshTrackedHotPartitions(ctx context.Context) error {
+	metas, err := s.cache.ListTrackedLogPartitions()
+	if err != nil {
+		return err
+	}
+	if len(metas) == 0 {
+		s.logger.Debug("tracked hot log cache sync skipped: no tracked partitions")
+		return nil
+	}
+
+	now := time.Now().UTC()
+	tagDefinitions, err := s.store.ListTagDefinitions(ctx)
+	if err != nil {
+		return err
+	}
+
+	datasourceCache := make(map[string]model.Datasource)
+	snapshotCache := make(map[string]model.DatasourceTagSnapshot)
+	refreshed := 0
+	for _, meta := range metas {
+		day, parseErr := time.Parse("2006-01-02", meta.Date)
+		if parseErr != nil {
+			continue
+		}
+		if !s.cache.LogPartitionNeedsRefresh(meta, day, now) {
+			continue
+		}
+
+		datasource, ok := datasourceCache[meta.DatasourceID]
+		if !ok {
+			loaded, loadErr := s.store.GetDatasource(ctx, meta.DatasourceID)
+			if loadErr != nil {
+				s.logger.Warn("load datasource for tracked hot sync failed",
+					zap.Error(loadErr),
+					zap.String("datasource_id", meta.DatasourceID),
+					zap.String("service", displayServiceName(meta.Service)),
+					zap.String("date", meta.Date),
+				)
+				continue
+			}
+			if !loaded.Enabled {
+				continue
+			}
+			datasource = loaded
+			datasourceCache[meta.DatasourceID] = loaded
+		}
+
+		partition, hit, loadErr := s.cache.LoadLogPartition(day, meta.Service, datasource)
+		if loadErr != nil || !hit {
+			if loadErr != nil {
+				s.logger.Warn("load tracked hot partition failed",
+					zap.Error(loadErr),
+					zap.String("datasource", datasource.Name),
+					zap.String("service", displayServiceName(meta.Service)),
+					zap.String("date", meta.Date),
+				)
+			}
+			continue
+		}
+
+		snapshot, ok := snapshotCache[datasource.ID]
+		if !ok {
+			loaded, _ := s.store.GetSnapshot(ctx, datasource.ID)
+			snapshot = loaded
+			snapshotCache[datasource.ID] = loaded
+		}
+
+		if _, _, refreshErr := s.refreshPartitionIncremental(ctx, datasource, snapshot, tagDefinitions, meta.Service, day, now, partition); refreshErr != nil {
+			s.logger.Warn("tracked hot partition incremental refresh failed",
+				zap.Error(refreshErr),
+				zap.String("datasource", datasource.Name),
+				zap.String("service", displayServiceName(meta.Service)),
+				zap.String("date", meta.Date),
+			)
+			continue
+		}
+		refreshed++
+	}
+
+	s.logger.Debug("tracked hot log cache sync cycle completed",
+		zap.Int("tracked_partitions", len(metas)),
+		zap.Int("refreshed", refreshed),
+	)
+	return nil
 }
 
 func (s *Service) searchDatasource(
@@ -192,6 +323,7 @@ func (s *Service) searchDatasource(
 		cacheHit = cacheHit && serviceCacheHit
 		partial = partial || servicePartial
 	}
+	rows = applySearchFilters(rows, req)
 
 	return rows, model.QuerySourceStatus{
 		Datasource: datasource.Name,
@@ -490,6 +622,14 @@ func (s *Service) fetchDatasourceWindow(
 		if err != nil {
 			return nil, false, err
 		}
+		s.logger.Debug("source query chunk fetched",
+			zap.String("datasource", datasource.Name),
+			zap.Int("offset", offset),
+			zap.Int("limit", limit),
+			zap.Int("rows", len(rows)),
+			zap.Time("start", start),
+			zap.Time("end", end),
+		)
 		if len(rows) == 0 {
 			break
 		}
@@ -499,7 +639,7 @@ func (s *Service) fetchDatasourceWindow(
 		for _, row := range rows {
 			batch = append(batch, normalizeRow(datasource, snapshot, tagDefinitions, row))
 		}
-		normalizedRows = mergeContinuationRows(normalizedRows, batch)
+		normalizedRows = append(normalizedRows, batch...)
 		offset += len(rows)
 
 		if len(rows) < limit {
@@ -560,6 +700,11 @@ func normalizeRequest(req model.SearchRequest) (model.SearchRequest, time.Time, 
 	normalized.End = end.Format(time.RFC3339)
 	normalized.Page = page
 	normalized.PageSize = pageSize
+	if strings.ToLower(strings.TrimSpace(normalized.KeywordMode)) == "or" {
+		normalized.KeywordMode = "or"
+	} else {
+		normalized.KeywordMode = "and"
+	}
 	normalized.DatasourceIDs = uniqueStrings(req.DatasourceIDs)
 	normalized.ServiceNames = uniqueStrings(req.ServiceNames)
 	if normalized.Tags == nil {
@@ -916,6 +1061,111 @@ func dedupeRows(rows []model.SearchResult) []model.SearchResult {
 		filtered = append(filtered, row)
 	}
 	return filtered
+}
+
+func applySearchFilters(rows []model.SearchResult, req model.SearchRequest) []model.SearchResult {
+	if len(rows) == 0 {
+		return rows
+	}
+	keywords := splitKeywords(req.Keyword)
+	filtered := make([]model.SearchResult, 0, len(rows))
+	for _, row := range rows {
+		if !matchesKeywordFilter(row, keywords, req.KeywordMode) {
+			continue
+		}
+		if !matchesTagFilters(row, req.Tags) {
+			continue
+		}
+		filtered = append(filtered, row)
+	}
+	return filtered
+}
+
+func splitKeywords(raw string) []string {
+	return uniqueStrings(strings.FieldsFunc(raw, func(r rune) bool {
+		return r == '\n' || r == '\r' || r == ',' || r == ';'
+	}))
+}
+
+func matchesKeywordFilter(row model.SearchResult, keywords []string, mode string) bool {
+	if len(keywords) == 0 {
+		return true
+	}
+	haystack := searchableRowText(row)
+	if mode == "or" {
+		for _, token := range keywords {
+			if strings.Contains(haystack, strings.ToLower(strings.Trim(strings.TrimSpace(token), `"'`))) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, token := range keywords {
+		if !strings.Contains(haystack, strings.ToLower(strings.Trim(strings.TrimSpace(token), `"'`))) {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesTagFilters(row model.SearchResult, filters map[string][]string) bool {
+	if len(filters) == 0 {
+		return true
+	}
+	for field, values := range filters {
+		normalizedValues := uniqueStrings(values)
+		if len(normalizedValues) == 0 {
+			continue
+		}
+		candidates := make([]string, 0, 2)
+		if row.Labels != nil && row.Labels[field] != "" {
+			candidates = append(candidates, strings.ToLower(strings.TrimSpace(row.Labels[field])))
+		}
+		if row.Raw != nil {
+			if rawValue, ok := row.Raw[field]; ok {
+				candidates = append(candidates, strings.ToLower(strings.TrimSpace(stringify(rawValue))))
+			}
+		}
+		if len(candidates) == 0 {
+			return false
+		}
+		matched := false
+		for _, value := range normalizedValues {
+			needle := strings.ToLower(strings.TrimSpace(value))
+			for _, candidate := range candidates {
+				if candidate == needle || strings.Contains(candidate, needle) {
+					matched = true
+					break
+				}
+			}
+			if matched {
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
+func searchableRowText(row model.SearchResult) string {
+	parts := []string{
+		row.Message,
+		row.Service,
+		row.Pod,
+		row.Datasource,
+		row.Timestamp,
+	}
+	for key, value := range row.Labels {
+		parts = append(parts, key, value)
+	}
+	if len(row.Raw) > 0 {
+		if raw, err := json.Marshal(row.Raw); err == nil {
+			parts = append(parts, string(raw))
+		}
+	}
+	return strings.ToLower(strings.Join(parts, "\n"))
 }
 
 func searchResultKey(row model.SearchResult) string {
