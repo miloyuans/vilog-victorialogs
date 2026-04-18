@@ -659,29 +659,15 @@ func (s *Service) fetchSourceRangeRecursive(
 		return dedupeRows(rows), false, nil
 	}
 	if depth >= s.maxSourceSplitDepth() {
-		s.logger.Warn("source range truncated at maximum split depth",
-			zap.String("datasource", datasource.Name),
-			zap.String("service", displayServiceName(serviceName)),
-			zap.Time("start", start),
-			zap.Time("end", end),
-			zap.Int("depth", depth),
-		)
-		return dedupeRows(rows), true, nil
+		return s.fetchDenseSourceRange(ctx, datasource, snapshot, tagDefinitions, serviceName, start, end, depth, "maximum split depth")
 	}
-	if end.Sub(start) <= time.Second {
-		s.logger.Warn("source range truncated at minimum split window",
-			zap.String("datasource", datasource.Name),
-			zap.String("service", displayServiceName(serviceName)),
-			zap.Time("start", start),
-			zap.Time("end", end),
-			zap.Int("depth", depth),
-		)
-		return dedupeRows(rows), true, nil
+	if end.Sub(start) <= s.sourceMinSplitWindow() {
+		return s.fetchDenseSourceRange(ctx, datasource, snapshot, tagDefinitions, serviceName, start, end, depth, "minimum split window")
 	}
 
 	mid := start.Add(end.Sub(start) / 2)
 	if !mid.After(start) || !end.After(mid) {
-		return dedupeRows(rows), true, nil
+		return s.fetchDenseSourceRange(ctx, datasource, snapshot, tagDefinitions, serviceName, start, end, depth, "invalid split midpoint")
 	}
 	s.logger.Debug("splitting truncated source window",
 		zap.String("datasource", datasource.Name),
@@ -753,6 +739,75 @@ func (s *Service) serviceChunkConcurrency() int {
 
 func (s *Service) maxSourceSplitDepth() int {
 	return 10
+}
+
+func (s *Service) sourceMinSplitWindow() time.Duration {
+	return 250 * time.Millisecond
+}
+
+func (s *Service) denseSourceWindowLimit() int {
+	limit := s.cfg.SourceRequestLimit * 4
+	if limit < 40000 {
+		limit = 40000
+	}
+	maxWindow := s.sourceWindowLimit()
+	if maxWindow > 0 && limit > maxWindow {
+		limit = maxWindow
+	}
+	if limit <= 0 {
+		return 40000
+	}
+	return limit
+}
+
+func (s *Service) fetchDenseSourceRange(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	serviceName string,
+	start, end time.Time,
+	depth int,
+	reason string,
+) ([]model.SearchResult, bool, error) {
+	logsql := buildSourceLogsQL(datasource, snapshot, serviceName)
+	rows, truncated, err := s.fetchDatasourceWindow(
+		ctx,
+		datasource,
+		snapshot,
+		tagDefinitions,
+		logsql,
+		start,
+		end,
+		s.denseSourceWindowLimit(),
+	)
+	if err != nil {
+		return nil, true, err
+	}
+	rows = dedupeRows(rows)
+	if truncated {
+		s.logger.Warn("source range still truncated after dense window drain",
+			zap.String("datasource", datasource.Name),
+			zap.String("service", displayServiceName(serviceName)),
+			zap.Time("start", start),
+			zap.Time("end", end),
+			zap.Int("depth", depth),
+			zap.String("reason", reason),
+			zap.Int("rows", len(rows)),
+			zap.Int("limit", s.denseSourceWindowLimit()),
+		)
+		return rows, true, nil
+	}
+	s.logger.Info("dense source window drain completed",
+		zap.String("datasource", datasource.Name),
+		zap.String("service", displayServiceName(serviceName)),
+		zap.Time("start", start),
+		zap.Time("end", end),
+		zap.Int("depth", depth),
+		zap.String("reason", reason),
+		zap.Int("rows", len(rows)),
+	)
+	return rows, false, nil
 }
 
 func (s *Service) tryFetchSplitConcurrently(chunkSem chan struct{}) bool {
