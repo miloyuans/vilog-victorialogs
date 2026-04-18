@@ -33,6 +33,7 @@ type Service struct {
 	partitionSyncs          map[string]*partitionSyncTask
 	interactivePendingSyncs []string
 	maintenancePendingSyncs []string
+	interactiveUrgentSem    chan struct{}
 	servicePriorityMu       sync.Mutex
 	servicePriorityTTL      map[string]time.Time
 }
@@ -58,8 +59,9 @@ func New(store *mongostore.Store, cacheService *cache.Service, client *victorial
 		client: client,
 		cfg:    cfg,
 		logger: logger,
-		partitionSyncs:     make(map[string]*partitionSyncTask),
-		servicePriorityTTL: make(map[string]time.Time),
+		partitionSyncs:       make(map[string]*partitionSyncTask),
+		interactiveUrgentSem: make(chan struct{}, 1),
+		servicePriorityTTL:   make(map[string]time.Time),
 	}
 	svc.partitionSyncCond = sync.NewCond(&svc.partitionSyncMu)
 	svc.startPartitionWorkers(partitionSyncQueueInteractive, interactiveConcurrency)
@@ -417,15 +419,25 @@ func (s *Service) loadPartitionWindow(
 	}
 
 	if useCache {
-		s.logger.Info("queueing log partition build from source",
-			zap.String("datasource", datasource.Name),
-			zap.String("service", displayServiceName(serviceName)),
-			zap.String("day", cacheDay(day).Format("2006-01-02")),
-		)
-		s.startPartitionSync(day, datasource, serviceName, "query-build", partitionSyncQueueInteractive, func(syncCtx context.Context) error {
+		task, created := s.startPartitionSync(day, datasource, serviceName, "query-build", partitionSyncQueueInteractive, func(syncCtx context.Context) error {
 			_, _, buildErr := s.buildPartitionFromSource(syncCtx, datasource, snapshot, tagDefinitions, serviceName, day, time.Now().UTC())
 			return buildErr
 		})
+		if created {
+			s.logger.Info("queueing log partition build from source",
+				zap.String("datasource", datasource.Name),
+				zap.String("service", displayServiceName(serviceName)),
+				zap.String("day", cacheDay(day).Format("2006-01-02")),
+			)
+		} else if task != nil {
+			s.logger.Info("log partition build already pending",
+				zap.String("datasource", datasource.Name),
+				zap.String("service", displayServiceName(serviceName)),
+				zap.String("day", cacheDay(day).Format("2006-01-02")),
+				zap.String("queue", string(task.queue)),
+				zap.Bool("started", task.started),
+			)
+		}
 		return cache.LocalLogPartition{
 			Meta: s.cache.PrepareLogPartitionMeta(day, serviceName, datasource, 0, now, true),
 			Rows: []model.SearchResult{},
@@ -564,6 +576,16 @@ func (s *Service) fetchSourceRangeRecursive(
 	if !truncated {
 		return dedupeRows(rows), false, nil
 	}
+	if depth >= s.maxSourceSplitDepth() {
+		s.logger.Warn("source range truncated at maximum split depth",
+			zap.String("datasource", datasource.Name),
+			zap.String("service", displayServiceName(serviceName)),
+			zap.Time("start", start),
+			zap.Time("end", end),
+			zap.Int("depth", depth),
+		)
+		return dedupeRows(rows), true, nil
+	}
 	if end.Sub(start) <= time.Second {
 		s.logger.Warn("source range truncated at minimum split window",
 			zap.String("datasource", datasource.Name),
@@ -645,6 +667,10 @@ func (s *Service) serviceChunkConcurrency() int {
 		return s.cfg.ServiceChunkConcurrency
 	}
 	return 2
+}
+
+func (s *Service) maxSourceSplitDepth() int {
+	return 10
 }
 
 func (s *Service) tryFetchSplitConcurrently(chunkSem chan struct{}) bool {

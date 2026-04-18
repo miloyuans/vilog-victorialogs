@@ -49,10 +49,13 @@ func (s *Service) startPartitionSync(
 	s.partitionSyncMu.Lock()
 	if existing, ok := s.partitionSyncs[key]; ok {
 		upgraded := false
-		if queue == partitionSyncQueueInteractive && existing.queue != partitionSyncQueueInteractive && !existing.started {
-			existing.queue = partitionSyncQueueInteractive
-			s.interactivePendingSyncs = append(s.interactivePendingSyncs, key)
-			upgraded = true
+		if queue == partitionSyncQueueInteractive && !existing.started {
+			if existing.queue != partitionSyncQueueInteractive {
+				existing.queue = partitionSyncQueueInteractive
+				upgraded = true
+			}
+			s.prependInteractivePendingLocked(key)
+			s.tryStartInteractiveUrgentLocked(existing)
 			s.partitionSyncCond.Broadcast()
 		}
 		s.partitionSyncMu.Unlock()
@@ -80,6 +83,9 @@ func (s *Service) startPartitionSync(
 	}
 	s.partitionSyncs[key] = task
 	s.enqueuePartitionSyncLocked(task)
+	if queue == partitionSyncQueueInteractive && strings.HasPrefix(reason, "query-") {
+		s.tryStartInteractiveUrgentLocked(task)
+	}
 	s.partitionSyncCond.Broadcast()
 	s.partitionSyncMu.Unlock()
 
@@ -113,26 +119,7 @@ func (s *Service) runPartitionWorker(queue partitionSyncQueue, workerID int) {
 		if task == nil {
 			continue
 		}
-		s.logger.Info("partition sync started",
-			zap.String("reason", task.reason),
-			zap.String("queue", string(task.queue)),
-			zap.Int("worker_id", workerID),
-			zap.String("datasource", task.datasource.Name),
-			zap.String("service", displayServiceName(task.serviceName)),
-			zap.String("day", task.day.Format("2006-01-02")),
-		)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-		err := func() (runErr error) {
-			defer func() {
-				if recovered := recover(); recovered != nil {
-					runErr = fmt.Errorf("partition sync panic: %v", recovered)
-				}
-			}()
-			return task.runner(ctx)
-		}()
-		cancel()
-		s.completePartitionSyncTask(task, err)
+		s.executePartitionSyncTask(task, workerID, false, nil)
 	}
 }
 
@@ -173,10 +160,75 @@ func (s *Service) enqueuePartitionSyncLocked(task *partitionSyncTask) {
 		return
 	}
 	if task.queue == partitionSyncQueueInteractive {
-		s.interactivePendingSyncs = append(s.interactivePendingSyncs, task.key)
+		s.prependInteractivePendingLocked(task.key)
 		return
 	}
 	s.maintenancePendingSyncs = append(s.maintenancePendingSyncs, task.key)
+}
+
+func (s *Service) prependInteractivePendingLocked(key string) {
+	if key == "" {
+		return
+	}
+	s.interactivePendingSyncs = append([]string{key}, s.interactivePendingSyncs...)
+}
+
+func (s *Service) tryStartInteractiveUrgentLocked(task *partitionSyncTask) bool {
+	if task == nil || task.started || task.queue != partitionSyncQueueInteractive {
+		return false
+	}
+	if s.interactiveUrgentSem == nil {
+		return false
+	}
+	select {
+	case s.interactiveUrgentSem <- struct{}{}:
+		task.started = true
+		task.startedAt = time.Now().UTC()
+		go s.executePartitionSyncTask(task, -1, true, func() {
+			<-s.interactiveUrgentSem
+		})
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) executePartitionSyncTask(task *partitionSyncTask, workerID int, urgent bool, release func()) {
+	if task == nil {
+		if release != nil {
+			release()
+		}
+		return
+	}
+	if release != nil {
+		defer release()
+	}
+
+	fields := []zap.Field{
+		zap.String("reason", task.reason),
+		zap.String("queue", string(task.queue)),
+		zap.String("datasource", task.datasource.Name),
+		zap.String("service", displayServiceName(task.serviceName)),
+		zap.String("day", task.day.Format("2006-01-02")),
+	}
+	if urgent {
+		fields = append(fields, zap.Bool("urgent", true))
+	} else {
+		fields = append(fields, zap.Int("worker_id", workerID))
+	}
+	s.logger.Info("partition sync started", fields...)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	err := func() (runErr error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				runErr = fmt.Errorf("partition sync panic: %v", recovered)
+			}
+		}()
+		return task.runner(ctx)
+	}()
+	cancel()
+	s.completePartitionSyncTask(task, err)
 }
 
 func (s *Service) completePartitionSyncTask(task *partitionSyncTask, err error) {
