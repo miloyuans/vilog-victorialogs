@@ -53,6 +53,10 @@ cache:
   local_log_refresh_interval: 10s
   local_log_daily_check_at: "00:05"
   local_log_check_concurrency: 4
+  interactive_sync_concurrency: 2
+  maintenance_sync_concurrency: 4
+  service_chunk_concurrency: 2
+  interactive_service_ttl: 10m
   local_log_history_ttl: 1h
   source_chunk_size: 1000
   source_request_limit: 10000

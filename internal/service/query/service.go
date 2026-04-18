@@ -28,28 +28,43 @@ type Service struct {
 	cfg    config.CacheConfig
 	logger *zap.Logger
 
-	partitionSyncMu   sync.Mutex
-	partitionSyncs    map[string]*partitionSyncTask
-	partitionSyncSem  chan struct{}
+	partitionSyncMu         sync.Mutex
+	partitionSyncCond       *sync.Cond
+	partitionSyncs          map[string]*partitionSyncTask
+	interactivePendingSyncs []string
+	maintenancePendingSyncs []string
+	servicePriorityMu       sync.Mutex
+	servicePriorityTTL      map[string]time.Time
 }
 
 func New(store *mongostore.Store, cacheService *cache.Service, client *victorialogs.Client, cfg config.CacheConfig, logger *zap.Logger) *Service {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	concurrency := cfg.LocalLogCheckConcurrency
-	if concurrency <= 0 {
-		concurrency = 4
+	maintenanceConcurrency := cfg.MaintenanceSyncConcurrency
+	if maintenanceConcurrency <= 0 {
+		maintenanceConcurrency = cfg.LocalLogCheckConcurrency
 	}
-	return &Service{
+	if maintenanceConcurrency <= 0 {
+		maintenanceConcurrency = 4
+	}
+	interactiveConcurrency := cfg.InteractiveSyncConcurrency
+	if interactiveConcurrency <= 0 {
+		interactiveConcurrency = 2
+	}
+	svc := &Service{
 		store:  store,
 		cache:  cacheService,
 		client: client,
 		cfg:    cfg,
 		logger: logger,
-		partitionSyncs:   make(map[string]*partitionSyncTask),
-		partitionSyncSem: make(chan struct{}, concurrency),
+		partitionSyncs:     make(map[string]*partitionSyncTask),
+		servicePriorityTTL: make(map[string]time.Time),
 	}
+	svc.partitionSyncCond = sync.NewCond(&svc.partitionSyncMu)
+	svc.startPartitionWorkers(partitionSyncQueueInteractive, interactiveConcurrency)
+	svc.startPartitionWorkers(partitionSyncQueueMaintenance, maintenanceConcurrency)
+	return svc
 }
 
 func (s *Service) StartHotSync(ctx context.Context) {
@@ -274,7 +289,8 @@ func (s *Service) refreshTrackedHotPartitions(ctx context.Context) error {
 			snapshotCache[datasource.ID] = loaded
 		}
 
-		task, _ := s.startPartitionSync(day, datasource, meta.Service, "tracked-refresh", func(syncCtx context.Context) error {
+		queue := s.preferredSyncQueue(datasource, meta.Service, now, partitionSyncQueueMaintenance)
+		task, _ := s.startPartitionSync(day, datasource, meta.Service, "tracked-refresh", queue, func(syncCtx context.Context) error {
 			_, _, refreshErr := s.refreshPartitionIncremental(syncCtx, datasource, snapshot, tagDefinitions, meta.Service, day, time.Now().UTC(), partition)
 			return refreshErr
 		})
@@ -308,6 +324,9 @@ func (s *Service) searchDatasource(
 	services, err := s.resolveServiceTargets(ctx, datasource.ID, req.ServiceNames)
 	if err != nil {
 		return nil, model.QuerySourceStatus{}, false, true, err
+	}
+	for _, serviceName := range services {
+		s.markServiceInteractive(datasource, serviceName, now)
 	}
 
 	rows := make([]model.SearchResult, 0)
@@ -387,7 +406,7 @@ func (s *Service) loadPartitionWindow(
 					zap.String("day", cacheDay(day).Format("2006-01-02")),
 					zap.Time("last_sync_at", partition.Meta.LastSyncAt),
 				)
-				s.startPartitionSync(day, datasource, serviceName, "query-refresh", func(syncCtx context.Context) error {
+				s.startPartitionSync(day, datasource, serviceName, "query-refresh", partitionSyncQueueInteractive, func(syncCtx context.Context) error {
 					_, _, refreshErr := s.refreshPartitionIncremental(syncCtx, datasource, snapshot, tagDefinitions, serviceName, day, time.Now().UTC(), partition)
 					return refreshErr
 				})
@@ -403,7 +422,7 @@ func (s *Service) loadPartitionWindow(
 			zap.String("service", displayServiceName(serviceName)),
 			zap.String("day", cacheDay(day).Format("2006-01-02")),
 		)
-		s.startPartitionSync(day, datasource, serviceName, "query-build", func(syncCtx context.Context) error {
+		s.startPartitionSync(day, datasource, serviceName, "query-build", partitionSyncQueueInteractive, func(syncCtx context.Context) error {
 			_, _, buildErr := s.buildPartitionFromSource(syncCtx, datasource, snapshot, tagDefinitions, serviceName, day, time.Now().UTC())
 			return buildErr
 		})
@@ -506,7 +525,12 @@ func (s *Service) fetchCompleteSourceRange(
 	serviceName string,
 	start, end time.Time,
 ) ([]model.SearchResult, bool, error) {
-	return s.fetchSourceRangeRecursive(ctx, datasource, snapshot, tagDefinitions, serviceName, start, end, 0)
+	concurrency := s.serviceChunkConcurrency()
+	var chunkSem chan struct{}
+	if concurrency > 1 {
+		chunkSem = make(chan struct{}, concurrency-1)
+	}
+	return s.fetchSourceRangeRecursive(ctx, datasource, snapshot, tagDefinitions, serviceName, start, end, 0, chunkSem)
 }
 
 func (s *Service) fetchSourceRangeRecursive(
@@ -517,6 +541,7 @@ func (s *Service) fetchSourceRangeRecursive(
 	serviceName string,
 	start, end time.Time,
 	depth int,
+	chunkSem chan struct{},
 ) ([]model.SearchResult, bool, error) {
 	if !end.After(start) {
 		return []model.SearchResult{}, false, nil
@@ -562,14 +587,38 @@ func (s *Service) fetchSourceRangeRecursive(
 		zap.Time("end", end),
 		zap.Int("depth", depth),
 	)
-	leftRows, leftPartial, err := s.fetchSourceRangeRecursive(ctx, datasource, snapshot, tagDefinitions, serviceName, start, mid, depth+1)
+	if !s.tryFetchSplitConcurrently(chunkSem) {
+		leftRows, leftPartial, err := s.fetchSourceRangeRecursive(ctx, datasource, snapshot, tagDefinitions, serviceName, start, mid, depth+1, chunkSem)
+		if err != nil {
+			return nil, false, err
+		}
+		rightRows, rightPartial, err := s.fetchSourceRangeRecursive(ctx, datasource, snapshot, tagDefinitions, serviceName, mid, end, depth+1, chunkSem)
+		if err != nil {
+			return nil, false, err
+		}
+		return dedupeRows(append(leftRows, rightRows...)), leftPartial || rightPartial, nil
+	}
+
+	type splitResult struct {
+		rows    []model.SearchResult
+		partial bool
+		err     error
+	}
+	leftCh := make(chan splitResult, 1)
+	go func() {
+		defer s.releaseFetchSplit(chunkSem)
+		rows, partial, err := s.fetchSourceRangeRecursive(ctx, datasource, snapshot, tagDefinitions, serviceName, start, mid, depth+1, chunkSem)
+		leftCh <- splitResult{rows: rows, partial: partial, err: err}
+	}()
+	rightRows, rightPartial, err := s.fetchSourceRangeRecursive(ctx, datasource, snapshot, tagDefinitions, serviceName, mid, end, depth+1, chunkSem)
+	leftResult := <-leftCh
+	if leftResult.err != nil {
+		return nil, false, leftResult.err
+	}
 	if err != nil {
 		return nil, false, err
 	}
-	rightRows, rightPartial, err := s.fetchSourceRangeRecursive(ctx, datasource, snapshot, tagDefinitions, serviceName, mid, end, depth+1)
-	if err != nil {
-		return nil, false, err
-	}
+	leftRows, leftPartial := leftResult.rows, leftResult.partial
 	return dedupeRows(append(leftRows, rightRows...)), leftPartial || rightPartial, nil
 }
 
@@ -589,6 +638,35 @@ func (s *Service) resolveServiceTargets(ctx context.Context, datasourceID string
 		names = append(names, entry.ServiceName)
 	}
 	return uniqueStrings(names), nil
+}
+
+func (s *Service) serviceChunkConcurrency() int {
+	if s.cfg.ServiceChunkConcurrency > 0 {
+		return s.cfg.ServiceChunkConcurrency
+	}
+	return 2
+}
+
+func (s *Service) tryFetchSplitConcurrently(chunkSem chan struct{}) bool {
+	if chunkSem == nil {
+		return false
+	}
+	select {
+	case chunkSem <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) releaseFetchSplit(chunkSem chan struct{}) {
+	if chunkSem == nil {
+		return
+	}
+	select {
+	case <-chunkSem:
+	default:
+	}
 }
 
 func (s *Service) fetchDatasourceWindow(

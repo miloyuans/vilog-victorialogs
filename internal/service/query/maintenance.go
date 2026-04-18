@@ -24,6 +24,10 @@ func (s *Service) StartMaintenance(ctx context.Context) {
 		zap.Int("hot_days", s.cfg.LocalLogHotDays),
 		zap.Duration("refresh_interval", s.cfg.LocalLogRefreshInterval),
 		zap.String("daily_check_at", strings.TrimSpace(s.cfg.LocalLogDailyCheckAt)),
+		zap.Int("interactive_sync_concurrency", s.cfg.InteractiveSyncConcurrency),
+		zap.Int("maintenance_sync_concurrency", s.cfg.MaintenanceSyncConcurrency),
+		zap.Int("service_chunk_concurrency", s.cfg.ServiceChunkConcurrency),
+		zap.Duration("interactive_service_ttl", s.cfg.InteractiveServiceTTL),
 	)
 
 	go s.runStartupCacheCheck(ctx)
@@ -106,7 +110,10 @@ func (s *Service) ensureHotCache(ctx context.Context, reason string) error {
 			zap.String("reason", reason),
 		)
 	}
-	concurrency := s.cfg.LocalLogCheckConcurrency
+	concurrency := s.cfg.MaintenanceSyncConcurrency
+	if concurrency <= 0 {
+		concurrency = s.cfg.LocalLogCheckConcurrency
+	}
 	if concurrency <= 0 {
 		concurrency = 4
 	}
@@ -221,7 +228,8 @@ func (s *Service) ensureHotPartition(
 				zap.String("service", displayServiceName(serviceName)),
 				zap.String("day", cacheDay(day).Format("2006-01-02")),
 			)
-			task, _ := s.startPartitionSync(day, datasource, serviceName, "hot-refresh-"+reason, func(syncCtx context.Context) error {
+			queue := s.preferredSyncQueue(datasource, serviceName, now, partitionSyncQueueMaintenance)
+			task, _ := s.startPartitionSync(day, datasource, serviceName, "hot-refresh-"+reason, queue, func(syncCtx context.Context) error {
 				_, _, refreshErr := s.refreshPartitionIncremental(syncCtx, datasource, snapshot, tagDefinitions, serviceName, day, time.Now().UTC(), partition)
 				return refreshErr
 			})
@@ -243,7 +251,8 @@ func (s *Service) ensureHotPartition(
 		zap.String("service", displayServiceName(serviceName)),
 		zap.String("day", cacheDay(day).Format("2006-01-02")),
 	)
-	task, _ := s.startPartitionSync(day, datasource, serviceName, "hot-build-"+reason, func(syncCtx context.Context) error {
+	queue := s.preferredSyncQueue(datasource, serviceName, now, partitionSyncQueueMaintenance)
+	task, _ := s.startPartitionSync(day, datasource, serviceName, "hot-build-"+reason, queue, func(syncCtx context.Context) error {
 		_, _, buildErr := s.buildPartitionFromSource(syncCtx, datasource, snapshot, tagDefinitions, serviceName, day, time.Now().UTC())
 		return buildErr
 	})

@@ -65,6 +65,10 @@ type CacheConfig struct {
 	LocalLogRefreshInterval time.Duration `yaml:"local_log_refresh_interval"`
 	LocalLogDailyCheckAt    string        `yaml:"local_log_daily_check_at"`
 	LocalLogCheckConcurrency int          `yaml:"local_log_check_concurrency"`
+	InteractiveSyncConcurrency int        `yaml:"interactive_sync_concurrency"`
+	MaintenanceSyncConcurrency int        `yaml:"maintenance_sync_concurrency"`
+	ServiceChunkConcurrency   int         `yaml:"service_chunk_concurrency"`
+	InteractiveServiceTTL     time.Duration `yaml:"interactive_service_ttl"`
 	LocalLogHistoryTTL      time.Duration `yaml:"local_log_history_ttl"`
 	SourceChunkSize         int           `yaml:"source_chunk_size"`
 	SourceRequestLimit      int           `yaml:"source_request_limit"`
@@ -153,6 +157,10 @@ func Default() Config {
 			LocalLogRefreshInterval: 10 * time.Second,
 			LocalLogDailyCheckAt:    "00:05",
 			LocalLogCheckConcurrency: 4,
+			InteractiveSyncConcurrency: 2,
+			MaintenanceSyncConcurrency: 4,
+			ServiceChunkConcurrency:   2,
+			InteractiveServiceTTL:     10 * time.Minute,
 			LocalLogHistoryTTL:      1 * time.Hour,
 			SourceChunkSize:         1000,
 			SourceRequestLimit:      10000,
@@ -250,7 +258,7 @@ func resolvePath(path string) (string, error) {
 	return "", fmt.Errorf("config file not found, checked: %s", strings.Join(candidates, ", "))
 }
 
-func (c Config) Validate() error {
+func (c *Config) Validate() error {
 	if strings.TrimSpace(c.App.Name) == "" {
 		return fmt.Errorf("app.name is required")
 	}
@@ -285,6 +293,18 @@ func (c Config) Validate() error {
 	}
 	if c.Cache.LocalLogCheckConcurrency <= 0 {
 		return fmt.Errorf("cache.local_log_check_concurrency must be positive")
+	}
+	if c.Cache.InteractiveSyncConcurrency <= 0 {
+		c.Cache.InteractiveSyncConcurrency = maxInt(1, minInt(2, c.Cache.LocalLogCheckConcurrency))
+	}
+	if c.Cache.MaintenanceSyncConcurrency <= 0 {
+		c.Cache.MaintenanceSyncConcurrency = c.Cache.LocalLogCheckConcurrency
+	}
+	if c.Cache.ServiceChunkConcurrency <= 0 {
+		c.Cache.ServiceChunkConcurrency = 2
+	}
+	if c.Cache.InteractiveServiceTTL <= 0 {
+		c.Cache.InteractiveServiceTTL = 10 * time.Minute
 	}
 	if c.Cache.LocalLogHistoryTTL <= 0 {
 		return fmt.Errorf("cache.local_log_history_ttl must be positive")
@@ -382,6 +402,18 @@ func applyEnvOverrides(cfg *Config) error {
 	}
 	setString("VILOG_CACHE_LOCAL_LOG_DAILY_CHECK_AT", &cfg.Cache.LocalLogDailyCheckAt)
 	if err := setInt("VILOG_CACHE_LOCAL_LOG_CHECK_CONCURRENCY", &cfg.Cache.LocalLogCheckConcurrency); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_CACHE_INTERACTIVE_SYNC_CONCURRENCY", &cfg.Cache.InteractiveSyncConcurrency); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_CACHE_MAINTENANCE_SYNC_CONCURRENCY", &cfg.Cache.MaintenanceSyncConcurrency); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_CACHE_SERVICE_CHUNK_CONCURRENCY", &cfg.Cache.ServiceChunkConcurrency); err != nil {
+		return err
+	}
+	if err := setDuration("VILOG_CACHE_INTERACTIVE_SERVICE_TTL", &cfg.Cache.InteractiveServiceTTL); err != nil {
 		return err
 	}
 	if err := setDuration("VILOG_CACHE_LOCAL_LOG_HISTORY_TTL", &cfg.Cache.LocalLogHistoryTTL); err != nil {
@@ -541,4 +573,18 @@ func validateCIDROrIP(value string) error {
 		return nil
 	}
 	return fmt.Errorf("invalid IP or CIDR %q", value)
+}
+
+func maxInt(left, right int) int {
+	if left > right {
+		return left
+	}
+	return right
+}
+
+func minInt(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
 }
