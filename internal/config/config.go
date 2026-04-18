@@ -72,6 +72,12 @@ type CacheConfig struct {
 	LocalLogHistoryTTL      time.Duration `yaml:"local_log_history_ttl"`
 	SourceChunkSize         int           `yaml:"source_chunk_size"`
 	SourceRequestLimit      int           `yaml:"source_request_limit"`
+	DenseWindowLimit        int           `yaml:"dense_window_limit"`
+	MaxPartitionRows        int           `yaml:"max_partition_rows"`
+	MaxRowsBeforePartial    int           `yaml:"max_rows_before_partial"`
+	MaxDedupeRows           int           `yaml:"max_dedupe_rows"`
+	MaxSortRows             int           `yaml:"max_sort_rows"`
+	MaxPendingPartitionSyncs int          `yaml:"max_pending_partition_syncs"`
 	MaxQueryWindow          int           `yaml:"max_query_window"`
 }
 
@@ -154,16 +160,22 @@ func Default() Config {
 			LocalQueryRetention:     24 * time.Hour,
 			LocalLogDir:             "./data/log-cache",
 			LocalLogHotDays:         2,
-			LocalLogRefreshInterval: 10 * time.Second,
+			LocalLogRefreshInterval: 60 * time.Second,
 			LocalLogDailyCheckAt:    "00:05",
-			LocalLogCheckConcurrency: 4,
-			InteractiveSyncConcurrency: 2,
-			MaintenanceSyncConcurrency: 4,
-			ServiceChunkConcurrency:   2,
+			LocalLogCheckConcurrency: 1,
+			InteractiveSyncConcurrency: 1,
+			MaintenanceSyncConcurrency: 1,
+			ServiceChunkConcurrency:   1,
 			InteractiveServiceTTL:     10 * time.Minute,
 			LocalLogHistoryTTL:      1 * time.Hour,
 			SourceChunkSize:         1000,
-			SourceRequestLimit:      10000,
+			SourceRequestLimit:      2000,
+			DenseWindowLimit:        5000,
+			MaxPartitionRows:        10000,
+			MaxRowsBeforePartial:    8000,
+			MaxDedupeRows:           12000,
+			MaxSortRows:             12000,
+			MaxPendingPartitionSyncs: 256,
 			MaxQueryWindow:          100000,
 		},
 		VictoriaLogs: VictoriaLogsConfig{
@@ -283,8 +295,8 @@ func (c *Config) Validate() error {
 	if c.Cache.LocalLogHotDays <= 0 {
 		return fmt.Errorf("cache.local_log_hot_days must be positive")
 	}
-	if c.Cache.LocalLogRefreshInterval <= 0 {
-		return fmt.Errorf("cache.local_log_refresh_interval must be positive")
+	if c.Cache.LocalLogRefreshInterval < 0 {
+		return fmt.Errorf("cache.local_log_refresh_interval must be zero or positive")
 	}
 	if strings.TrimSpace(c.Cache.LocalLogDailyCheckAt) != "" {
 		if _, err := time.Parse("15:04", strings.TrimSpace(c.Cache.LocalLogDailyCheckAt)); err != nil {
@@ -292,16 +304,16 @@ func (c *Config) Validate() error {
 		}
 	}
 	if c.Cache.LocalLogCheckConcurrency <= 0 {
-		return fmt.Errorf("cache.local_log_check_concurrency must be positive")
+		c.Cache.LocalLogCheckConcurrency = 1
 	}
 	if c.Cache.InteractiveSyncConcurrency <= 0 {
-		c.Cache.InteractiveSyncConcurrency = maxInt(1, minInt(2, c.Cache.LocalLogCheckConcurrency))
+		c.Cache.InteractiveSyncConcurrency = 1
 	}
 	if c.Cache.MaintenanceSyncConcurrency <= 0 {
-		c.Cache.MaintenanceSyncConcurrency = c.Cache.LocalLogCheckConcurrency
+		c.Cache.MaintenanceSyncConcurrency = 1
 	}
 	if c.Cache.ServiceChunkConcurrency <= 0 {
-		c.Cache.ServiceChunkConcurrency = 2
+		c.Cache.ServiceChunkConcurrency = 1
 	}
 	if c.Cache.InteractiveServiceTTL <= 0 {
 		c.Cache.InteractiveServiceTTL = 10 * time.Minute
@@ -309,8 +321,47 @@ func (c *Config) Validate() error {
 	if c.Cache.LocalLogHistoryTTL <= 0 {
 		return fmt.Errorf("cache.local_log_history_ttl must be positive")
 	}
-	if c.Cache.SourceChunkSize <= 0 || c.Cache.SourceRequestLimit <= 0 || c.Cache.MaxQueryWindow <= 0 {
-		return fmt.Errorf("cache source limits must be positive")
+	if c.Cache.SourceChunkSize <= 0 {
+		c.Cache.SourceChunkSize = 1000
+	}
+	if c.Cache.SourceRequestLimit <= 0 {
+		c.Cache.SourceRequestLimit = 2000
+	}
+	if c.Cache.DenseWindowLimit <= 0 {
+		c.Cache.DenseWindowLimit = 5000
+	}
+	if c.Cache.MaxPartitionRows <= 0 {
+		c.Cache.MaxPartitionRows = 10000
+	}
+	if c.Cache.MaxRowsBeforePartial <= 0 {
+		c.Cache.MaxRowsBeforePartial = minInt(c.Cache.MaxPartitionRows, 8000)
+	}
+	if c.Cache.MaxDedupeRows <= 0 {
+		c.Cache.MaxDedupeRows = maxInt(c.Cache.MaxPartitionRows, 12000)
+	}
+	if c.Cache.MaxSortRows <= 0 {
+		c.Cache.MaxSortRows = maxInt(c.Cache.MaxRowsBeforePartial, 12000)
+	}
+	if c.Cache.MaxPendingPartitionSyncs <= 0 {
+		c.Cache.MaxPendingPartitionSyncs = 256
+	}
+	if c.Cache.MaxQueryWindow <= 0 {
+		c.Cache.MaxQueryWindow = 100000
+	}
+	if c.Cache.MaxRowsBeforePartial > c.Cache.MaxPartitionRows {
+		c.Cache.MaxRowsBeforePartial = c.Cache.MaxPartitionRows
+	}
+	if c.Cache.DenseWindowLimit > c.Cache.MaxPartitionRows {
+		c.Cache.DenseWindowLimit = c.Cache.MaxPartitionRows
+	}
+	if c.Cache.SourceRequestLimit > c.Cache.MaxPartitionRows {
+		c.Cache.SourceRequestLimit = c.Cache.MaxPartitionRows
+	}
+	if c.Cache.MaxDedupeRows < c.Cache.MaxPartitionRows {
+		c.Cache.MaxDedupeRows = c.Cache.MaxPartitionRows
+	}
+	if c.Cache.MaxSortRows < c.Cache.MaxRowsBeforePartial {
+		c.Cache.MaxSortRows = c.Cache.MaxRowsBeforePartial
 	}
 	if c.VictoriaLogs.RequestRetries < 0 || c.VictoriaLogs.DiscoveryLimit <= 0 || c.VictoriaLogs.TagValueLimit <= 0 {
 		return fmt.Errorf("victorialogs settings must be positive")
@@ -423,6 +474,24 @@ func applyEnvOverrides(cfg *Config) error {
 		return err
 	}
 	if err := setInt("VILOG_CACHE_SOURCE_REQUEST_LIMIT", &cfg.Cache.SourceRequestLimit); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_CACHE_DENSE_WINDOW_LIMIT", &cfg.Cache.DenseWindowLimit); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_CACHE_MAX_PARTITION_ROWS", &cfg.Cache.MaxPartitionRows); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_CACHE_MAX_ROWS_BEFORE_PARTIAL", &cfg.Cache.MaxRowsBeforePartial); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_CACHE_MAX_DEDUPE_ROWS", &cfg.Cache.MaxDedupeRows); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_CACHE_MAX_SORT_ROWS", &cfg.Cache.MaxSortRows); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_CACHE_MAX_PENDING_PARTITION_SYNCS", &cfg.Cache.MaxPendingPartitionSyncs); err != nil {
 		return err
 	}
 	if err := setInt("VILOG_CACHE_MAX_QUERY_WINDOW", &cfg.Cache.MaxQueryWindow); err != nil {

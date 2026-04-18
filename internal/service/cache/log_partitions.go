@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"bufio"
 	"compress/gzip"
 	"encoding/json"
 	"errors"
@@ -16,9 +17,11 @@ import (
 )
 
 const (
-	logPartitionRowsFile = "rows.json"
-	logPartitionMetaFile = "meta.json"
-	logPartitionTextFile = "logs.txt.gz"
+	logPartitionRowsFile      = "rows.json"
+	logPartitionMetaFile      = "meta.json"
+	logPartitionTextFile      = "logs.txt.gz"
+	logPartitionCompleteFile  = "complete.marker"
+	logPartitionFormatVersion = 2
 )
 
 type LocalLogPartition struct {
@@ -27,6 +30,7 @@ type LocalLogPartition struct {
 }
 
 type LocalLogPartitionMeta struct {
+	FormatVersion  int       `json:"format_version"`
 	Date           string    `json:"date"`
 	Service        string    `json:"service"`
 	DatasourceID   string    `json:"datasource_id"`
@@ -39,6 +43,20 @@ type LocalLogPartitionMeta struct {
 	Building       bool      `json:"building"`
 }
 
+type logPartitionCompleteMarker struct {
+	FormatVersion int       `json:"format_version"`
+	CompletedAt   time.Time `json:"completed_at"`
+}
+
+type storedSearchResult struct {
+	Timestamp  string            `json:"timestamp"`
+	Message    string            `json:"message"`
+	Service    string            `json:"service"`
+	Pod        string            `json:"pod"`
+	Datasource string            `json:"datasource"`
+	Labels     map[string]string `json:"labels,omitempty"`
+}
+
 func (s *Service) LoadLogPartition(day time.Time, service string, datasource model.Datasource) (LocalLogPartition, bool, error) {
 	if strings.TrimSpace(s.cfg.LocalLogDir) == "" {
 		return LocalLogPartition{}, false, nil
@@ -46,15 +64,35 @@ func (s *Service) LoadLogPartition(day time.Time, service string, datasource mod
 	s.maybeCleanupLocalLogPartitions()
 
 	dir := s.logPartitionDir(day, service, datasource)
-	metaPath := filepath.Join(dir, logPartitionMetaFile)
-	rowsPath := filepath.Join(dir, logPartitionRowsFile)
-
-	meta, err := s.readLogPartitionMeta(metaPath)
-	if err != nil {
+	if _, err := os.Stat(dir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return LocalLogPartition{}, false, nil
 		}
 		return LocalLogPartition{}, false, err
+	}
+
+	metaPath := filepath.Join(dir, logPartitionMetaFile)
+	rowsPath := filepath.Join(dir, logPartitionRowsFile)
+	completePath := filepath.Join(dir, logPartitionCompleteFile)
+
+	marker, err := s.readLogPartitionMarker(completePath)
+	if err != nil {
+		s.discardBrokenLogPartition(dir, logPartitionCompleteFile, err, datasource.Name, service, s.partitionDate(day))
+		return LocalLogPartition{}, false, nil
+	}
+	if marker.FormatVersion != logPartitionFormatVersion {
+		s.discardBrokenLogPartition(dir, logPartitionCompleteFile, fmt.Errorf("unsupported marker format version %d", marker.FormatVersion), datasource.Name, service, s.partitionDate(day))
+		return LocalLogPartition{}, false, nil
+	}
+
+	meta, err := s.readLogPartitionMeta(metaPath)
+	if err != nil {
+		s.discardBrokenLogPartition(dir, logPartitionMetaFile, err, datasource.Name, service, s.partitionDate(day))
+		return LocalLogPartition{}, false, nil
+	}
+	if meta.FormatVersion != logPartitionFormatVersion {
+		s.discardBrokenLogPartition(dir, logPartitionMetaFile, fmt.Errorf("unsupported partition format version %d", meta.FormatVersion), datasource.Name, service, meta.Date)
+		return LocalLogPartition{}, false, nil
 	}
 
 	now := time.Now().UTC()
@@ -65,8 +103,8 @@ func (s *Service) LoadLogPartition(day time.Time, service string, datasource mod
 
 	rows, err := s.readLogPartitionRows(rowsPath)
 	if err != nil {
-		_ = os.RemoveAll(dir)
-		return LocalLogPartition{}, false, err
+		s.discardBrokenLogPartition(dir, logPartitionRowsFile, err, datasource.Name, service, meta.Date)
+		return LocalLogPartition{}, false, nil
 	}
 
 	meta.LastAccessAt = now
@@ -111,7 +149,9 @@ func (s *Service) StoreLogPartition(partition LocalLogPartition) error {
 	rowsPath := filepath.Join(dir, logPartitionRowsFile)
 	metaPath := filepath.Join(dir, logPartitionMetaFile)
 	textPath := filepath.Join(dir, logPartitionTextFile)
+	completePath := filepath.Join(dir, logPartitionCompleteFile)
 
+	partition.Meta.FormatVersion = logPartitionFormatVersion
 	partition.Meta.RowCount = len(partition.Rows)
 	if partition.Meta.LastAccessAt.IsZero() {
 		partition.Meta.LastAccessAt = time.Now().UTC()
@@ -123,27 +163,37 @@ func (s *Service) StoreLogPartition(partition LocalLogPartition) error {
 		partition.Meta.ExpireAt = partition.Meta.LastAccessAt.Add(s.cfg.LocalLogHistoryTTL)
 	}
 
-	storableRows := prepareRowsForLocalStorage(partition.Rows)
-	if err := s.writeJSONAtomic(rowsPath, storableRows); err != nil {
+	_ = os.Remove(completePath)
+	if err := s.writeRowsJSONAtomic(rowsPath, partition.Rows); err != nil {
 		return err
 	}
 	if err := s.writeJSONAtomic(metaPath, partition.Meta); err != nil {
 		return err
 	}
-	if err := s.writeGzipTextAtomic(textPath, s.renderPartitionText(storableRows)); err != nil {
+	if err := s.writeGzipRowsAtomic(textPath, partition.Rows); err != nil {
 		return err
 	}
+	if err := s.writeJSONAtomic(completePath, logPartitionCompleteMarker{
+		FormatVersion: partition.Meta.FormatVersion,
+		CompletedAt:   time.Now().UTC(),
+	}); err != nil {
+		return err
+	}
+
 	s.logger.Debug("stored log partition",
 		zap.String("datasource", partition.Meta.DatasourceName),
 		zap.String("service", defaultPartitionService(partition.Meta.Service)),
 		zap.String("date", partition.Meta.Date),
-		zap.Int("rows", len(storableRows)),
+		zap.Int("rows", len(partition.Rows)),
+		zap.Bool("partial", partition.Meta.Partial),
+		zap.Bool("building", partition.Meta.Building),
 	)
 	return nil
 }
 
 func (s *Service) PrepareLogPartitionMeta(day time.Time, service string, datasource model.Datasource, rowCount int, now time.Time, partial bool) LocalLogPartitionMeta {
 	meta := LocalLogPartitionMeta{
+		FormatVersion:  logPartitionFormatVersion,
 		Date:           s.partitionDate(day),
 		Service:        service,
 		DatasourceID:   datasource.ID,
@@ -208,9 +258,18 @@ func (s *Service) ListTrackedLogPartitions() ([]LocalLogPartitionMeta, error) {
 		if d.IsDir() || d.Name() != logPartitionMetaFile {
 			return nil
 		}
-		meta, readErr := s.readLogPartitionMeta(path)
-		if readErr != nil {
-			s.logger.Warn("read tracked log partition meta failed", zap.Error(readErr), zap.String("path", path))
+		dir := filepath.Dir(path)
+		meta, err := s.readLogPartitionMeta(path)
+		if err != nil {
+			s.discardBrokenLogPartition(dir, logPartitionMetaFile, err, "", "", "")
+			return nil
+		}
+		if meta.FormatVersion != logPartitionFormatVersion {
+			s.discardBrokenLogPartition(dir, logPartitionMetaFile, fmt.Errorf("unsupported partition format version %d", meta.FormatVersion), meta.DatasourceName, meta.Service, meta.Date)
+			return nil
+		}
+		if _, err := s.readLogPartitionMarker(filepath.Join(dir, logPartitionCompleteFile)); err != nil {
+			s.discardBrokenLogPartition(dir, logPartitionCompleteFile, err, meta.DatasourceName, meta.Service, meta.Date)
 			return nil
 		}
 		metas = append(metas, meta)
@@ -243,14 +302,23 @@ func (s *Service) maybeCleanupLocalLogPartitions() {
 		if d.IsDir() || d.Name() != logPartitionMetaFile {
 			return nil
 		}
+		dir := filepath.Dir(path)
 		meta, readErr := s.readLogPartitionMeta(path)
 		if readErr != nil {
-			_ = os.RemoveAll(filepath.Dir(path))
+			s.discardBrokenLogPartition(dir, logPartitionMetaFile, readErr, "", "", "")
+			return nil
+		}
+		if meta.FormatVersion != logPartitionFormatVersion {
+			s.discardBrokenLogPartition(dir, logPartitionMetaFile, fmt.Errorf("unsupported partition format version %d", meta.FormatVersion), meta.DatasourceName, meta.Service, meta.Date)
+			return nil
+		}
+		if _, markerErr := s.readLogPartitionMarker(filepath.Join(dir, logPartitionCompleteFile)); markerErr != nil {
+			s.discardBrokenLogPartition(dir, logPartitionCompleteFile, markerErr, meta.DatasourceName, meta.Service, meta.Date)
 			return nil
 		}
 		day, dayErr := time.Parse("2006-01-02", meta.Date)
 		if dayErr != nil {
-			_ = os.RemoveAll(filepath.Dir(path))
+			s.discardBrokenLogPartition(dir, logPartitionMetaFile, dayErr, meta.DatasourceName, meta.Service, meta.Date)
 			return nil
 		}
 		now := time.Now().UTC()
@@ -259,9 +327,9 @@ func (s *Service) maybeCleanupLocalLogPartitions() {
 				zap.String("datasource", meta.DatasourceName),
 				zap.String("service", defaultPartitionService(meta.Service)),
 				zap.String("date", meta.Date),
-				zap.String("path", filepath.Dir(path)),
+				zap.String("path", dir),
 			)
-			_ = os.RemoveAll(filepath.Dir(path))
+			_ = os.RemoveAll(dir)
 		}
 		return nil
 	})
@@ -286,6 +354,18 @@ func (s *Service) readLogPartitionMeta(path string) (LocalLogPartitionMeta, erro
 		return LocalLogPartitionMeta{}, err
 	}
 	return meta, nil
+}
+
+func (s *Service) readLogPartitionMarker(path string) (logPartitionCompleteMarker, error) {
+	var marker logPartitionCompleteMarker
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return logPartitionCompleteMarker{}, err
+	}
+	if err := json.Unmarshal(raw, &marker); err != nil {
+		return logPartitionCompleteMarker{}, err
+	}
+	return marker, nil
 }
 
 func (s *Service) readLogPartitionRows(path string) ([]model.SearchResult, error) {
@@ -316,7 +396,7 @@ func (s *Service) writeJSONAtomic(path string, payload any) error {
 	return os.Rename(tempPath, path)
 }
 
-func (s *Service) writeGzipTextAtomic(path, text string) error {
+func (s *Service) writeRowsJSONAtomic(path string, rows []model.SearchResult) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -325,17 +405,41 @@ func (s *Service) writeGzipTextAtomic(path, text string) error {
 	if err != nil {
 		return err
 	}
-	writer := gzip.NewWriter(file)
-	if _, err := writer.Write([]byte(text)); err != nil {
-		_ = writer.Close()
+
+	cleanup := func(writeErr error) error {
 		_ = file.Close()
 		_ = os.Remove(tempPath)
-		return err
+		return writeErr
 	}
-	if err := writer.Close(); err != nil {
-		_ = file.Close()
-		_ = os.Remove(tempPath)
-		return err
+
+	writer := bufio.NewWriterSize(file, 64*1024)
+	if _, err := writer.WriteString("["); err != nil {
+		return cleanup(err)
+	}
+	encoder := json.NewEncoder(writer)
+	encoder.SetEscapeHTML(false)
+	for index, row := range rows {
+		if index > 0 {
+			if _, err := writer.WriteString(","); err != nil {
+				return cleanup(err)
+			}
+		}
+		if err := encoder.Encode(storedSearchResult{
+			Timestamp:  row.Timestamp,
+			Message:    row.Message,
+			Service:    row.Service,
+			Pod:        row.Pod,
+			Datasource: row.Datasource,
+			Labels:     row.Labels,
+		}); err != nil {
+			return cleanup(err)
+		}
+	}
+	if _, err := writer.WriteString("]"); err != nil {
+		return cleanup(err)
+	}
+	if err := writer.Flush(); err != nil {
+		return cleanup(err)
 	}
 	if err := file.Close(); err != nil {
 		_ = os.Remove(tempPath)
@@ -345,19 +449,84 @@ func (s *Service) writeGzipTextAtomic(path, text string) error {
 	return os.Rename(tempPath, path)
 }
 
-func (s *Service) renderPartitionText(rows []model.SearchResult) string {
-	if len(rows) == 0 {
-		return ""
+func (s *Service) writeGzipRowsAtomic(path string, rows []model.SearchResult) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
 	}
-	lines := make([]string, 0, len(rows))
-	for _, row := range rows {
-		pod := strings.TrimSpace(row.Pod)
-		if pod == "" {
-			pod = strings.TrimSpace(row.Service)
+	tempPath := path + ".tmp"
+	file, err := os.Create(tempPath)
+	if err != nil {
+		return err
+	}
+
+	cleanup := func(writeErr error) error {
+		_ = file.Close()
+		_ = os.Remove(tempPath)
+		return writeErr
+	}
+
+	gzipWriter := gzip.NewWriter(file)
+	writer := bufio.NewWriterSize(gzipWriter, 64*1024)
+	for index, row := range rows {
+		if index > 0 {
+			if _, err := writer.WriteString("\n"); err != nil {
+				_ = gzipWriter.Close()
+				return cleanup(err)
+			}
 		}
-		lines = append(lines, fmt.Sprintf("[%s] %s %s %s", row.Timestamp, row.Datasource, pod, row.Message))
+		if _, err := writer.WriteString(formatPartitionLine(row)); err != nil {
+			_ = gzipWriter.Close()
+			return cleanup(err)
+		}
 	}
-	return strings.Join(lines, "\n")
+	if err := writer.Flush(); err != nil {
+		_ = gzipWriter.Close()
+		return cleanup(err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		return cleanup(err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return err
+	}
+	_ = os.Remove(path)
+	return os.Rename(tempPath, path)
+}
+
+func (s *Service) discardBrokenLogPartition(dir, file string, reason error, datasourceName, serviceName, date string) {
+	fields := []zap.Field{
+		zap.String("path", dir),
+		zap.String("file", file),
+		zap.String("action", "delete"),
+	}
+	if strings.TrimSpace(datasourceName) != "" {
+		fields = append(fields, zap.String("datasource", datasourceName))
+	}
+	if strings.TrimSpace(serviceName) != "" {
+		fields = append(fields, zap.String("service", defaultPartitionService(serviceName)))
+	}
+	if strings.TrimSpace(date) != "" {
+		fields = append(fields, zap.String("date", date))
+	}
+	if reason != nil {
+		fields = append(fields, zap.Error(reason))
+	}
+	s.logger.Warn("dropping broken log partition", fields...)
+	if err := os.RemoveAll(dir); err != nil {
+		s.logger.Warn("delete broken log partition failed",
+			zap.String("path", dir),
+			zap.Error(err),
+		)
+	}
+}
+
+func formatPartitionLine(row model.SearchResult) string {
+	pod := strings.TrimSpace(row.Pod)
+	if pod == "" {
+		pod = strings.TrimSpace(row.Service)
+	}
+	return fmt.Sprintf("[%s] %s %s %s", row.Timestamp, row.Datasource, pod, row.Message)
 }
 
 func (s *Service) isHotLogDay(day, now time.Time) bool {
@@ -401,17 +570,4 @@ func sanitizeLogPathSegment(value string) string {
 			return r
 		}
 	}, trimmed)
-}
-
-func prepareRowsForLocalStorage(rows []model.SearchResult) []model.SearchResult {
-	if len(rows) == 0 {
-		return nil
-	}
-	compact := make([]model.SearchResult, 0, len(rows))
-	for _, row := range rows {
-		clone := row
-		clone.Raw = nil
-		compact = append(compact, clone)
-	}
-	return compact
 }

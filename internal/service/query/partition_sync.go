@@ -69,6 +69,18 @@ func (s *Service) startPartitionSync(
 		)
 		return existing, false
 	}
+	if queue == partitionSyncQueueMaintenance && s.pendingPartitionSyncCountLocked() >= s.maxPendingPartitionSyncs() {
+		s.partitionSyncMu.Unlock()
+		s.logger.Warn("skipping partition sync enqueue because pending queue is full",
+			zap.String("reason", reason),
+			zap.String("queue", string(queue)),
+			zap.String("datasource", datasource.Name),
+			zap.String("service", displayServiceName(serviceName)),
+			zap.String("day", cacheDay(day).Format("2006-01-02")),
+			zap.Int("pending", s.maxPendingPartitionSyncs()),
+		)
+		return nil, false
+	}
 
 	task := &partitionSyncTask{
 		done:      make(chan struct{}),
@@ -171,6 +183,7 @@ func (s *Service) enqueuePartitionSyncLocked(task *partitionSyncTask) {
 		s.prependInteractivePendingLocked(task.key)
 		return
 	}
+	s.removePendingSyncLocked(&s.maintenancePendingSyncs, task.key)
 	s.maintenancePendingSyncs = append(s.maintenancePendingSyncs, task.key)
 }
 
@@ -178,6 +191,7 @@ func (s *Service) prependInteractivePendingLocked(key string) {
 	if key == "" {
 		return
 	}
+	s.removePendingSyncLocked(&s.interactivePendingSyncs, key)
 	s.interactivePendingSyncs = append([]string{key}, s.interactivePendingSyncs...)
 }
 
@@ -199,6 +213,31 @@ func (s *Service) tryStartInteractiveUrgentLocked(task *partitionSyncTask) bool 
 	default:
 		return false
 	}
+}
+
+func (s *Service) removePendingSyncLocked(pending *[]string, key string) {
+	if pending == nil || len(*pending) == 0 || key == "" {
+		return
+	}
+	filtered := (*pending)[:0]
+	for _, item := range *pending {
+		if item == key {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	*pending = filtered
+}
+
+func (s *Service) pendingPartitionSyncCountLocked() int {
+	return len(s.interactivePendingSyncs) + len(s.maintenancePendingSyncs)
+}
+
+func (s *Service) maxPendingPartitionSyncs() int {
+	if s.cfg.MaxPendingPartitionSyncs > 0 {
+		return s.cfg.MaxPendingPartitionSyncs
+	}
+	return 256
 }
 
 func (s *Service) executePartitionSyncTask(task *partitionSyncTask, workerID int, urgent bool, release func()) {

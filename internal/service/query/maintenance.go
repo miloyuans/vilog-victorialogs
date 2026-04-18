@@ -15,7 +15,18 @@ import (
 )
 
 func (s *Service) StartMaintenance(ctx context.Context) {
-	if s.cache == nil || strings.TrimSpace(s.cfg.LocalLogDir) == "" {
+	if s.cache == nil {
+		s.logger.Info("query maintenance disabled: cache service unavailable")
+		return
+	}
+	if strings.TrimSpace(s.cfg.LocalLogDir) == "" {
+		s.logger.Info("query maintenance disabled: local_log_dir is empty")
+		return
+	}
+	if s.cfg.LocalLogRefreshInterval <= 0 {
+		s.logger.Info("query maintenance disabled: local_log_refresh_interval is not positive",
+			zap.Duration("refresh_interval", s.cfg.LocalLogRefreshInterval),
+		)
 		return
 	}
 

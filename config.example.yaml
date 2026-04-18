@@ -50,16 +50,22 @@ cache:
   local_query_retention: 24h
   local_log_dir: ./data/log-cache
   local_log_hot_days: 2
-  local_log_refresh_interval: 10s
+  local_log_refresh_interval: 60s
   local_log_daily_check_at: "00:05"
-  local_log_check_concurrency: 4
-  interactive_sync_concurrency: 2
-  maintenance_sync_concurrency: 4
-  service_chunk_concurrency: 2
+  local_log_check_concurrency: 1
+  interactive_sync_concurrency: 1
+  maintenance_sync_concurrency: 1
+  service_chunk_concurrency: 1
   interactive_service_ttl: 10m
   local_log_history_ttl: 1h
   source_chunk_size: 1000
-  source_request_limit: 10000
+  source_request_limit: 2000
+  dense_window_limit: 5000
+  max_partition_rows: 10000
+  max_rows_before_partial: 8000
+  max_dedupe_rows: 12000
+  max_sort_rows: 12000
+  max_pending_partition_syncs: 256
   max_query_window: 100000
 
 datasources:

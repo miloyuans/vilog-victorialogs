@@ -463,7 +463,7 @@ func (s *Service) loadPartitionWindow(
 				previewRows, _ = s.fetchPreviewSourceRange(ctx, datasource, snapshot, tagDefinitions, serviceName, previewStart, previewEnd, previewLimit)
 			}
 		}
-		previewRows = normalizePartitionRows(previewRows)
+		previewRows, _ = s.normalizeRowsForPartition(previewRows, datasource, serviceName, day, "preview")
 		placeholder := cache.LocalLogPartition{
 			Meta: s.cache.PreparePendingLogPartitionMeta(day, serviceName, datasource, len(previewRows), now),
 			Rows: previewRows,
@@ -526,15 +526,24 @@ func (s *Service) buildPartitionFromSource(
 	serviceName string,
 	day, now time.Time,
 ) (cache.LocalLogPartition, bool, error) {
+	buildStartedAt := time.Now()
+	s.logger.Info("partition build started",
+		zap.String("datasource", datasource.Name),
+		zap.String("service", displayServiceName(serviceName)),
+		zap.String("day", cacheDay(day).Format("2006-01-02")),
+	)
 	rangeStart, rangeEnd := dayBounds(day, now)
 	rows, partial, err := s.fetchCompleteSourceRange(ctx, datasource, snapshot, tagDefinitions, serviceName, rangeStart, rangeEnd)
 	if err != nil {
 		return cache.LocalLogPartition{}, partial, err
 	}
+	rows, guardPartial := s.normalizeRowsForPartition(rows, datasource, serviceName, day, "build")
+	partial = partial || guardPartial
 	partition := cache.LocalLogPartition{
 		Meta: s.cache.PrepareLogPartitionMeta(day, serviceName, datasource, len(rows), now, partial),
-		Rows: normalizePartitionRows(rows),
+		Rows: rows,
 	}
+	persistStartedAt := time.Now()
 	if err := s.cache.StoreLogPartition(partition); err != nil {
 		s.logger.Warn("store log partition failed",
 			zap.Error(err),
@@ -543,6 +552,16 @@ func (s *Service) buildPartitionFromSource(
 			zap.String("day", cacheDay(day).Format("2006-01-02")),
 		)
 	}
+	s.logger.Info("partition build completed",
+		zap.String("datasource", datasource.Name),
+		zap.String("service", displayServiceName(serviceName)),
+		zap.String("day", cacheDay(day).Format("2006-01-02")),
+		zap.Int("rows", len(partition.Rows)),
+		zap.Bool("partial", partial),
+		zap.Bool("skip_persist", false),
+		zap.Duration("persist_took", time.Since(persistStartedAt)),
+		zap.Duration("took", time.Since(buildStartedAt)),
+	)
 	return partition, partial, nil
 }
 
@@ -555,6 +574,7 @@ func (s *Service) refreshPartitionIncremental(
 	day, now time.Time,
 	partition cache.LocalLogPartition,
 ) (cache.LocalLogPartition, bool, error) {
+	refreshStartedAt := time.Now()
 	rangeStart, rangeEnd := dayBounds(day, now)
 	refreshStart := partition.Meta.LastSyncAt.Add(-2 * time.Second)
 	if refreshStart.Before(rangeStart) {
@@ -578,8 +598,9 @@ func (s *Service) refreshPartitionIncremental(
 	if err != nil {
 		return cache.LocalLogPartition{}, true, err
 	}
-	partition.Rows = normalizePartitionRows(append(partition.Rows, rows...))
+	partition.Rows, partial = s.mergePartitionRows(partition.Rows, rows, datasource, serviceName, day, partial)
 	partition.Meta = s.cache.PrepareLogPartitionMeta(day, serviceName, datasource, len(partition.Rows), now, partition.Meta.Partial || partial)
+	persistStartedAt := time.Now()
 	if err := s.cache.StoreLogPartition(partition); err != nil {
 		s.logger.Warn("store refreshed hot partition failed",
 			zap.Error(err),
@@ -588,6 +609,15 @@ func (s *Service) refreshPartitionIncremental(
 			zap.String("day", cacheDay(day).Format("2006-01-02")),
 		)
 	}
+	s.logger.Info("partition refresh completed",
+		zap.String("datasource", datasource.Name),
+		zap.String("service", displayServiceName(serviceName)),
+		zap.String("day", cacheDay(day).Format("2006-01-02")),
+		zap.Int("rows", len(partition.Rows)),
+		zap.Bool("partial", partition.Meta.Partial),
+		zap.Duration("persist_took", time.Since(persistStartedAt)),
+		zap.Duration("took", time.Since(refreshStartedAt)),
+	)
 	return partition, partition.Meta.Partial, nil
 }
 
@@ -608,7 +638,8 @@ func (s *Service) fetchPreviewSourceRange(
 	if err != nil {
 		return nil, err
 	}
-	return dedupeRows(rows), nil
+	rows, _ = s.normalizeRowsForPartition(rows, datasource, serviceName, cacheDay(start), "preview")
+	return rows, nil
 }
 
 func (s *Service) fetchCompleteSourceRange(
@@ -624,7 +655,12 @@ func (s *Service) fetchCompleteSourceRange(
 	if concurrency > 1 {
 		chunkSem = make(chan struct{}, concurrency-1)
 	}
-	return s.fetchSourceRangeRecursive(ctx, datasource, snapshot, tagDefinitions, serviceName, start, end, 0, chunkSem)
+	rows, partial, err := s.fetchSourceRangeRecursive(ctx, datasource, snapshot, tagDefinitions, serviceName, start, end, 0, chunkSem)
+	if err != nil {
+		return nil, partial, err
+	}
+	rows, guardPartial := s.normalizeRowsForPartition(rows, datasource, serviceName, cacheDay(start), "source-range")
+	return rows, partial || guardPartial, nil
 }
 
 func (s *Service) fetchSourceRangeRecursive(
@@ -656,7 +692,8 @@ func (s *Service) fetchSourceRangeRecursive(
 		return nil, false, err
 	}
 	if !truncated {
-		return dedupeRows(rows), false, nil
+		rows, guardPartial := s.dedupeRowsLimited(rows, datasource, serviceName, cacheDay(start), "recursive-base")
+		return rows, guardPartial, nil
 	}
 	if depth >= s.maxSourceSplitDepth() {
 		return s.fetchDenseSourceRange(ctx, datasource, snapshot, tagDefinitions, serviceName, start, end, depth, "maximum split depth")
@@ -686,7 +723,8 @@ func (s *Service) fetchSourceRangeRecursive(
 		if err != nil {
 			return nil, false, err
 		}
-		return dedupeRows(append(leftRows, rightRows...)), leftPartial || rightPartial, nil
+		mergedRows, guardPartial := s.mergeSourceRowsLimited(leftRows, rightRows, datasource, serviceName, cacheDay(start), "recursive-merge")
+		return mergedRows, leftPartial || rightPartial || guardPartial, nil
 	}
 
 	type splitResult struct {
@@ -709,7 +747,8 @@ func (s *Service) fetchSourceRangeRecursive(
 		return nil, false, err
 	}
 	leftRows, leftPartial := leftResult.rows, leftResult.partial
-	return dedupeRows(append(leftRows, rightRows...)), leftPartial || rightPartial, nil
+	mergedRows, guardPartial := s.mergeSourceRowsLimited(leftRows, rightRows, datasource, serviceName, cacheDay(start), "recursive-merge")
+	return mergedRows, leftPartial || rightPartial || guardPartial, nil
 }
 
 func (s *Service) resolveServiceTargets(ctx context.Context, datasourceID string, requested []string) ([]string, error) {
@@ -734,7 +773,7 @@ func (s *Service) serviceChunkConcurrency() int {
 	if s.cfg.ServiceChunkConcurrency > 0 {
 		return s.cfg.ServiceChunkConcurrency
 	}
-	return 2
+	return 1
 }
 
 func (s *Service) maxSourceSplitDepth() int {
@@ -746,16 +785,19 @@ func (s *Service) sourceMinSplitWindow() time.Duration {
 }
 
 func (s *Service) denseSourceWindowLimit() int {
-	limit := s.cfg.SourceRequestLimit * 4
-	if limit < 40000 {
-		limit = 40000
+	limit := s.cfg.DenseWindowLimit
+	if limit <= 0 {
+		limit = 5000
 	}
 	maxWindow := s.sourceWindowLimit()
 	if maxWindow > 0 && limit > maxWindow {
 		limit = maxWindow
 	}
+	if maxPartitionRows := s.partitionRowLimit(); maxPartitionRows > 0 && limit > maxPartitionRows {
+		limit = maxPartitionRows
+	}
 	if limit <= 0 {
-		return 40000
+		return 5000
 	}
 	return limit
 }
@@ -784,8 +826,8 @@ func (s *Service) fetchDenseSourceRange(
 	if err != nil {
 		return nil, true, err
 	}
-	rows = dedupeRows(rows)
-	if truncated {
+	rows, guardPartial := s.dedupeRowsLimited(rows, datasource, serviceName, cacheDay(start), "dense-drain")
+	if truncated || guardPartial {
 		s.logger.Warn("source range still truncated after dense window drain",
 			zap.String("datasource", datasource.Name),
 			zap.String("service", displayServiceName(serviceName)),
@@ -848,8 +890,12 @@ func (s *Service) fetchDatasourceWindow(
 	if requestedWindow > s.sourceWindowLimit() {
 		requestedWindow = s.sourceWindowLimit()
 	}
+	maxRows := requestedWindow
+	if guardLimit := s.rowsBeforePartialLimit(); guardLimit > 0 && maxRows > guardLimit {
+		maxRows = guardLimit
+	}
 
-	normalizedRows := make([]model.SearchResult, 0, requestedWindow)
+	normalizedRows := make([]model.SearchResult, 0, maxSearchInt(1, maxRows))
 	offset := 0
 	truncated := false
 	lastBatchSize := 0
@@ -885,14 +931,23 @@ func (s *Service) fetchDatasourceWindow(
 		}
 		lastBatchSize = len(rows)
 
-		batch := make([]model.SearchResult, 0, len(rows))
 		for _, row := range rows {
-			batch = append(batch, normalizeRow(datasource, snapshot, tagDefinitions, row))
+			normalizedRows = append(normalizedRows, normalizeRow(datasource, snapshot, tagDefinitions, row))
+			if len(normalizedRows) >= maxRows {
+				truncated = true
+				s.logger.Warn("source window limited by safety guard",
+					zap.String("datasource", datasource.Name),
+					zap.Time("start", start),
+					zap.Time("end", end),
+					zap.Int("rows", len(normalizedRows)),
+					zap.Int("guard_limit", maxRows),
+				)
+				break
+			}
 		}
-		normalizedRows = append(normalizedRows, batch...)
 		offset += len(rows)
 
-		if len(rows) < limit {
+		if truncated || len(rows) < limit {
 			break
 		}
 	}
@@ -1299,10 +1354,140 @@ func filterRowsByWindow(rows []model.SearchResult, start, end time.Time) []model
 	return filtered
 }
 
-func normalizePartitionRows(rows []model.SearchResult) []model.SearchResult {
+func (s *Service) normalizeRowsForPartition(rows []model.SearchResult, datasource model.Datasource, serviceName string, day time.Time, stage string) ([]model.SearchResult, bool) {
+	filtered, partial := s.dedupeRowsLimited(rows, datasource, serviceName, day, stage)
+	filtered, sortPartial := s.sortSearchResultsLimited(filtered, datasource, serviceName, day, stage)
+	return filtered, partial || sortPartial
+}
+
+func (s *Service) mergePartitionRows(existing []model.SearchResult, incoming []model.SearchResult, datasource model.Datasource, serviceName string, day time.Time, partial bool) ([]model.SearchResult, bool) {
+	merged, mergePartial := s.mergeSourceRowsLimited(existing, incoming, datasource, serviceName, day, "partition-refresh")
+	merged, normalizePartial := s.normalizeRowsForPartition(merged, datasource, serviceName, day, "partition-refresh")
+	trimmed, trimPartial := s.trimRowsForPartition(merged, datasource, serviceName, day, "partition-refresh")
+	return trimmed, partial || mergePartial || normalizePartial || trimPartial
+}
+
+func (s *Service) dedupeRowsLimited(rows []model.SearchResult, datasource model.Datasource, serviceName string, day time.Time, stage string) ([]model.SearchResult, bool) {
+	limit := s.maxDedupeRowsLimit()
+	partial := false
+	if limit > 0 && len(rows) > limit {
+		partial = true
+		s.logger.Warn("partition rows limited before dedupe",
+			zap.String("datasource", datasource.Name),
+			zap.String("service", displayServiceName(serviceName)),
+			zap.String("day", cacheDay(day).Format("2006-01-02")),
+			zap.String("stage", stage),
+			zap.Int("rows", len(rows)),
+			zap.Int("guard_limit", limit),
+		)
+		rows = rows[:limit]
+	}
 	filtered := dedupeRows(rows)
-	sortSearchResults(filtered)
-	return filtered
+	trimmed, trimPartial := s.trimRowsForPartition(filtered, datasource, serviceName, day, stage)
+	return trimmed, partial || trimPartial
+}
+
+func (s *Service) sortSearchResultsLimited(rows []model.SearchResult, datasource model.Datasource, serviceName string, day time.Time, stage string) ([]model.SearchResult, bool) {
+	limit := s.maxSortRowsLimit()
+	partial := false
+	if limit > 0 && len(rows) > limit {
+		partial = true
+		s.logger.Warn("partition rows limited before sort",
+			zap.String("datasource", datasource.Name),
+			zap.String("service", displayServiceName(serviceName)),
+			zap.String("day", cacheDay(day).Format("2006-01-02")),
+			zap.String("stage", stage),
+			zap.Int("rows", len(rows)),
+			zap.Int("guard_limit", limit),
+		)
+		rows = rows[:limit]
+	}
+	sortSearchResults(rows)
+	return rows, partial
+}
+
+func (s *Service) mergeSourceRowsLimited(leftRows []model.SearchResult, rightRows []model.SearchResult, datasource model.Datasource, serviceName string, day time.Time, stage string) ([]model.SearchResult, bool) {
+	limit := s.maxDedupeRowsLimit()
+	if limit <= 0 {
+		limit = len(leftRows) + len(rightRows)
+	}
+	filtered := make([]model.SearchResult, 0, minSearchInt(limit, len(leftRows)+len(rightRows)))
+	seen := make(map[string]struct{}, minSearchInt(limit, len(leftRows)+len(rightRows)))
+	partial := false
+
+	appendRows := func(items []model.SearchResult) {
+		for _, row := range items {
+			key := searchResultKey(row)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			if len(filtered) >= limit {
+				partial = true
+				return
+			}
+			seen[key] = struct{}{}
+			filtered = append(filtered, row)
+		}
+	}
+
+	appendRows(rightRows)
+	appendRows(leftRows)
+	if partial {
+		s.logger.Warn("partition rows limited during merge",
+			zap.String("datasource", datasource.Name),
+			zap.String("service", displayServiceName(serviceName)),
+			zap.String("day", cacheDay(day).Format("2006-01-02")),
+			zap.String("stage", stage),
+			zap.Int("left_rows", len(leftRows)),
+			zap.Int("right_rows", len(rightRows)),
+			zap.Int("guard_limit", limit),
+		)
+	}
+	return filtered, partial
+}
+
+func (s *Service) trimRowsForPartition(rows []model.SearchResult, datasource model.Datasource, serviceName string, day time.Time, stage string) ([]model.SearchResult, bool) {
+	limit := s.partitionRowLimit()
+	if limit <= 0 || len(rows) <= limit {
+		return rows, false
+	}
+	s.logger.Warn("partition build downgraded due to row threshold",
+		zap.String("datasource", datasource.Name),
+		zap.String("service", displayServiceName(serviceName)),
+		zap.String("day", cacheDay(day).Format("2006-01-02")),
+		zap.String("stage", stage),
+		zap.Int("rows", len(rows)),
+		zap.Int("guard_limit", limit),
+	)
+	return rows[:limit], true
+}
+
+func (s *Service) rowsBeforePartialLimit() int {
+	if s.cfg.MaxRowsBeforePartial > 0 {
+		return s.cfg.MaxRowsBeforePartial
+	}
+	return 8000
+}
+
+func (s *Service) partitionRowLimit() int {
+	if s.cfg.MaxPartitionRows > 0 {
+		return s.cfg.MaxPartitionRows
+	}
+	return 10000
+}
+
+func (s *Service) maxDedupeRowsLimit() int {
+	if s.cfg.MaxDedupeRows > 0 {
+		return s.cfg.MaxDedupeRows
+	}
+	return maxSearchInt(12000, s.partitionRowLimit())
+}
+
+func (s *Service) maxSortRowsLimit() int {
+	if s.cfg.MaxSortRows > 0 {
+		return s.cfg.MaxSortRows
+	}
+	return maxSearchInt(12000, s.rowsBeforePartialLimit())
 }
 
 func dedupeRows(rows []model.SearchResult) []model.SearchResult {
@@ -1336,6 +1521,20 @@ func sortSearchResults(rows []model.SearchResult) {
 		}
 		return left.After(right)
 	})
+}
+
+func minSearchInt(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
+}
+
+func maxSearchInt(left, right int) int {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func applySearchFilters(rows []model.SearchResult, req model.SearchRequest) []model.SearchResult {
