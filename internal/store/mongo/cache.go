@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 
 	"vilog-victorialogs/internal/model"
 )
@@ -50,6 +52,22 @@ func (s *Store) UpsertCacheEntry(ctx context.Context, entry model.CacheEntry) er
 	)
 	if err != nil {
 		return fmt.Errorf("upsert cache entry: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) DeleteCacheEntriesByPrefix(ctx context.Context, kind, prefix string) error {
+	filter := bson.M{
+		"kind": kind,
+		"cache_key": bson.M{
+			"$regex": primitive.Regex{
+				Pattern: "^" + regexp.QuoteMeta(prefix),
+				Options: "",
+			},
+		},
+	}
+	if _, err := s.collection(collectionQueryCache).DeleteMany(ctx, filter); err != nil {
+		return fmt.Errorf("delete cache entries by prefix: %w", err)
 	}
 	return nil
 }

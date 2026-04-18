@@ -11,9 +11,9 @@ const defaults = {
     delete_stop_task: "/delete/stop_task",
   },
   fieldMapping: {
-    service_field: "",
-    pod_field: "",
-    message_field: "",
+    service_field: "app",
+    pod_field: "kubernetes.pod.name",
+    message_field: "_msg",
     time_field: "_time",
   },
 };
@@ -1140,7 +1140,7 @@ function renderSearchInspector() {
 
 function renderDatasourceList() {
   byId("datasource-list").innerHTML = state.datasources.length
-    ? state.datasources.map((item) => `<div class="list-card"><div class="section-head"><div><h3 class="card-title">${esc(item.name || "-")}</h3><div class="tiny mono">${esc(item.base_url || "-")}</div></div><div class="chip-row">${pill(item.enabled ? s("启用", "Enabled") : s("停用", "Disabled"), item.enabled ? "tone-ok" : "tone-warn")}${pill(item.supports_delete ? "delete:on" : "delete:off", item.supports_delete ? "tone-warn" : "tone-soft")}</div></div><div class="tiny">${esc(s("更新时间", "Updated"))}: ${esc(formatDate(item.updated_at))}</div><div class="chip-row"><span class="chip">${esc((item.field_mapping && item.field_mapping.service_field) || "service:?")}</span><span class="chip">${esc((item.field_mapping && item.field_mapping.pod_field) || "pod:?")}</span><span class="chip">${esc((item.field_mapping && item.field_mapping.message_field) || "message:?")}</span></div><div class="form-actions"><button class="button button-small" type="button" data-action="edit-datasource" data-id="${esc(item.id)}">${esc(s("编辑", "Edit"))}</button><button class="button button-small" type="button" data-action="test-datasource" data-id="${esc(item.id)}">${esc(s("测试", "Test"))}</button><button class="button button-small" type="button" data-action="discover-datasource" data-id="${esc(item.id)}">Discover</button><button class="button button-small" type="button" data-action="snapshot-datasource" data-id="${esc(item.id)}">Snapshot</button></div></div>`).join("")
+    ? state.datasources.map((item) => `<div class="list-card"><div class="section-head"><div><h3 class="card-title">${esc(item.name || "-")}</h3><div class="tiny mono">${esc(item.base_url || "-")}</div></div><div class="chip-row">${pill(item.enabled ? s("启用", "Enabled") : s("停用", "Disabled"), item.enabled ? "tone-ok" : "tone-warn")}${pill(item.supports_delete ? "delete:on" : "delete:off", item.supports_delete ? "tone-warn" : "tone-soft")}</div></div><div class="tiny">${esc(s("更新时间", "Updated"))}: ${esc(formatDate(item.updated_at))}</div><div class="chip-row"><span class="chip">${esc((item.field_mapping && item.field_mapping.service_field) || defaults.fieldMapping.service_field)}</span><span class="chip">${esc((item.field_mapping && item.field_mapping.pod_field) || defaults.fieldMapping.pod_field)}</span><span class="chip">${esc((item.field_mapping && item.field_mapping.message_field) || defaults.fieldMapping.message_field)}</span></div><div class="form-actions"><button class="button button-small" type="button" data-action="edit-datasource" data-id="${esc(item.id)}">${esc(s("编辑", "Edit"))}</button><button class="button button-small" type="button" data-action="test-datasource" data-id="${esc(item.id)}">${esc(s("测试", "Test"))}</button><button class="button button-small" type="button" data-action="discover-datasource" data-id="${esc(item.id)}">Discover</button><button class="button button-small" type="button" data-action="snapshot-datasource" data-id="${esc(item.id)}">Snapshot</button></div></div>`).join("")
     : empty(s("还没有配置任何数据源。", "No datasource configured yet."));
 }
 
@@ -1199,9 +1199,9 @@ function resetDatasourceForm() {
   byId("ds-header-account").value = "";
   byId("ds-header-project").value = "";
   byId("ds-header-auth").value = "";
-  byId("ds-field-service").value = "";
-  byId("ds-field-pod").value = "";
-  byId("ds-field-message").value = "";
+  byId("ds-field-service").value = defaults.fieldMapping.service_field;
+  byId("ds-field-pod").value = defaults.fieldMapping.pod_field;
+  byId("ds-field-message").value = defaults.fieldMapping.message_field;
   byId("ds-field-time").value = defaults.fieldMapping.time_field;
   applyDatasourceDefaults();
 }
@@ -1231,9 +1231,9 @@ function fillDatasourceForm(item) {
   byId("ds-header-account").value = (item.headers && item.headers.AccountID) || "";
   byId("ds-header-project").value = (item.headers && item.headers.ProjectID) || "";
   byId("ds-header-auth").value = (item.headers && item.headers.Authorization) || "";
-  byId("ds-field-service").value = (item.field_mapping && item.field_mapping.service_field) || "";
-  byId("ds-field-pod").value = (item.field_mapping && item.field_mapping.pod_field) || "";
-  byId("ds-field-message").value = (item.field_mapping && item.field_mapping.message_field) || "";
+  byId("ds-field-service").value = (item.field_mapping && item.field_mapping.service_field) || defaults.fieldMapping.service_field;
+  byId("ds-field-pod").value = (item.field_mapping && item.field_mapping.pod_field) || defaults.fieldMapping.pod_field;
+  byId("ds-field-message").value = (item.field_mapping && item.field_mapping.message_field) || defaults.fieldMapping.message_field;
   byId("ds-field-time").value = (item.field_mapping && item.field_mapping.time_field) || defaults.fieldMapping.time_field;
   byId("ds-path-query").value = (item.query_paths && item.query_paths.query) || defaults.queryPaths.query;
   byId("ds-path-field-names").value = (item.query_paths && item.query_paths.field_names) || defaults.queryPaths.field_names;
@@ -1596,7 +1596,7 @@ function parseTagScope(text) { if (!String(text || "").trim()) return {}; let va
 function normalizeFilters(obj) { const out = {}; Object.keys(obj || {}).forEach((key) => { const values = (obj[key] || []).map((item) => String(item).trim()).filter(Boolean); if (values.length) out[key] = values; }); return out; }
 function parseCSV(text) { return String(text || "").split(",").map((item) => item.trim()).filter(Boolean); }
 function localToRFC3339(value) { return value ? new Date(value).toISOString() : ""; }
-function localDateValue(date) { return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}T${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`; }
+function localDateValue(date) { return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}T${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`; }
 function formatDate(value) { if (!value) return "-"; const date = new Date(value); if (Number.isNaN(date.getTime())) return String(value); return new Intl.DateTimeFormat(state.locale === "zh" ? "zh-CN" : "en-US", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(date); }
 function formatShortDate(value) { const date = new Date(value); if (Number.isNaN(date.getTime())) return String(value); return new Intl.DateTimeFormat(state.locale === "zh" ? "zh-CN" : "en-US", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(date); }
 function statusText(item) { if (!item) return "loading"; if (item.ok && item.data && item.data.status) return item.data.status; return "error"; }

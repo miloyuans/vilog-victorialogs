@@ -176,3 +176,16 @@ func (s *Store) GetSnapshot(ctx context.Context, datasourceID string) (model.Dat
 	}
 	return model.DatasourceTagSnapshot{}, fmt.Errorf("find snapshot: %w", err)
 }
+
+func (s *Store) ResetDatasourceDiscovery(ctx context.Context, datasourceID string) error {
+	targets := []string{
+		collectionServiceCatalog,
+		collectionDatasourceTagSnapshots,
+	}
+	for _, target := range targets {
+		if _, err := s.collection(target).DeleteMany(ctx, bson.M{"datasource_id": datasourceID}); err != nil {
+			return fmt.Errorf("reset discovery %s for datasource %s: %w", target, datasourceID, err)
+		}
+	}
+	return nil
+}

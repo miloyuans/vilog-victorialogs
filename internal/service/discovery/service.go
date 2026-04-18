@@ -93,7 +93,7 @@ func (s *Service) Discover(ctx context.Context, datasourceID, actor string) (mod
 	allFields := uniqueStrings(append(append([]string{}, streamFieldNames...), fieldNames...))
 
 	serviceField := pickCandidate(firstNonEmpty(ds.FieldMapping.ServiceField), allFields, []string{
-		"service", "service_name", "app", "job", "kubernetes.container.name", "kubernetes_container_name", "container", "container_name",
+		"app", "service", "service_name", "job", "kubernetes.container.name", "kubernetes_container_name", "container", "container_name",
 	})
 	podField := pickCandidate(firstNonEmpty(ds.FieldMapping.PodField), allFields, []string{
 		"kubernetes.pod.name", "kubernetes_pod_name", "pod", "pod_name",
@@ -144,11 +144,21 @@ func (s *Service) Discover(ctx context.Context, datasourceID, actor string) (mod
 		}
 	}
 
-	if serviceField != ds.FieldMapping.ServiceField || podField != ds.FieldMapping.PodField || messageField != ds.FieldMapping.MessageField || timeField != ds.FieldMapping.TimeField {
-		ds.FieldMapping.ServiceField = serviceField
-		ds.FieldMapping.PodField = podField
-		ds.FieldMapping.MessageField = messageField
-		ds.FieldMapping.TimeField = timeField
+	updatedMapping := ds.FieldMapping
+	if strings.TrimSpace(updatedMapping.ServiceField) == "" {
+		updatedMapping.ServiceField = serviceField
+	}
+	if strings.TrimSpace(updatedMapping.PodField) == "" {
+		updatedMapping.PodField = podField
+	}
+	if strings.TrimSpace(updatedMapping.MessageField) == "" {
+		updatedMapping.MessageField = messageField
+	}
+	if strings.TrimSpace(updatedMapping.TimeField) == "" {
+		updatedMapping.TimeField = timeField
+	}
+	if updatedMapping != ds.FieldMapping {
+		ds.FieldMapping = updatedMapping
 		ds.UpdatedAt = time.Now().UTC()
 		if err := s.store.UpdateDatasource(ctx, ds); err != nil {
 			return model.DatasourceTagSnapshot{}, err
@@ -506,7 +516,7 @@ func inferTagDefinitions(datasourceID string, fields []string) ([]string, []mode
 		displayName string
 		fields     []string
 	}{
-		{name: "service", displayName: "service", fields: []string{"service", "service_name", "app", "job"}},
+		{name: "service", displayName: "service", fields: []string{"app", "service", "service_name", "job"}},
 		{name: "namespace", displayName: "namespace", fields: []string{"namespace", "kubernetes.namespace", "kubernetes_namespace", "kubernetes.pod_namespace"}},
 		{name: "pod", displayName: "pod", fields: []string{"kubernetes.pod.name", "kubernetes_pod_name", "pod", "pod_name"}},
 		{name: "container", displayName: "container", fields: []string{"container", "container_name", "kubernetes.container.name", "kubernetes_container_name"}},

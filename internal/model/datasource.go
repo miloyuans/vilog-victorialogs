@@ -73,6 +73,9 @@ func DefaultDatasourceQueryPaths() DatasourceQueryPaths {
 
 func DefaultDatasourceFieldMapping() DatasourceFieldMapping {
 	return DatasourceFieldMapping{
-		TimeField: "_time",
+		ServiceField: "app",
+		PodField:     "kubernetes.pod.name",
+		MessageField: "_msg",
+		TimeField:    "_time",
 	}
 }

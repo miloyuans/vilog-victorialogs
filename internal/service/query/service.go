@@ -793,7 +793,7 @@ func normalizeRow(datasource model.Datasource, snapshot model.DatasourceTagSnaps
 	return model.SearchResult{
 		Timestamp:  formatTimestamp(extractValue(row, timestampField, "_time")),
 		Message:    stringify(extractValue(row, messageField, "_msg", "message", "msg", "log")),
-		Service:    stringify(extractValue(row, serviceField, "service", "service_name", "app", "job")),
+		Service:    stringify(extractValue(row, serviceField, "app", "service", "service_name", "job")),
 		Pod:        stringify(extractValue(row, podField, "kubernetes.pod.name", "kubernetes_pod_name", "pod", "pod_name")),
 		Datasource: datasource.Name,
 		Labels:     labels,

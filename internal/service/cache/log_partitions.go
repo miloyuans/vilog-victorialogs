@@ -122,20 +122,21 @@ func (s *Service) StoreLogPartition(partition LocalLogPartition) error {
 		partition.Meta.ExpireAt = partition.Meta.LastAccessAt.Add(s.cfg.LocalLogHistoryTTL)
 	}
 
-	if err := s.writeJSONAtomic(rowsPath, partition.Rows); err != nil {
+	storableRows := prepareRowsForLocalStorage(partition.Rows)
+	if err := s.writeJSONAtomic(rowsPath, storableRows); err != nil {
 		return err
 	}
 	if err := s.writeJSONAtomic(metaPath, partition.Meta); err != nil {
 		return err
 	}
-	if err := s.writeGzipTextAtomic(textPath, s.renderPartitionText(partition.Rows)); err != nil {
+	if err := s.writeGzipTextAtomic(textPath, s.renderPartitionText(storableRows)); err != nil {
 		return err
 	}
 	s.logger.Debug("stored log partition",
 		zap.String("datasource", partition.Meta.DatasourceName),
 		zap.String("service", defaultPartitionService(partition.Meta.Service)),
 		zap.String("date", partition.Meta.Date),
-		zap.Int("rows", len(partition.Rows)),
+		zap.Int("rows", len(storableRows)),
 	)
 	return nil
 }
@@ -279,6 +280,9 @@ func (s *Service) writeJSONAtomic(path string, payload any) error {
 	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
 	tempPath := path + ".tmp"
 	if err := os.WriteFile(tempPath, raw, 0o644); err != nil {
 		return err
@@ -288,6 +292,9 @@ func (s *Service) writeJSONAtomic(path string, payload any) error {
 }
 
 func (s *Service) writeGzipTextAtomic(path, text string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
 	tempPath := path + ".tmp"
 	file, err := os.Create(tempPath)
 	if err != nil {
@@ -369,4 +376,17 @@ func sanitizeLogPathSegment(value string) string {
 			return r
 		}
 	}, trimmed)
+}
+
+func prepareRowsForLocalStorage(rows []model.SearchResult) []model.SearchResult {
+	if len(rows) == 0 {
+		return nil
+	}
+	compact := make([]model.SearchResult, 0, len(rows))
+	for _, row := range rows {
+		clone := row
+		clone.Raw = nil
+		compact = append(compact, clone)
+	}
+	return compact
 }

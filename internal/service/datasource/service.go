@@ -14,22 +14,25 @@ import (
 	"vilog-victorialogs/internal/client/victorialogs"
 	"vilog-victorialogs/internal/config"
 	"vilog-victorialogs/internal/model"
+	cachesvc "vilog-victorialogs/internal/service/cache"
 	mongostore "vilog-victorialogs/internal/store/mongo"
 	"vilog-victorialogs/internal/util"
 )
 
 type Service struct {
 	store  *mongostore.Store
+	cache  *cachesvc.Service
 	client *victorialogs.Client
 	logger *zap.Logger
 }
 
-func New(store *mongostore.Store, client *victorialogs.Client, logger *zap.Logger) *Service {
+func New(store *mongostore.Store, cacheService *cachesvc.Service, client *victorialogs.Client, logger *zap.Logger) *Service {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 	return &Service{
 		store:  store,
+		cache:  cacheService,
 		client: client,
 		logger: logger,
 	}
@@ -79,6 +82,9 @@ func (s *Service) Update(ctx context.Context, id string, req model.DatasourceUps
 	if err := s.store.UpdateDatasource(ctx, datasource); err != nil {
 		return model.Datasource{}, err
 	}
+	if datasourceRuntimeChanged(existing, datasource) {
+		s.invalidateDatasourceRuntimeState(ctx, datasource, "update")
+	}
 	_ = s.audit(ctx, "datasource", datasource.ID, "update", actor, map[string]any{"name": datasource.Name})
 	return datasource, nil
 }
@@ -91,6 +97,7 @@ func (s *Service) Delete(ctx context.Context, id, actor string) error {
 	if err := s.store.DeleteDatasource(ctx, id); err != nil {
 		return err
 	}
+	s.invalidateDatasourceRuntimeState(ctx, existing, "delete")
 	_ = s.audit(ctx, "datasource", id, "delete", actor, map[string]any{"name": existing.Name})
 	return nil
 }
@@ -139,6 +146,9 @@ func (s *Service) SyncConfigured(ctx context.Context, items []config.ConfiguredD
 
 		if err := s.store.UpdateDatasource(ctx, datasource); err != nil {
 			return fmt.Errorf("update configured datasource %s: %w", id, err)
+		}
+		if datasourceRuntimeChanged(existing, datasource) {
+			s.invalidateDatasourceRuntimeState(ctx, datasource, "config_sync")
 		}
 		s.logger.Info("configured datasource synced",
 			zap.String("id", datasource.ID),
@@ -296,8 +306,18 @@ func buildDatasource(id string, req model.DatasourceUpsertRequest, createdAt tim
 	fieldMapping := model.DefaultDatasourceFieldMapping()
 	if req.FieldMapping.TimeField != "" || req.FieldMapping.ServiceField != "" || req.FieldMapping.PodField != "" || req.FieldMapping.MessageField != "" {
 		fieldMapping = req.FieldMapping
-		if fieldMapping.TimeField == "" {
-			fieldMapping.TimeField = "_time"
+		defaults := model.DefaultDatasourceFieldMapping()
+		if strings.TrimSpace(fieldMapping.ServiceField) == "" {
+			fieldMapping.ServiceField = defaults.ServiceField
+		}
+		if strings.TrimSpace(fieldMapping.PodField) == "" {
+			fieldMapping.PodField = defaults.PodField
+		}
+		if strings.TrimSpace(fieldMapping.MessageField) == "" {
+			fieldMapping.MessageField = defaults.MessageField
+		}
+		if strings.TrimSpace(fieldMapping.TimeField) == "" {
+			fieldMapping.TimeField = defaults.TimeField
 		}
 	}
 
@@ -347,4 +367,53 @@ func configuredDatasourceID(item config.ConfiguredDatasource) string {
 
 func boolPtr(value bool) *bool {
 	return &value
+}
+
+func datasourceRuntimeChanged(before, after model.Datasource) bool {
+	return before.Name != after.Name ||
+		before.BaseURL != after.BaseURL ||
+		before.Enabled != after.Enabled ||
+		before.TimeoutSeconds != after.TimeoutSeconds ||
+		before.SupportsDelete != after.SupportsDelete ||
+		before.Headers != after.Headers ||
+		before.QueryPaths != after.QueryPaths ||
+		before.FieldMapping != after.FieldMapping
+}
+
+func (s *Service) invalidateDatasourceRuntimeState(ctx context.Context, datasource model.Datasource, reason string) {
+	if err := s.store.ResetDatasourceDiscovery(ctx, datasource.ID); err != nil {
+		s.logger.Warn("reset datasource discovery state failed",
+			zap.Error(err),
+			zap.String("datasource_id", datasource.ID),
+			zap.String("reason", reason),
+		)
+	}
+	if err := s.store.DeleteCacheEntriesByPrefix(ctx, cachesvc.KindServiceList, datasource.ID); err != nil {
+		s.logger.Warn("clear datasource service-list cache failed",
+			zap.Error(err),
+			zap.String("datasource_id", datasource.ID),
+			zap.String("reason", reason),
+		)
+	}
+	if err := s.store.DeleteCacheEntriesByPrefix(ctx, cachesvc.KindTagValues, datasource.ID+":"); err != nil {
+		s.logger.Warn("clear datasource tag-values cache failed",
+			zap.Error(err),
+			zap.String("datasource_id", datasource.ID),
+			zap.String("reason", reason),
+		)
+	}
+	if s.cache != nil {
+		if err := s.cache.PurgeDatasourceArtifacts(datasource.ID); err != nil {
+			s.logger.Warn("purge datasource local cache failed",
+				zap.Error(err),
+				zap.String("datasource_id", datasource.ID),
+				zap.String("reason", reason),
+			)
+		}
+	}
+	s.logger.Info("datasource runtime state invalidated",
+		zap.String("datasource_id", datasource.ID),
+		zap.String("datasource_name", datasource.Name),
+		zap.String("reason", reason),
+	)
 }

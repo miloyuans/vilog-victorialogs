@@ -48,6 +48,10 @@ func New(store *mongostore.Store, cfg config.CacheConfig, logger *zap.Logger) *S
 	if strings.TrimSpace(cfg.LocalLogDir) != "" {
 		_ = os.MkdirAll(cfg.LocalLogDir, 0o755)
 	}
+	logger.Info("local cache directories ready",
+		zap.String("query_dir", strings.TrimSpace(cfg.LocalQueryDir)),
+		zap.String("log_dir", strings.TrimSpace(cfg.LocalLogDir)),
+	)
 	return service
 }
 
@@ -223,4 +227,36 @@ func (s *Service) maybeCleanupLocalQueries() {
 			_ = os.Remove(path)
 		}
 	}
+}
+
+func (s *Service) PurgeDatasourceArtifacts(datasourceID string) error {
+	logDir := strings.TrimSpace(s.cfg.LocalLogDir)
+	if logDir == "" || strings.TrimSpace(datasourceID) == "" {
+		return nil
+	}
+
+	var firstErr error
+	_ = filepath.WalkDir(logDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return nil
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if name == sanitizeLogPathSegment(datasourceID) || strings.HasSuffix(name, "__"+sanitizeLogPathSegment(datasourceID)) {
+			if removeErr := os.RemoveAll(path); removeErr != nil && firstErr == nil {
+				firstErr = removeErr
+			}
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if firstErr == nil {
+		s.logger.Info("purged datasource local log artifacts", zap.String("datasource_id", datasourceID), zap.String("log_dir", logDir))
+	}
+	return firstErr
 }

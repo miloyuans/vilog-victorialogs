@@ -1005,7 +1005,7 @@ renderDatasourceList = function () {
   const items = filteredDatasourceItems();
   if (!state.datasources.length) return void (node.innerHTML = empty(s("还没有配置任何数据源。", "No datasource configured yet.")));
   if (!items.length) return void (node.innerHTML = empty(s("没有匹配当前搜索条件的数据源。", "No datasource matches the current search filter.")));
-  node.innerHTML = `<div class="datasource-list-grid">${items.map((item) => { const mapping = item.field_mapping || {}; return `<article class="datasource-list-item"><div class="datasource-list-main"><div class="datasource-badge">VL</div><div class="datasource-list-copy"><div class="datasource-list-head"><strong>${esc(item.name || "-")}</strong><div class="chip-row">${pill(item.enabled ? s("启用", "Enabled") : s("停用", "Disabled"), item.enabled ? "tone-ok" : "tone-warn")}${pill(item.supports_delete ? s("允许删除", "Delete On") : s("只读", "Read Only"), item.supports_delete ? "tone-warn" : "tone-soft")}</div></div><div class="datasource-list-meta"><span>VictoriaLogs</span><span class="datasource-sep">|</span><span class="mono">${esc(item.base_url || "-")}</span></div><div class="datasource-list-meta small"><span>${esc(s("服务字段", "Service"))}: ${esc(mapping.service_field || "service")}</span><span>${esc(s("消息字段", "Message"))}: ${esc(mapping.message_field || "_msg")}</span><span>${esc(s("时间字段", "Time"))}: ${esc(mapping.time_field || "_time")}</span><span>${esc(s("更新", "Updated"))}: ${esc(formatDate(item.updated_at))}</span></div></div></div><div class="datasource-list-actions"><button class="button button-small" type="button" data-action="explore-datasource" data-id="${esc(item.id)}">${esc(s("Explore", "Explore"))}</button><button class="button button-small" type="button" data-action="edit-datasource" data-id="${esc(item.id)}">${esc(s("编辑", "Edit"))}</button><button class="button button-small" type="button" data-action="test-datasource" data-id="${esc(item.id)}">${esc(s("测试", "Test"))}</button><button class="button button-small" type="button" data-action="discover-datasource" data-id="${esc(item.id)}">Discover</button><button class="button button-small" type="button" data-action="snapshot-datasource" data-id="${esc(item.id)}">Snapshot</button><button class="button button-small button-danger" type="button" data-action="delete-datasource" data-id="${esc(item.id)}">${esc(s("删除", "Delete"))}</button></div></article>`; }).join("")}</div>`;
+  node.innerHTML = `<div class="datasource-list-grid">${items.map((item) => { const mapping = item.field_mapping || {}; return `<article class="datasource-list-item"><div class="datasource-list-main"><div class="datasource-badge">VL</div><div class="datasource-list-copy"><div class="datasource-list-head"><strong>${esc(item.name || "-")}</strong><div class="chip-row">${pill(item.enabled ? s("启用", "Enabled") : s("停用", "Disabled"), item.enabled ? "tone-ok" : "tone-warn")}${pill(item.supports_delete ? s("允许删除", "Delete On") : s("只读", "Read Only"), item.supports_delete ? "tone-warn" : "tone-soft")}</div></div><div class="datasource-list-meta"><span>VictoriaLogs</span><span class="datasource-sep">|</span><span class="mono">${esc(item.base_url || "-")}</span></div><div class="datasource-list-meta small"><span>${esc(s("服务字段", "Service"))}: ${esc(mapping.service_field || defaults.fieldMapping.service_field)}</span><span>${esc(s("Pod 字段", "Pod"))}: ${esc(mapping.pod_field || defaults.fieldMapping.pod_field)}</span><span>${esc(s("消息字段", "Message"))}: ${esc(mapping.message_field || defaults.fieldMapping.message_field)}</span><span>${esc(s("时间字段", "Time"))}: ${esc(mapping.time_field || defaults.fieldMapping.time_field)}</span><span>${esc(s("更新", "Updated"))}: ${esc(formatDate(item.updated_at))}</span></div></div></div><div class="datasource-list-actions"><button class="button button-small" type="button" data-action="explore-datasource" data-id="${esc(item.id)}">${esc(s("Explore", "Explore"))}</button><button class="button button-small" type="button" data-action="edit-datasource" data-id="${esc(item.id)}">${esc(s("编辑", "Edit"))}</button><button class="button button-small" type="button" data-action="test-datasource" data-id="${esc(item.id)}">${esc(s("测试", "Test"))}</button><button class="button button-small" type="button" data-action="discover-datasource" data-id="${esc(item.id)}">Discover</button><button class="button button-small" type="button" data-action="snapshot-datasource" data-id="${esc(item.id)}">Snapshot</button><button class="button button-small button-danger" type="button" data-action="delete-datasource" data-id="${esc(item.id)}">${esc(s("删除", "Delete"))}</button></div></article>`; }).join("")}</div>`;
 };
 
 clearSearchFilters = async function () {
@@ -1123,13 +1123,23 @@ seedSearchRange = function () {
   renderSearchTimePanel();
 };
 
+function formatSearchLocalDateValue(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}`;
+}
+
 applyQuickRange = function (name) {
   const end = new Date();
   const deltaMap = { "5m": 5 * 60 * 1000, "30m": 30 * 60 * 1000, "1h": 60 * 60 * 1000, "3h": 3 * 60 * 60 * 1000, "6h": 6 * 60 * 60 * 1000, "12h": 12 * 60 * 60 * 1000, "1d": 24 * 60 * 60 * 1000, "3d": 3 * 24 * 60 * 60 * 1000, "7d": 7 * 24 * 60 * 60 * 1000 };
   const start = new Date(end.getTime() - (deltaMap[name] || deltaMap["1h"]));
   state.search.timePreset = name;
-  byId("search-start").value = localDateValue(start);
-  byId("search-end").value = localDateValue(end);
+  byId("search-start").value = formatSearchLocalDateValue(start);
+  byId("search-end").value = formatSearchLocalDateValue(end);
   closeSearchMenus();
   renderSearchTimePanel();
 };
@@ -1161,9 +1171,9 @@ resetDatasourceForm = function (event, options) {
   byId("ds-header-account").value = "";
   byId("ds-header-project").value = "";
   byId("ds-header-auth").value = "";
-  byId("ds-field-service").value = "";
-  byId("ds-field-pod").value = "";
-  byId("ds-field-message").value = "";
+  byId("ds-field-service").value = defaults.fieldMapping.service_field;
+  byId("ds-field-pod").value = defaults.fieldMapping.pod_field;
+  byId("ds-field-message").value = defaults.fieldMapping.message_field;
   byId("ds-field-time").value = defaults.fieldMapping.time_field;
   applyDatasourceDefaults();
   renderDatasourceList();
@@ -1184,9 +1194,9 @@ fillDatasourceForm = function (item, options) {
   byId("ds-header-account").value = (item.headers && item.headers.AccountID) || "";
   byId("ds-header-project").value = (item.headers && item.headers.ProjectID) || "";
   byId("ds-header-auth").value = (item.headers && item.headers.Authorization) || "";
-  byId("ds-field-service").value = (item.field_mapping && item.field_mapping.service_field) || "";
-  byId("ds-field-pod").value = (item.field_mapping && item.field_mapping.pod_field) || "";
-  byId("ds-field-message").value = (item.field_mapping && item.field_mapping.message_field) || "";
+  byId("ds-field-service").value = (item.field_mapping && item.field_mapping.service_field) || defaults.fieldMapping.service_field;
+  byId("ds-field-pod").value = (item.field_mapping && item.field_mapping.pod_field) || defaults.fieldMapping.pod_field;
+  byId("ds-field-message").value = (item.field_mapping && item.field_mapping.message_field) || defaults.fieldMapping.message_field;
   byId("ds-field-time").value = (item.field_mapping && item.field_mapping.time_field) || defaults.fieldMapping.time_field;
   byId("ds-path-query").value = (item.query_paths && item.query_paths.query) || defaults.queryPaths.query;
   byId("ds-path-field-names").value = (item.query_paths && item.query_paths.field_names) || defaults.queryPaths.field_names;
@@ -1208,7 +1218,7 @@ renderDatasourceList = function () {
   const items = filteredDatasourceItems();
   if (!state.datasources.length) return void (node.innerHTML = empty(s("è¿˜æ²¡æœ‰é…ç½®ä»»ä½•æ•°æ®æºã€‚", "No datasource configured yet.")));
   if (!items.length) return void (node.innerHTML = empty(s("æ²¡æœ‰åŒ¹é…å½“å‰æœç´¢æ¡ä»¶çš„æ•°æ®æºã€‚", "No datasource matches the current search filter.")));
-  node.innerHTML = `<div class="datasource-list-grid">${items.map((item) => { const mapping = item.field_mapping || {}; const active = state.ui.datasourceSelectedId === item.id; return `<article class="datasource-list-item ${active ? "active" : ""}"><button class="datasource-list-main datasource-list-main-button" type="button" data-action="inspect-datasource" data-id="${esc(item.id)}"><div class="datasource-badge">VL</div><div class="datasource-list-copy"><div class="datasource-list-head"><strong>${esc(item.name || "-")}</strong><div class="chip-row">${pill(item.enabled ? s("å¯ç”¨", "Enabled") : s("åœç”¨", "Disabled"), item.enabled ? "tone-ok" : "tone-warn")}${pill(item.supports_delete ? s("å…è®¸åˆ é™¤", "Delete On") : s("åªè¯»", "Read Only"), item.supports_delete ? "tone-warn" : "tone-soft")}</div></div><div class="datasource-list-meta"><span>VictoriaLogs</span><span class="datasource-sep">|</span><span class="mono">${esc(item.base_url || "-")}</span></div><div class="datasource-list-meta small"><span>${esc(s("æœåŠ¡å­—æ®µ", "Service"))}: ${esc(mapping.service_field || "service")}</span><span>${esc(s("æ¶ˆæ¯å­—æ®µ", "Message"))}: ${esc(mapping.message_field || "_msg")}</span><span>${esc(s("æ—¶é—´å­—æ®µ", "Time"))}: ${esc(mapping.time_field || "_time")}</span><span>${esc(s("æ›´æ–°", "Updated"))}: ${esc(formatDate(item.updated_at))}</span></div></div></button><div class="datasource-list-actions"><button class="button button-small" type="button" data-action="explore-datasource" data-id="${esc(item.id)}">${esc(s("Explore", "Explore"))}</button><button class="button button-small" type="button" data-action="edit-datasource" data-id="${esc(item.id)}">${esc(s("ç¼–è¾‘", "Edit"))}</button><button class="button button-small" type="button" data-action="test-datasource" data-id="${esc(item.id)}">${esc(s("æµ‹è¯•", "Test"))}</button><button class="button button-small" type="button" data-action="discover-datasource" data-id="${esc(item.id)}">Discover</button><button class="button button-small" type="button" data-action="snapshot-datasource" data-id="${esc(item.id)}">Snapshot</button><button class="button button-small button-danger" type="button" data-action="delete-datasource" data-id="${esc(item.id)}">${esc(s("åˆ é™¤", "Delete"))}</button></div></article>`; }).join("")}</div>`;
+  node.innerHTML = `<div class="datasource-list-grid">${items.map((item) => { const mapping = item.field_mapping || {}; const active = state.ui.datasourceSelectedId === item.id; return `<article class="datasource-list-item ${active ? "active" : ""}"><button class="datasource-list-main datasource-list-main-button" type="button" data-action="inspect-datasource" data-id="${esc(item.id)}"><div class="datasource-badge">VL</div><div class="datasource-list-copy"><div class="datasource-list-head"><strong>${esc(item.name || "-")}</strong><div class="chip-row">${pill(item.enabled ? s("启用", "Enabled") : s("停用", "Disabled"), item.enabled ? "tone-ok" : "tone-warn")}${pill(item.supports_delete ? s("允许删除", "Delete On") : s("只读", "Read Only"), item.supports_delete ? "tone-warn" : "tone-soft")}</div></div><div class="datasource-list-meta"><span>VictoriaLogs</span><span class="datasource-sep">|</span><span class="mono">${esc(item.base_url || "-")}</span></div><div class="datasource-list-meta small"><span>${esc(s("服务字段", "Service"))}: ${esc(mapping.service_field || defaults.fieldMapping.service_field)}</span><span>${esc(s("Pod 字段", "Pod"))}: ${esc(mapping.pod_field || defaults.fieldMapping.pod_field)}</span><span>${esc(s("消息字段", "Message"))}: ${esc(mapping.message_field || defaults.fieldMapping.message_field)}</span><span>${esc(s("时间字段", "Time"))}: ${esc(mapping.time_field || defaults.fieldMapping.time_field)}</span><span>${esc(s("更新", "Updated"))}: ${esc(formatDate(item.updated_at))}</span></div></div></button><div class="datasource-list-actions"><button class="button button-small" type="button" data-action="explore-datasource" data-id="${esc(item.id)}">${esc(s("Explore", "Explore"))}</button><button class="button button-small" type="button" data-action="edit-datasource" data-id="${esc(item.id)}">${esc(s("编辑", "Edit"))}</button><button class="button button-small" type="button" data-action="test-datasource" data-id="${esc(item.id)}">${esc(s("测试", "Test"))}</button><button class="button button-small" type="button" data-action="discover-datasource" data-id="${esc(item.id)}">Discover</button><button class="button button-small" type="button" data-action="snapshot-datasource" data-id="${esc(item.id)}">Snapshot</button><button class="button button-small button-danger" type="button" data-action="delete-datasource" data-id="${esc(item.id)}">${esc(s("删除", "Delete"))}</button></div></article>`; }).join("")}</div>`;
 };
 
 submitDatasource = async function (event) {
@@ -1333,9 +1343,9 @@ resetDatasourceForm = function (event, options) {
   byId("ds-header-account").value = "";
   byId("ds-header-project").value = "";
   byId("ds-header-auth").value = "";
-  byId("ds-field-service").value = "";
-  byId("ds-field-pod").value = "";
-  byId("ds-field-message").value = "";
+  byId("ds-field-service").value = defaults.fieldMapping.service_field;
+  byId("ds-field-pod").value = defaults.fieldMapping.pod_field;
+  byId("ds-field-message").value = defaults.fieldMapping.message_field;
   byId("ds-field-time").value = defaults.fieldMapping.time_field;
   applyDatasourceDefaults();
   renderDatasourceList();
@@ -1356,9 +1366,9 @@ fillDatasourceForm = function (item, options) {
   byId("ds-header-account").value = (item.headers && item.headers.AccountID) || "";
   byId("ds-header-project").value = (item.headers && item.headers.ProjectID) || "";
   byId("ds-header-auth").value = (item.headers && item.headers.Authorization) || "";
-  byId("ds-field-service").value = (item.field_mapping && item.field_mapping.service_field) || "";
-  byId("ds-field-pod").value = (item.field_mapping && item.field_mapping.pod_field) || "";
-  byId("ds-field-message").value = (item.field_mapping && item.field_mapping.message_field) || "";
+  byId("ds-field-service").value = (item.field_mapping && item.field_mapping.service_field) || defaults.fieldMapping.service_field;
+  byId("ds-field-pod").value = (item.field_mapping && item.field_mapping.pod_field) || defaults.fieldMapping.pod_field;
+  byId("ds-field-message").value = (item.field_mapping && item.field_mapping.message_field) || defaults.fieldMapping.message_field;
   byId("ds-field-time").value = (item.field_mapping && item.field_mapping.time_field) || defaults.fieldMapping.time_field;
   byId("ds-path-query").value = (item.query_paths && item.query_paths.query) || defaults.queryPaths.query;
   byId("ds-path-field-names").value = (item.query_paths && item.query_paths.field_names) || defaults.queryPaths.field_names;
@@ -1380,7 +1390,7 @@ renderDatasourceList = function () {
   const items = filteredDatasourceItems();
   if (!state.datasources.length) return void (node.innerHTML = empty(s("还没有配置任何数据源。", "No datasource configured yet.")));
   if (!items.length) return void (node.innerHTML = empty(s("没有匹配当前搜索条件的数据源。", "No datasource matches the current search filter.")));
-  node.innerHTML = `<div class="datasource-list-grid">${items.map((item) => { const mapping = item.field_mapping || {}; const active = state.ui.datasourceSelectedId === item.id; return `<article class="datasource-list-item ${active ? "active" : ""}"><button class="datasource-list-main datasource-list-main-button" type="button" data-action="inspect-datasource" data-id="${esc(item.id)}"><div class="datasource-badge">VL</div><div class="datasource-list-copy"><div class="datasource-list-head"><strong>${esc(item.name || "-")}</strong><div class="chip-row">${pill(item.enabled ? s("启用", "Enabled") : s("停用", "Disabled"), item.enabled ? "tone-ok" : "tone-warn")}${pill(item.supports_delete ? s("允许删除", "Delete On") : s("只读", "Read Only"), item.supports_delete ? "tone-warn" : "tone-soft")}</div></div><div class="datasource-list-meta"><span>VictoriaLogs</span><span class="datasource-sep">|</span><span class="mono">${esc(item.base_url || "-")}</span></div><div class="datasource-list-meta small"><span>${esc(s("服务字段", "Service"))}: ${esc(mapping.service_field || "service")}</span><span>${esc(s("消息字段", "Message"))}: ${esc(mapping.message_field || "_msg")}</span><span>${esc(s("时间字段", "Time"))}: ${esc(mapping.time_field || "_time")}</span><span>${esc(s("更新", "Updated"))}: ${esc(formatDate(item.updated_at))}</span></div></div></button><div class="datasource-list-actions"><button class="button button-small" type="button" data-action="explore-datasource" data-id="${esc(item.id)}">${esc(s("Explore", "Explore"))}</button><button class="button button-small" type="button" data-action="edit-datasource" data-id="${esc(item.id)}">${esc(s("编辑", "Edit"))}</button><button class="button button-small" type="button" data-action="test-datasource" data-id="${esc(item.id)}">${esc(s("测试", "Test"))}</button><button class="button button-small" type="button" data-action="discover-datasource" data-id="${esc(item.id)}">Discover</button><button class="button button-small" type="button" data-action="snapshot-datasource" data-id="${esc(item.id)}">Snapshot</button><button class="button button-small button-danger" type="button" data-action="delete-datasource" data-id="${esc(item.id)}">${esc(s("删除", "Delete"))}</button></div></article>`; }).join("")}</div>`;
+  node.innerHTML = `<div class="datasource-list-grid">${items.map((item) => { const mapping = item.field_mapping || {}; const active = state.ui.datasourceSelectedId === item.id; return `<article class="datasource-list-item ${active ? "active" : ""}"><button class="datasource-list-main datasource-list-main-button" type="button" data-action="inspect-datasource" data-id="${esc(item.id)}"><div class="datasource-badge">VL</div><div class="datasource-list-copy"><div class="datasource-list-head"><strong>${esc(item.name || "-")}</strong><div class="chip-row">${pill(item.enabled ? s("启用", "Enabled") : s("停用", "Disabled"), item.enabled ? "tone-ok" : "tone-warn")}${pill(item.supports_delete ? s("允许删除", "Delete On") : s("只读", "Read Only"), item.supports_delete ? "tone-warn" : "tone-soft")}</div></div><div class="datasource-list-meta"><span>VictoriaLogs</span><span class="datasource-sep">|</span><span class="mono">${esc(item.base_url || "-")}</span></div><div class="datasource-list-meta small"><span>${esc(s("服务字段", "Service"))}: ${esc(mapping.service_field || defaults.fieldMapping.service_field)}</span><span>${esc(s("Pod 字段", "Pod"))}: ${esc(mapping.pod_field || defaults.fieldMapping.pod_field)}</span><span>${esc(s("消息字段", "Message"))}: ${esc(mapping.message_field || defaults.fieldMapping.message_field)}</span><span>${esc(s("时间字段", "Time"))}: ${esc(mapping.time_field || defaults.fieldMapping.time_field)}</span><span>${esc(s("更新", "Updated"))}: ${esc(formatDate(item.updated_at))}</span></div></div></button><div class="datasource-list-actions"><button class="button button-small" type="button" data-action="explore-datasource" data-id="${esc(item.id)}">${esc(s("Explore", "Explore"))}</button><button class="button button-small" type="button" data-action="edit-datasource" data-id="${esc(item.id)}">${esc(s("编辑", "Edit"))}</button><button class="button button-small" type="button" data-action="test-datasource" data-id="${esc(item.id)}">${esc(s("测试", "Test"))}</button><button class="button button-small" type="button" data-action="discover-datasource" data-id="${esc(item.id)}">Discover</button><button class="button button-small" type="button" data-action="snapshot-datasource" data-id="${esc(item.id)}">Snapshot</button><button class="button button-small button-danger" type="button" data-action="delete-datasource" data-id="${esc(item.id)}">${esc(s("删除", "Delete"))}</button></div></article>`; }).join("")}</div>`;
 };
 
 submitDatasource = async function (event) {
@@ -1588,7 +1598,7 @@ highlight = function (text) {
     state.search.pageSizeCustomRaw = String(state.search.pageSizeCustomRaw || state.search.pageSizeCustom || 1500);
     state.search.pageSizeMode = String(state.search.pageSizeMode || getActivePageSizeMode());
     state.search.pageSizeError = !!state.search.pageSizeError;
-    state.search.autoRefreshEnabled = state.search.autoRefreshEnabled !== false;
+    state.search.autoRefreshEnabled = state.search.autoRefreshEnabled === true;
     state.search.autoRefreshInterval = normalizeAutoRefreshInterval(state.search.autoRefreshInterval || "5s");
     state.search.columnWidths = safeObject(state.search.columnWidths);
     state.search.useCache = true;
@@ -2971,7 +2981,7 @@ highlight = function (text) {
           </label>
           <button class="button button-small button-muted" type="button" id="search-clear-filters">${esc(s("\u6e05\u7a7a", "Clear"))}</button>
           <button class="button button-small button-primary" type="submit" id="search-submit">${esc(s("\u6267\u884c\u67e5\u8be2", "Run Query"))}</button>
-          <button class="button button-small ${autoEnabled ? "button-primary" : "button-ghost"}" type="button" id="search-auto-toggle">Auto</button>
+          <button class="button button-small ${autoEnabled ? "button-primary" : "button-ghost"}" type="button" id="search-auto-toggle">${esc(s("auto查询", "Auto Query"))}</button>
           <label class="toolbar-inline-field toolbar-inline-field-auto">
             <span>${esc(s("\u5468\u671f", "Every"))}</span>
             <select id="search-auto-interval" ${autoEnabled ? "" : "disabled"}>
@@ -3032,16 +3042,16 @@ highlight = function (text) {
                     <div class="toolbar-menu-section">
                       <div class="menu-section-title">${esc(s("\u81ea\u5b9a\u4e49\u65f6\u95f4", "Custom Range"))}</div>
                       <div class="field-grid compact search-time-grid">
-                        <div class="field"><label for="search-start-custom">${esc(s("\u5f00\u59cb", "Start"))}</label><input id="search-start-custom" type="datetime-local" /></div>
-                        <div class="field"><label for="search-end-custom">${esc(s("\u7ed3\u675f", "End"))}</label><input id="search-end-custom" type="datetime-local" /></div>
+                        <div class="field"><label for="search-start-custom">${esc(s("\u5f00\u59cb", "Start"))}</label><input id="search-start-custom" type="datetime-local" step="1" /></div>
+                        <div class="field"><label for="search-end-custom">${esc(s("\u7ed3\u675f", "End"))}</label><input id="search-end-custom" type="datetime-local" step="1" /></div>
                       </div>
                       <div class="form-actions"><button class="button button-small button-primary" type="button" data-action="apply-custom-time">${esc(s("\u5e94\u7528\u81ea\u5b9a\u4e49\u65f6\u95f4", "Apply Custom Range"))}</button></div>
                     </div>
                   </div>
                 </div>
                 <div class="hidden-time-inputs">
-                  <input id="search-start" type="datetime-local" />
-                  <input id="search-end" type="datetime-local" />
+                  <input id="search-start" type="datetime-local" step="1" />
+                  <input id="search-end" type="datetime-local" step="1" />
                   <textarea id="search-keyword" rows="1"></textarea>
                 </div>
               </form>
@@ -3203,7 +3213,7 @@ highlight = function (text) {
     state.search.page = 1;
     state.search.pageSize = 500;
     state.search.pageSizeCustom = 1500;
-    state.search.autoRefreshEnabled = true;
+    state.search.autoRefreshEnabled = false;
     state.search.autoRefreshInterval = "5s";
     if (byId("search-page-size")) byId("search-page-size").value = "500";
     if (byId("search-page-size-custom")) byId("search-page-size-custom").value = "";

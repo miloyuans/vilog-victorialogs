@@ -68,7 +68,7 @@ func main() {
 	victoriaClient := victorialogs.New(cfg.VictoriaLogs)
 	cacheService := cache.New(store, cfg.Cache, logger.Named("cache"))
 	telegramService := telegram.New(cfg.Telegram)
-	datasourceService := datasource.New(store, victoriaClient, logger.Named("datasource"))
+	datasourceService := datasource.New(store, cacheService, victoriaClient, logger.Named("datasource"))
 	if err := datasourceService.SyncConfigured(startupCtx, cfg.Datasources); err != nil {
 		logger.Fatal("sync configured datasources", zap.Error(err))
 	}

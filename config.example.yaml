@@ -71,7 +71,7 @@ datasources:
       Authorization: ""
     field_mapping:
       service_field: app
-      pod_field: pod
+      pod_field: kubernetes.pod.name
       message_field: _msg
       time_field: _time
     query_paths:
