@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"vilog-victorialogs/internal/model"
 )
 
 type Config struct {
@@ -18,6 +20,7 @@ type Config struct {
 	Mongo        MongoConfig        `yaml:"mongo"`
 	Logging      LoggingConfig      `yaml:"logging"`
 	Cache        CacheConfig        `yaml:"cache"`
+	Datasources  []ConfiguredDatasource `yaml:"datasources"`
 	VictoriaLogs VictoriaLogsConfig `yaml:"victorialogs"`
 	Security     SecurityConfig     `yaml:"security"`
 	Telegram     TelegramConfig     `yaml:"telegram"`
@@ -60,10 +63,24 @@ type CacheConfig struct {
 	LocalLogDir             string        `yaml:"local_log_dir"`
 	LocalLogHotDays         int           `yaml:"local_log_hot_days"`
 	LocalLogRefreshInterval time.Duration `yaml:"local_log_refresh_interval"`
+	LocalLogDailyCheckAt    string        `yaml:"local_log_daily_check_at"`
+	LocalLogCheckConcurrency int          `yaml:"local_log_check_concurrency"`
 	LocalLogHistoryTTL      time.Duration `yaml:"local_log_history_ttl"`
 	SourceChunkSize         int           `yaml:"source_chunk_size"`
 	SourceRequestLimit      int           `yaml:"source_request_limit"`
 	MaxQueryWindow          int           `yaml:"max_query_window"`
+}
+
+type ConfiguredDatasource struct {
+	ID             string                     `yaml:"id"`
+	Name           string                     `yaml:"name"`
+	BaseURL        string                     `yaml:"base_url"`
+	Enabled        bool                       `yaml:"enabled"`
+	TimeoutSeconds int                        `yaml:"timeout_seconds"`
+	Headers        model.DatasourceHeaders    `yaml:"headers"`
+	QueryPaths     model.DatasourceQueryPaths `yaml:"query_paths"`
+	FieldMapping   model.DatasourceFieldMapping `yaml:"field_mapping"`
+	SupportsDelete bool                       `yaml:"supports_delete"`
 }
 
 type VictoriaLogsConfig struct {
@@ -134,6 +151,8 @@ func Default() Config {
 			LocalLogDir:             "./data/log-cache",
 			LocalLogHotDays:         2,
 			LocalLogRefreshInterval: 10 * time.Second,
+			LocalLogDailyCheckAt:    "00:05",
+			LocalLogCheckConcurrency: 4,
 			LocalLogHistoryTTL:      1 * time.Hour,
 			SourceChunkSize:         1000,
 			SourceRequestLimit:      10000,
@@ -259,6 +278,14 @@ func (c Config) Validate() error {
 	if c.Cache.LocalLogRefreshInterval <= 0 {
 		return fmt.Errorf("cache.local_log_refresh_interval must be positive")
 	}
+	if strings.TrimSpace(c.Cache.LocalLogDailyCheckAt) != "" {
+		if _, err := time.Parse("15:04", strings.TrimSpace(c.Cache.LocalLogDailyCheckAt)); err != nil {
+			return fmt.Errorf("cache.local_log_daily_check_at must use HH:MM format")
+		}
+	}
+	if c.Cache.LocalLogCheckConcurrency <= 0 {
+		return fmt.Errorf("cache.local_log_check_concurrency must be positive")
+	}
 	if c.Cache.LocalLogHistoryTTL <= 0 {
 		return fmt.Errorf("cache.local_log_history_ttl must be positive")
 	}
@@ -351,6 +378,10 @@ func applyEnvOverrides(cfg *Config) error {
 		return err
 	}
 	if err := setDuration("VILOG_CACHE_LOCAL_LOG_REFRESH_INTERVAL", &cfg.Cache.LocalLogRefreshInterval); err != nil {
+		return err
+	}
+	setString("VILOG_CACHE_LOCAL_LOG_DAILY_CHECK_AT", &cfg.Cache.LocalLogDailyCheckAt)
+	if err := setInt("VILOG_CACHE_LOCAL_LOG_CHECK_CONCURRENCY", &cfg.Cache.LocalLogCheckConcurrency); err != nil {
 		return err
 	}
 	if err := setDuration("VILOG_CACHE_LOCAL_LOG_HISTORY_TTL", &cfg.Cache.LocalLogHistoryTTL); err != nil {

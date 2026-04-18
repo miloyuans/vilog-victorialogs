@@ -1432,6 +1432,65 @@ highlight = function (text) {
   const BACKEND_SEARCH_PAGE_SIZE = 1000;
   const SEARCH_EXPORT_LIMIT = 100000;
   const MAX_UI_PAGE_SIZE = 10000;
+  const AUTO_REFRESH_PRESETS = ["5s", "10s", "15s", "20s", "30s", "1m", "5m", "10m"];
+  const SEARCH_COLUMN_DEFAULTS = { timestamp: 120, datasource: 92, pod: 148, level: 78, message: 0, action: 70 };
+  const SEARCH_COLUMN_MIN = { timestamp: 96, datasource: 80, pod: 118, level: 70, message: 320, action: 64 };
+  let autoRefreshTimer = null;
+  let searchColumnResizeState = null;
+
+  function normalizeAutoRefreshInterval(value) {
+    const candidate = String(value || "").trim().toLowerCase();
+    return AUTO_REFRESH_PRESETS.indexOf(candidate) >= 0 ? candidate : "5s";
+  }
+
+  function autoRefreshIntervalMs(value) {
+    const normalized = normalizeAutoRefreshInterval(value);
+    if (normalized.endsWith("m")) return Number(normalized.slice(0, -1)) * 60 * 1000;
+    return Number(normalized.slice(0, -1)) * 1000;
+  }
+
+  function clearSearchAutoRefresh() {
+    if (autoRefreshTimer) {
+      clearTimeout(autoRefreshTimer);
+      autoRefreshTimer = null;
+    }
+  }
+
+  function updateSearchColumnWidth(key, width) {
+    const safeWidth = Math.max(SEARCH_COLUMN_MIN[key] || 80, Math.floor(Number(width || 0)));
+    state.search.columnWidths = safeObject(state.search.columnWidths);
+    state.search.columnWidths[key] = safeWidth;
+    document.querySelectorAll(`col[data-col-key="${key}"]`).forEach((node) => {
+      node.style.width = `${safeWidth}px`;
+    });
+  }
+
+  function ensureSearchColumnResizeBindings() {
+    if (window.__vilogSearchColumnResizeBound) return;
+    window.__vilogSearchColumnResizeBound = true;
+    document.addEventListener("pointerdown", (event) => {
+      const handle = event.target.closest("[data-col-resizer]");
+      if (!handle) return;
+      const key = handle.getAttribute("data-col-resizer");
+      if (!key) return;
+      event.preventDefault();
+      searchColumnResizeState = {
+        key,
+        startX: event.clientX,
+        startWidth: Number((state.search.columnWidths && state.search.columnWidths[key]) || SEARCH_COLUMN_DEFAULTS[key] || 120),
+      };
+      document.body.classList.add("search-col-resizing");
+    });
+    window.addEventListener("pointermove", (event) => {
+      if (!searchColumnResizeState) return;
+      const nextWidth = searchColumnResizeState.startWidth + (event.clientX - searchColumnResizeState.startX);
+      updateSearchColumnWidth(searchColumnResizeState.key, nextWidth);
+    });
+    window.addEventListener("pointerup", () => {
+      searchColumnResizeState = null;
+      document.body.classList.remove("search-col-resizing");
+    });
+  }
 
   function getResolvedSearchPageSize(value) {
     const candidate = Number(value || state.search && state.search.pageSizeCustom || state.search && state.search.pageSize || 500);
@@ -1529,6 +1588,19 @@ highlight = function (text) {
     state.search.pageSizeCustomRaw = String(state.search.pageSizeCustomRaw || state.search.pageSizeCustom || 1500);
     state.search.pageSizeMode = String(state.search.pageSizeMode || getActivePageSizeMode());
     state.search.pageSizeError = !!state.search.pageSizeError;
+    state.search.autoRefreshEnabled = state.search.autoRefreshEnabled !== false;
+    state.search.autoRefreshInterval = normalizeAutoRefreshInterval(state.search.autoRefreshInterval || "5s");
+    state.search.columnWidths = safeObject(state.search.columnWidths);
+    state.search.useCache = true;
+    state.search.page = 1;
+    state.search.queryLayers = safeArray(state.search.queryLayers).length
+      ? safeArray(state.search.queryLayers).map((layer) => ({
+          id: layer && layer.id ? String(layer.id) : nextQueryLayerID(),
+          mode: "keyword",
+          operator: layer && layer.operator === "or" ? "or" : "and",
+          value: String(layer && layer.value || ""),
+        }))
+      : [createQueryLayer("keyword", "")];
     if (state.search.pageSizeMode !== "custom" && PAGE_SIZE_PRESETS.indexOf(Number(state.search.pageSizeMode)) >= 0) {
       state.search.pageSize = getResolvedSearchPageSize(state.search.pageSizeMode);
     }
@@ -2524,6 +2596,8 @@ highlight = function (text) {
     renderSearchLoadingState();
     syncSearchMenuState();
     renderSearchFloatingExportDock();
+    ensureSearchColumnResizeBindings();
+    syncSearchAutoRefresh();
   };
 
   renderSearchContext = function () {
@@ -2587,7 +2661,7 @@ highlight = function (text) {
             ${index > 0 ? `<button class="icon-button" type="button" data-action="remove-query-layer" data-layer-id="${esc(layer.id)}">x</button>` : ""}
           </div>
         </div>
-        <textarea class="query-layer-input" data-query-layer-input="${esc(layer.id)}" rows="${index === 0 ? "3" : "2"}" placeholder="${esc(getLayerPlaceholder(layer, index))}">${esc(layer.value || "")}</textarea>
+        <textarea class="query-layer-input" data-query-layer-input="${esc(layer.id)}" rows="${index === 0 ? "2" : "2"}" placeholder="${esc(getLayerPlaceholder(layer, index))}">${esc(layer.value || "")}</textarea>
         <div class="query-layer-foot">
           <span>${esc(index === 0 ? s("Enter \u76f4\u63a5\u67e5\u8be2\uff0cShift+Enter \u6362\u884c\u3002", "Press Enter to run and Shift+Enter for a line break.") : s("\u8fd9\u4e00\u5c42\u4ec5\u4f5c\u7528\u4e8e\u4e0a\u4e00\u5c42\u7ed3\u679c\uff0c\u4e0d\u4f1a\u91cd\u65b0\u5411\u540e\u7aef\u53d1\u8d77\u8bf7\u6c42\u3002", "This layer filters the previous result set locally without sending a new backend request."))}</span>
         </div>
@@ -2598,16 +2672,18 @@ highlight = function (text) {
   buildCurrentSearchPayload = function (page, pageSize) {
     normalizeFrontendCollections();
     syncHiddenQueryInput();
+    const primaryLayer = safeArray(state.search.queryLayers)[0] || createQueryLayer("keyword", "");
     return {
-      keyword: "",
+      keyword: String(primaryLayer.value || "").trim(),
+      keyword_mode: primaryLayer.operator === "or" ? "or" : "and",
       start: localToRFC3339((byId("search-start") && byId("search-start").value) || ""),
       end: localToRFC3339((byId("search-end") && byId("search-end").value) || ""),
       datasource_ids: safeArray(state.search.selectedDatasourceIDs).slice(),
       service_names: safeArray(state.search.serviceNames).slice(),
-      tags: {},
+      tags: normalizeFilters(state.search.activeFilters),
       page: 1,
       page_size: getResolvedSearchPageSize(pageSize || state.search.pageSize || 500),
-      use_cache: state.search.useCache !== false,
+      use_cache: true,
     };
   };
 
@@ -2728,6 +2804,31 @@ highlight = function (text) {
     };
   }
 
+  function syncSearchAutoRefresh() {
+    clearSearchAutoRefresh();
+    normalizeFrontendCollections();
+    if (state.activePanel !== "search") return;
+    if (state.search.autoRefreshEnabled === false) return;
+    autoRefreshTimer = setTimeout(async () => {
+      if (state.activePanel !== "search") {
+        syncSearchAutoRefresh();
+        return;
+      }
+      if (state.ui.searchLoading) {
+        syncSearchAutoRefresh();
+        return;
+      }
+      if (safeArray(state.search.selectedDatasourceIDs).length) {
+        await runSearchWindow(1, {
+          silentSuccess: true,
+          background: true,
+          preserveSelection: true,
+        });
+      }
+      syncSearchAutoRefresh();
+    }, autoRefreshIntervalMs(state.search.autoRefreshInterval));
+  }
+
   async function runSearchWindow(pageOverride, options) {
     normalizeFrontendCollections();
     syncHiddenQueryInput();
@@ -2735,14 +2836,18 @@ highlight = function (text) {
       applyQuickRange(state.search.timePreset || "1h");
     }
     if (!safeArray(state.search.selectedDatasourceIDs).length) {
-      toast(s("\u8bf7\u5148\u9009\u62e9\u81f3\u5c11\u4e00\u4e2a\u67e5\u8be2\u6570\u636e\u6e90\u3002", "Select at least one search datasource."), "error");
+      if (!(options && options.background)) {
+        toast(s("\u8bf7\u5148\u9009\u62e9\u81f3\u5c11\u4e00\u4e2a\u67e5\u8be2\u6570\u636e\u6e90\u3002", "Select at least one search datasource."), "error");
+      }
       return false;
     }
     const pageInfo = getSearchPageSizeFromState();
     if (!pageInfo.valid) {
       state.search.pageSizeError = true;
       renderSearchToolbar();
-      toast(s("\u81ea\u5b9a\u4e49\u6761\u6570\u6700\u5927\u4e0d\u80fd\u8d85\u8fc7 10000\u3002", "Custom rows cannot exceed 10000."), "error");
+      if (!(options && options.background)) {
+        toast(s("\u81ea\u5b9a\u4e49\u6761\u6570\u6700\u5927\u4e0d\u80fd\u8d85\u8fc7 10000\u3002", "Custom rows cannot exceed 10000."), "error");
+      }
       return false;
     }
     const page = 1;
@@ -2751,8 +2856,11 @@ highlight = function (text) {
     state.search.pageSizeCustom = pageInfo.mode === "custom" ? pageInfo.value : state.search.pageSizeCustom;
     state.search.pageSizeCustomRaw = pageInfo.raw;
     state.search.pageSizeMode = pageInfo.mode;
-    state.search.useCache = byId("search-use-cache") ? byId("search-use-cache").checked : true;
-    setSearchLoading(true);
+    state.search.useCache = true;
+    const previousSelectedKey = state.search.selectedResultKey;
+    if (!(options && options.background)) {
+      setSearchLoading(true);
+    }
     try {
       const response = safeObject(await requestSearchWindow(page, pageInfo.value));
       response.results = safeArray(response.results);
@@ -2763,7 +2871,11 @@ highlight = function (text) {
       state.search.exportStatusTone = "idle";
       state.search.exportStatusText = s("\u5c31\u7eea", "Ready");
       const results = getVisibleResults();
-      state.search.selectedResultKey = results[0] ? String(results[0]._index) : "";
+      if (options && options.preserveSelection && previousSelectedKey && results.some((item) => String(item._index) === previousSelectedKey)) {
+        state.search.selectedResultKey = previousSelectedKey;
+      } else {
+        state.search.selectedResultKey = results[0] ? String(results[0]._index) : "";
+      }
       state.ui.detailOpen = false;
       renderSearchControls();
       renderSearchResults();
@@ -2772,10 +2884,14 @@ highlight = function (text) {
       }
       return true;
     } catch (error) {
-      toast(error.message || String(error), "error");
+      if (!(options && options.background)) {
+        toast(error.message || String(error), "error");
+      }
       return false;
     } finally {
-      setSearchLoading(false);
+      if (!(options && options.background)) {
+        setSearchLoading(false);
+      }
     }
   }
 
@@ -2818,6 +2934,8 @@ highlight = function (text) {
         : "tone-soft";
     const exportStatusText = state.search.exportStatusText || s("\u5c31\u7eea", "Ready");
     const pageInfo = getSearchPageSizeFromState();
+    const autoEnabled = state.search.autoRefreshEnabled !== false;
+    const autoInterval = normalizeAutoRefreshInterval(state.search.autoRefreshInterval);
     const target = byId("search-toolbar-controls");
     if (!target) return;
     syncHiddenQueryInput();
@@ -2851,13 +2969,15 @@ highlight = function (text) {
             </select>
             <input id="search-page-size-custom" class="${pageInfo.mode === "custom" ? "" : "is-hidden"} ${!pageInfo.valid ? "field-error" : ""}" type="number" min="50" max="${MAX_UI_PAGE_SIZE}" step="50" value="${pageInfo.mode === "custom" ? esc(String(pageInfo.raw)) : ""}" placeholder="Custom" />
           </label>
-          <label class="toolbar-inline-check">
-            <input id="search-use-cache" type="checkbox" ${state.search.useCache === false ? "" : "checked"} />
-            ${esc(s("\u7f13\u5b58", "Cache"))}
-          </label>
-          <button class="button button-small button-ghost" type="button" id="search-refresh-catalogs">${esc(s("\u5237\u65b0", "Refresh"))}</button>
           <button class="button button-small button-muted" type="button" id="search-clear-filters">${esc(s("\u6e05\u7a7a", "Clear"))}</button>
           <button class="button button-small button-primary" type="submit" id="search-submit">${esc(s("\u6267\u884c\u67e5\u8be2", "Run Query"))}</button>
+          <button class="button button-small ${autoEnabled ? "button-primary" : "button-ghost"}" type="button" id="search-auto-toggle">Auto</button>
+          <label class="toolbar-inline-field toolbar-inline-field-auto">
+            <span>${esc(s("\u5468\u671f", "Every"))}</span>
+            <select id="search-auto-interval" ${autoEnabled ? "" : "disabled"}>
+              ${AUTO_REFRESH_PRESETS.map((item) => `<option value="${esc(item)}" ${autoInterval === item ? "selected" : ""}>${esc(item)}</option>`).join("")}
+            </select>
+          </label>
         </div>
       </div>
       <div class="search-toolbar-row search-toolbar-row-query">
@@ -2865,7 +2985,7 @@ highlight = function (text) {
           <div class="query-composer-head">
             <div class="query-composer-copy">
               <strong>${esc(s("\u5173\u952e\u5b57\u9012\u5f52\u8fc7\u6ee4\u5668", "Keyword Recursive Filters"))}</strong>
-              <span class="query-composer-hint">${esc(s("\u5148\u786e\u5b9a\u6570\u636e\u6e90\u548c\u670d\u52a1\uff0c\u540e\u7aef\u5148\u6309\u65f6\u95f4\u8303\u56f4\u62c9\u53d6\u6700\u65b0\u65e5\u5fd7\uff0c\u518d\u5728\u672c\u5730\u6309\u5173\u952e\u5b57\u9012\u5f52\u8fc7\u6ee4\u3002", "Pick datasources and services first. The backend pulls the latest logs for the time window, then keyword layers keep filtering locally."))}</span>
+              <span class="query-composer-hint">${esc(s("\u4e3b\u67e5\u8be2\u5148\u5bf9\u672c\u5730\u65e5\u5fd7\u7f13\u5b58\u505a\u5173\u952e\u5b57\u8fc7\u6ee4\uff0c\u540e\u7eed\u5c42\u518d\u4ece\u4e3b\u67e5\u8be2\u7ed3\u679c\u91cc\u9012\u5f52\u7f29\u5c0f\u8303\u56f4\u3002", "The primary query filters the local log cache first, then each next layer recursively narrows the previous result set."))}</span>
             </div>
             <div class="query-composer-toolbar">
               <div id="search-level-filters" class="inline-dock-block"></div>
@@ -2975,7 +3095,13 @@ highlight = function (text) {
     } else if (state.search.view === "json") {
       content = `<div class="raw-view compact-raw-view"><pre>${esc(JSON.stringify(results.map(stripRuntimeFields), null, 2))}</pre></div>`;
     } else if (state.search.view === "table") {
-      content = `<div class="table-wrap table-wrap-compact"><table class="log-results-table"><thead><tr><th>${esc(s("\u65f6\u95f4", "Timestamp"))}</th><th>${esc(s("\u6570\u636e\u6e90", "Datasource"))}</th><th>${esc(s("Pod", "Pod"))}</th><th>${esc(s("\u7ea7\u522b", "Level"))}</th><th>${esc(s("\u65e5\u5fd7\u5185\u5bb9", "Message"))}</th><th>${esc(s("\u64cd\u4f5c", "Action"))}</th></tr></thead><tbody>${results.map((item) => { const pod = item.pod || item.service || "-"; return `<tr class="${String(item._index) === state.search.selectedResultKey ? "active" : ""}"><td>${esc(formatDate(item.timestamp))}</td><td>${esc(item.datasource || "-")}</td><td><div class="log-cell-pod" title="${esc(pod)}">${esc(pod)}</div></td><td>${pill(item._level.toUpperCase(), levelTone(item._level))}</td><td><div class="log-cell-message ${state.search.wrap ? "clamped" : ""}" title="${esc(item.message || "")}">${highlight(item.message || "", "")}</div></td><td><button class="button button-small" type="button" data-select-result="${esc(String(item._index))}">${esc(s("\u8be6\u60c5", "Detail"))}</button></td></tr>`; }).join("")}</tbody></table></div>`;
+      const widths = safeObject(state.search.columnWidths);
+      const timestampWidth = Number(widths.timestamp || SEARCH_COLUMN_DEFAULTS.timestamp);
+      const datasourceWidth = Number(widths.datasource || SEARCH_COLUMN_DEFAULTS.datasource);
+      const podWidth = Number(widths.pod || SEARCH_COLUMN_DEFAULTS.pod);
+      const levelWidth = Number(widths.level || SEARCH_COLUMN_DEFAULTS.level);
+      const messageWidth = Number(widths.message || SEARCH_COLUMN_DEFAULTS.message || 0);
+      content = `<div class="table-wrap table-wrap-compact"><table class="log-results-table log-results-table-resizable"><colgroup><col data-col-key="timestamp" style="width:${timestampWidth}px" /><col data-col-key="datasource" style="width:${datasourceWidth}px" /><col data-col-key="pod" style="width:${podWidth}px" /><col data-col-key="level" style="width:${levelWidth}px" /><col data-col-key="message" ${messageWidth > 0 ? `style="width:${messageWidth}px"` : ""} /><col data-col-key="action" style="width:${SEARCH_COLUMN_DEFAULTS.action}px" /></colgroup><thead><tr><th><div class="table-head-cell"><span>${esc(s("\u65f6\u95f4", "Timestamp"))}</span><span class="table-col-resizer" data-col-resizer="timestamp"></span></div></th><th><div class="table-head-cell"><span>${esc(s("\u6570\u636e\u6e90", "Datasource"))}</span><span class="table-col-resizer" data-col-resizer="datasource"></span></div></th><th><div class="table-head-cell"><span>${esc(s("Pod", "Pod"))}</span><span class="table-col-resizer" data-col-resizer="pod"></span></div></th><th><div class="table-head-cell"><span>${esc(s("\u7ea7\u522b", "Level"))}</span><span class="table-col-resizer" data-col-resizer="level"></span></div></th><th><div class="table-head-cell"><span>${esc(s("\u65e5\u5fd7\u5185\u5bb9", "Message"))}</span><span class="table-col-resizer" data-col-resizer="message"></span></div></th><th>${esc(s("\u64cd\u4f5c", "Action"))}</th></tr></thead><tbody>${results.map((item) => { const pod = item.pod || item.service || "-"; return `<tr class="${String(item._index) === state.search.selectedResultKey ? "active" : ""}"><td>${esc(formatDate(item.timestamp))}</td><td>${esc(item.datasource || "-")}</td><td><div class="log-cell-pod" title="${esc(pod)}">${esc(pod)}</div></td><td>${pill(item._level.toUpperCase(), levelTone(item._level))}</td><td><div class="log-cell-message log-cell-message-wrap">${highlight(item.message || "", "")}</div></td><td><button class="button button-small" type="button" data-select-result="${esc(String(item._index))}">${esc(s("\u8be6\u60c5", "Detail"))}</button></td></tr>`; }).join("")}</tbody></table></div>`;
     } else {
       content = `<div class="logs-list compact-logs-list">${results.map(renderLogEntry).join("")}</div>`;
     }
@@ -3026,15 +3152,16 @@ highlight = function (text) {
       }
       return;
     }
+    if (target.id === "search-auto-interval") {
+      state.search.autoRefreshInterval = normalizeAutoRefreshInterval(target.value || "5s");
+      renderSearchToolbar();
+      syncSearchAutoRefresh();
+      return;
+    }
     if (target.id === "search-page-size-custom") {
       if (state.search.pageSizeMode === "custom" && !state.search.pageSizeError) {
         await runSearchWindow(1, { silentSuccess: true });
       }
-      return;
-    }
-    if (target.id === "search-use-cache") {
-      __baseHandleChange(event);
-      await runSearchWindow(1, { silentSuccess: true });
       return;
     }
     return __baseHandleChange(event);
@@ -3047,11 +3174,13 @@ highlight = function (text) {
       if (action === "export-search-all") return exportCurrentSearchResults();
       if (button.getAttribute("data-query-layer-mode") === "logsql") return;
     }
+    if (button && button.id === "search-auto-toggle") {
+      state.search.autoRefreshEnabled = !(state.search.autoRefreshEnabled !== false);
+      renderSearchToolbar();
+      syncSearchAutoRefresh();
+      return;
+    }
     const shouldAutoReload = !!(button && (
-      button.hasAttribute("data-search-datasource-id") ||
-      button.hasAttribute("data-search-datasource-all") ||
-      button.hasAttribute("data-search-service-name") ||
-      button.hasAttribute("data-search-service-all") ||
       button.hasAttribute("data-toggle-tag-value-field") ||
       button.hasAttribute("data-remove-tag") ||
       button.getAttribute("data-range") != null ||
@@ -3074,6 +3203,8 @@ highlight = function (text) {
     state.search.page = 1;
     state.search.pageSize = 500;
     state.search.pageSizeCustom = 1500;
+    state.search.autoRefreshEnabled = true;
+    state.search.autoRefreshInterval = "5s";
     if (byId("search-page-size")) byId("search-page-size").value = "500";
     if (byId("search-page-size-custom")) byId("search-page-size-custom").value = "";
     state.search.selectedDatasourceIDs = [];
@@ -3089,6 +3220,7 @@ highlight = function (text) {
     if (state.search.catalogDatasourceID) await loadSearchCatalogs();
     else renderSearchControls();
     renderSearchResults();
+    syncSearchAutoRefresh();
   };
 
   applyClientSideResultFilters = function (items) {
@@ -3143,7 +3275,7 @@ highlight = function (text) {
 
   renderLogEntry = function (item) {
     const pod = item.pod || item.service || "-";
-    return `<div class="log-entry compact-log-entry ${String(item._index) === state.search.selectedResultKey ? "active" : ""}"><div class="log-meta">${pill(formatDate(item.timestamp), "tone-soft")}${pill(item.datasource || "-", "tone-neutral")}<span class="log-meta-pod" title="${esc(pod)}">${esc(pod)}</span>${pill(item._level.toUpperCase(), levelTone(item._level))}</div><p class="log-message compact-log-message ${state.search.wrap ? "clamped" : ""}" title="${esc(item.message || "")}">${highlight(item.message || "", "")}</p><div class="log-labels">${renderLabelChips(item.labels)}</div><div class="form-actions"><button class="button button-small" type="button" data-select-result="${esc(String(item._index))}">${esc(s("\u8be6\u60c5", "Detail"))}</button></div></div>`;
+    return `<div class="log-entry compact-log-entry ${String(item._index) === state.search.selectedResultKey ? "active" : ""}"><div class="log-meta">${pill(formatDate(item.timestamp), "tone-soft")}${pill(item.datasource || "-", "tone-neutral")}<span class="log-meta-pod" title="${esc(pod)}">${esc(pod)}</span>${pill(item._level.toUpperCase(), levelTone(item._level))}</div><p class="log-message compact-log-message log-message-wrap">${highlight(item.message || "", "")}</p><div class="log-labels">${renderLabelChips(item.labels)}</div><div class="form-actions"><button class="button button-small" type="button" data-select-result="${esc(String(item._index))}">${esc(s("\u8be6\u60c5", "Detail"))}</button></div></div>`;
   };
 })();
 

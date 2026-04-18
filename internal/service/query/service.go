@@ -172,22 +172,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 		zap.Int("after", len(allResults)),
 	)
 
-	sort.Slice(allResults, func(i, j int) bool {
-		left := parseTimestamp(allResults[i].Timestamp)
-		right := parseTimestamp(allResults[j].Timestamp)
-		if left.Equal(right) {
-			leftMessage := strings.ToLower(allResults[i].Message)
-			rightMessage := strings.ToLower(allResults[j].Message)
-			if leftMessage == rightMessage {
-				if allResults[i].Datasource == allResults[j].Datasource {
-					return allResults[i].Service < allResults[j].Service
-				}
-				return allResults[i].Datasource < allResults[j].Datasource
-			}
-			return leftMessage < rightMessage
-		}
-		return left.After(right)
-	})
+	sortSearchResults(allResults)
 
 	totalMatches := len(allResults)
 	if len(allResults) > pageSize {
@@ -431,7 +416,7 @@ func (s *Service) buildPartitionFromSource(
 	}
 	partition := cache.LocalLogPartition{
 		Meta: s.cache.PrepareLogPartitionMeta(day, serviceName, datasource, len(rows), now, partial),
-		Rows: dedupeRows(rows),
+		Rows: normalizePartitionRows(rows),
 	}
 	if err := s.cache.StoreLogPartition(partition); err != nil {
 		s.logger.Warn("store log partition failed",
@@ -476,7 +461,7 @@ func (s *Service) refreshPartitionIncremental(
 	if err != nil {
 		return cache.LocalLogPartition{}, true, err
 	}
-	partition.Rows = dedupeRows(append(partition.Rows, rows...))
+	partition.Rows = normalizePartitionRows(append(partition.Rows, rows...))
 	partition.Meta = s.cache.PrepareLogPartitionMeta(day, serviceName, datasource, len(partition.Rows), now, partition.Meta.Partial || partial)
 	if err := s.cache.StoreLogPartition(partition); err != nil {
 		s.logger.Warn("store refreshed hot partition failed",
@@ -1049,6 +1034,12 @@ func filterRowsByWindow(rows []model.SearchResult, start, end time.Time) []model
 	return filtered
 }
 
+func normalizePartitionRows(rows []model.SearchResult) []model.SearchResult {
+	filtered := dedupeRows(rows)
+	sortSearchResults(filtered)
+	return filtered
+}
+
 func dedupeRows(rows []model.SearchResult) []model.SearchResult {
 	seen := make(map[string]struct{}, len(rows))
 	filtered := make([]model.SearchResult, 0, len(rows))
@@ -1061,6 +1052,25 @@ func dedupeRows(rows []model.SearchResult) []model.SearchResult {
 		filtered = append(filtered, row)
 	}
 	return filtered
+}
+
+func sortSearchResults(rows []model.SearchResult) {
+	sort.Slice(rows, func(i, j int) bool {
+		left := parseTimestamp(rows[i].Timestamp)
+		right := parseTimestamp(rows[j].Timestamp)
+		if left.Equal(right) {
+			leftMessage := strings.ToLower(rows[i].Message)
+			rightMessage := strings.ToLower(rows[j].Message)
+			if leftMessage == rightMessage {
+				if rows[i].Datasource == rows[j].Datasource {
+					return rows[i].Service < rows[j].Service
+				}
+				return rows[i].Datasource < rows[j].Datasource
+			}
+			return leftMessage < rightMessage
+		}
+		return left.After(right)
+	})
 }
 
 func applySearchFilters(rows []model.SearchResult, req model.SearchRequest) []model.SearchResult {

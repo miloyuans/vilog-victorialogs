@@ -2,12 +2,17 @@ package datasource
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
+	"go.uber.org/zap"
+
 	"vilog-victorialogs/internal/client/victorialogs"
+	"vilog-victorialogs/internal/config"
 	"vilog-victorialogs/internal/model"
 	mongostore "vilog-victorialogs/internal/store/mongo"
 	"vilog-victorialogs/internal/util"
@@ -16,12 +21,17 @@ import (
 type Service struct {
 	store  *mongostore.Store
 	client *victorialogs.Client
+	logger *zap.Logger
 }
 
-func New(store *mongostore.Store, client *victorialogs.Client) *Service {
+func New(store *mongostore.Store, client *victorialogs.Client, logger *zap.Logger) *Service {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	return &Service{
 		store:  store,
 		client: client,
+		logger: logger,
 	}
 }
 
@@ -82,6 +92,60 @@ func (s *Service) Delete(ctx context.Context, id, actor string) error {
 		return err
 	}
 	_ = s.audit(ctx, "datasource", id, "delete", actor, map[string]any{"name": existing.Name})
+	return nil
+}
+
+func (s *Service) SyncConfigured(ctx context.Context, items []config.ConfiguredDatasource) error {
+	for _, item := range items {
+		id := configuredDatasourceID(item)
+		req := model.DatasourceUpsertRequest{
+			Name:           item.Name,
+			BaseURL:        item.BaseURL,
+			Enabled:        boolPtr(item.Enabled),
+			TimeoutSeconds: item.TimeoutSeconds,
+			Headers:        item.Headers,
+			QueryPaths:     item.QueryPaths,
+			FieldMapping:   item.FieldMapping,
+			SupportsDelete: boolPtr(item.SupportsDelete),
+		}
+
+		existing, err := s.store.GetDatasource(ctx, id)
+		if err != nil && !errors.Is(err, mongostore.ErrNotFound) {
+			return fmt.Errorf("load configured datasource %s: %w", id, err)
+		}
+
+		createdAt := existing.CreatedAt
+		datasource, err := buildDatasource(id, req, createdAt)
+		if err != nil {
+			return fmt.Errorf("build configured datasource %s: %w", id, err)
+		}
+		now := time.Now().UTC()
+		if createdAt.IsZero() {
+			datasource.CreatedAt = now
+		}
+		datasource.UpdatedAt = now
+
+		if existing.ID == "" {
+			if err := s.store.CreateDatasource(ctx, datasource); err != nil {
+				return fmt.Errorf("create configured datasource %s: %w", id, err)
+			}
+			s.logger.Info("configured datasource synced",
+				zap.String("id", datasource.ID),
+				zap.String("name", datasource.Name),
+				zap.String("mode", "created"),
+			)
+			continue
+		}
+
+		if err := s.store.UpdateDatasource(ctx, datasource); err != nil {
+			return fmt.Errorf("update configured datasource %s: %w", id, err)
+		}
+		s.logger.Info("configured datasource synced",
+			zap.String("id", datasource.ID),
+			zap.String("name", datasource.Name),
+			zap.String("mode", "updated"),
+		)
+	}
 	return nil
 }
 
@@ -264,4 +328,23 @@ func buildDatasource(id string, req model.DatasourceUpsertRequest, createdAt tim
 		SupportsDelete: supportsDelete,
 		CreatedAt:      createdAt,
 	}, nil
+}
+
+var configuredDatasourceIDSanitizer = regexp.MustCompile(`[^a-z0-9]+`)
+
+func configuredDatasourceID(item config.ConfiguredDatasource) string {
+	if trimmed := strings.TrimSpace(item.ID); trimmed != "" {
+		return trimmed
+	}
+	slug := strings.ToLower(strings.TrimSpace(item.Name))
+	slug = configuredDatasourceIDSanitizer.ReplaceAllString(slug, "-")
+	slug = strings.Trim(slug, "-")
+	if slug == "" {
+		slug = "datasource"
+	}
+	return "cfg_" + slug
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }

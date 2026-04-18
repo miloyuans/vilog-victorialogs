@@ -3,6 +3,9 @@
 # 2. VictoriaLogs 数据源通过 Web 控制台或 /api/datasources 接口动态添加，持久化到 MongoDB 的 datasources 集合。
 # 3. 首次启动后，先打开 http://127.0.0.1:8080/ ，再在 Datasources 页面创建数据源。
 
+# Datasources can be defined here and will be upserted into Mongo on startup.
+# UI-managed datasources and config-managed datasources share the same store.
+
 app:
   # 服务名，仅用于日志和标识。
   name: vilog-victorialogs
@@ -48,10 +51,39 @@ cache:
   local_log_dir: ./data/log-cache
   local_log_hot_days: 2
   local_log_refresh_interval: 10s
+  local_log_daily_check_at: "00:05"
+  local_log_check_concurrency: 4
   local_log_history_ttl: 1h
   source_chunk_size: 1000
   source_request_limit: 10000
   max_query_window: 100000
+
+datasources:
+  - id: cfg_vilogs_us
+    name: vilogs-us
+    base_url: http://127.0.0.1:9428
+    enabled: true
+    timeout_seconds: 15
+    supports_delete: false
+    headers:
+      AccountID: ""
+      ProjectID: ""
+      Authorization: ""
+    field_mapping:
+      service_field: app
+      pod_field: pod
+      message_field: _msg
+      time_field: _time
+    query_paths:
+      query: /select/logsql/query
+      field_names: /select/logsql/field_names
+      field_values: /select/logsql/field_values
+      stream_field_names: /select/logsql/stream_field_names
+      stream_field_values: /select/logsql/stream_field_values
+      facets: /select/logsql/facets
+      delete_run_task: /delete/run_task
+      delete_active_tasks: /delete/active_tasks
+      delete_stop_task: /delete/stop_task
 
 #cache:
   # 查询结果缓存 TTL。建议保守设置，避免误以为是实时结果。

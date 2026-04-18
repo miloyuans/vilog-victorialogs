@@ -68,7 +68,10 @@ func main() {
 	victoriaClient := victorialogs.New(cfg.VictoriaLogs)
 	cacheService := cache.New(store, cfg.Cache, logger.Named("cache"))
 	telegramService := telegram.New(cfg.Telegram)
-	datasourceService := datasource.New(store, victoriaClient)
+	datasourceService := datasource.New(store, victoriaClient, logger.Named("datasource"))
+	if err := datasourceService.SyncConfigured(startupCtx, cfg.Datasources); err != nil {
+		logger.Fatal("sync configured datasources", zap.Error(err))
+	}
 	discoveryService := discovery.New(store, cacheService, datasourceService, victoriaClient, telegramService, cfg.Discovery, cfg.VictoriaLogs)
 	queryService := query.New(store, cacheService, victoriaClient, cfg.Cache, logger.Named("query"))
 	retentionService := retention.New(store, victoriaClient, cfg.Retention)
@@ -83,7 +86,7 @@ func main() {
 	if cfg.Discovery.StartupEnabled {
 		go discoveryService.RunStartupDiscovery(context.Background())
 	}
-	go queryService.StartHotSync(ctx)
+	queryService.StartMaintenance(ctx)
 
 	server, err := httpserver.New(cfg, logger, []httpserver.ReadinessChecker{store}, httpserver.BuildInfo{
 		Version: version,

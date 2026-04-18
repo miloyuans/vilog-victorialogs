@@ -158,7 +158,7 @@ func (s *Service) PrepareLogPartitionMeta(day time.Time, service string, datasou
 }
 
 func (s *Service) LogPartitionNeedsRefresh(meta LocalLogPartitionMeta, day, now time.Time) bool {
-	if !s.isHotLogDay(day, now) {
+	if !truncateToUTCDay(day).Equal(truncateToUTCDay(now)) {
 		return false
 	}
 	if meta.LastSyncAt.IsZero() {
