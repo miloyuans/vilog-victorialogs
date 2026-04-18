@@ -104,6 +104,14 @@ func (s *Service) waitPartitionSync(ctx context.Context, task *partitionSyncTask
 	}
 }
 
+func (s *Service) isPartitionSyncActive(day time.Time, datasource model.Datasource, serviceName string) bool {
+	key := s.partitionSyncKey(day, serviceName, datasource)
+	s.partitionSyncMu.Lock()
+	defer s.partitionSyncMu.Unlock()
+	_, ok := s.partitionSyncs[key]
+	return ok
+}
+
 func (s *Service) startPartitionWorkers(queue partitionSyncQueue, concurrency int) {
 	if concurrency <= 0 {
 		return

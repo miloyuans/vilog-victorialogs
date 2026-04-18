@@ -36,6 +36,7 @@ type LocalLogPartitionMeta struct {
 	ExpireAt       time.Time `json:"expire_at"`
 	RowCount       int       `json:"row_count"`
 	Partial        bool      `json:"partial"`
+	Building       bool      `json:"building"`
 }
 
 func (s *Service) LoadLogPartition(day time.Time, service string, datasource model.Datasource) (LocalLogPartition, bool, error) {
@@ -151,6 +152,7 @@ func (s *Service) PrepareLogPartitionMeta(day time.Time, service string, datasou
 		LastAccessAt:   now.UTC(),
 		RowCount:       rowCount,
 		Partial:        partial,
+		Building:       false,
 	}
 	if !s.isHotLogDay(day, now) {
 		meta.ExpireAt = now.UTC().Add(s.cfg.LocalLogHistoryTTL)
@@ -158,7 +160,16 @@ func (s *Service) PrepareLogPartitionMeta(day time.Time, service string, datasou
 	return meta
 }
 
+func (s *Service) PreparePendingLogPartitionMeta(day time.Time, service string, datasource model.Datasource, rowCount int, now time.Time) LocalLogPartitionMeta {
+	meta := s.PrepareLogPartitionMeta(day, service, datasource, rowCount, now, true)
+	meta.Building = true
+	return meta
+}
+
 func (s *Service) LogPartitionNeedsRefresh(meta LocalLogPartitionMeta, day, now time.Time) bool {
+	if meta.Building {
+		return false
+	}
 	if !truncateToUTCDay(day).Equal(truncateToUTCDay(now)) {
 		return false
 	}
@@ -166,6 +177,20 @@ func (s *Service) LogPartitionNeedsRefresh(meta LocalLogPartitionMeta, day, now 
 		return true
 	}
 	return now.UTC().Sub(meta.LastSyncAt.UTC()) >= s.cfg.LocalLogRefreshInterval
+}
+
+func (s *Service) LogPartitionBuildStale(meta LocalLogPartitionMeta, now time.Time) bool {
+	if !meta.Building {
+		return false
+	}
+	if meta.LastSyncAt.IsZero() {
+		return true
+	}
+	lease := s.cfg.LocalLogRefreshInterval
+	if lease <= 0 || lease < 30*time.Second {
+		lease = 30 * time.Second
+	}
+	return now.UTC().Sub(meta.LastSyncAt.UTC()) >= lease
 }
 
 func (s *Service) ListTrackedLogPartitions() ([]LocalLogPartitionMeta, error) {

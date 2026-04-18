@@ -1447,6 +1447,8 @@ highlight = function (text) {
   const SEARCH_COLUMN_MIN = { timestamp: 96, datasource: 80, pod: 118, level: 70, message: 320, action: 64 };
   let autoRefreshTimer = null;
   let searchColumnResizeState = null;
+  let activeSearchRequest = null;
+  let activeSearchRequestKey = "";
 
   function normalizeAutoRefreshInterval(value) {
     const candidate = String(value || "").trim().toLowerCase();
@@ -1690,23 +1692,36 @@ highlight = function (text) {
     const requestedPage = 1;
     const requestedSize = getResolvedSearchPageSize(pageSize || state.search.pageSize || 500);
     const payload = buildCurrentSearchPayload(requestedPage, requestedSize);
-    const response = safeObject(await request("/api/query/search", {
+    const requestKey = JSON.stringify(payload);
+    if (activeSearchRequest && activeSearchRequestKey === requestKey) {
+      return activeSearchRequest;
+    }
+    activeSearchRequestKey = requestKey;
+    activeSearchRequest = request("/api/query/search", {
       method: "POST",
       body: JSON.stringify(payload),
-    }));
-    return {
-      keyword: payload.keyword || "",
-      start: payload.start || "",
-      end: payload.end || "",
-      results: safeArray(response.results),
-      total: Math.max(Number(response.total || 0), safeArray(response.results).length),
-      page: requestedPage,
-      page_size: requestedSize,
-      partial: !!response.partial,
-      cache_hit: !!response.cache_hit,
-      took_ms: Number(response.took_ms || 0),
-      sources: safeArray(response.sources),
-    };
+    }).then((rawResponse) => {
+      const response = safeObject(rawResponse);
+      return {
+        keyword: payload.keyword || "",
+        start: payload.start || "",
+        end: payload.end || "",
+        results: safeArray(response.results),
+        total: Math.max(Number(response.total || 0), safeArray(response.results).length),
+        page: requestedPage,
+        page_size: requestedSize,
+        partial: !!response.partial,
+        cache_hit: !!response.cache_hit,
+        took_ms: Number(response.took_ms || 0),
+        sources: safeArray(response.sources),
+      };
+    }).finally(() => {
+      if (activeSearchRequestKey === requestKey) {
+        activeSearchRequest = null;
+        activeSearchRequestKey = "";
+      }
+    });
+    return activeSearchRequest;
   }
 
   function decorateExportResults(items) {
@@ -2861,6 +2876,16 @@ highlight = function (text) {
       return false;
     }
     const page = 1;
+    const requestFingerprint = JSON.stringify(buildCurrentSearchPayload(page, pageInfo.value));
+    const nowMs = Date.now();
+    const minGapMs = options && options.background
+      ? Math.min(2500, Math.max(1000, Math.floor(autoRefreshIntervalMs(state.search.autoRefreshInterval) / 2)))
+      : 500;
+    if (state.search.lastRequestFingerprint === requestFingerprint && (nowMs - Number(state.search.lastRequestAt || 0)) < minGapMs) {
+      return false;
+    }
+    state.search.lastRequestFingerprint = requestFingerprint;
+    state.search.lastRequestAt = nowMs;
     state.search.page = page;
     state.search.pageSize = pageInfo.value;
     state.search.pageSizeCustom = pageInfo.mode === "custom" ? pageInfo.value : state.search.pageSizeCustom;

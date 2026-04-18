@@ -147,7 +147,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 			defer wg.Done()
 
 			snapshot, _ := s.store.GetSnapshot(ctx, ds.ID)
-			rows, status, cacheHit, sourcePartial, queryErr := s.searchDatasource(ctx, ds, snapshot, tagDefinitions, normalized, start, end, now)
+			rows, status, cacheHit, sourcePartial, queryErr := s.searchDatasource(ctx, ds, snapshot, tagDefinitions, normalized, start, end, now, pageSize)
 			if queryErr != nil {
 				resultsCh <- sourceResult{
 					status: model.QuerySourceStatus{
@@ -322,6 +322,7 @@ func (s *Service) searchDatasource(
 	tagDefinitions []model.TagDefinition,
 	req model.SearchRequest,
 	start, end, now time.Time,
+	pageSize int,
 ) ([]model.SearchResult, model.QuerySourceStatus, bool, bool, error) {
 	services, err := s.resolveServiceTargets(ctx, datasource.ID, req.ServiceNames)
 	if err != nil {
@@ -334,8 +335,18 @@ func (s *Service) searchDatasource(
 	rows := make([]model.SearchResult, 0)
 	cacheHit := true
 	partial := false
+	previewLimit := 0
+	if len(req.ServiceNames) > 0 {
+		previewLimit = pageSize
+		if previewLimit <= 0 {
+			previewLimit = 200
+		}
+		if previewLimit > 1000 {
+			previewLimit = 1000
+		}
+	}
 	for _, serviceName := range services {
-		serviceRows, serviceCacheHit, servicePartial, err := s.searchServiceWindow(ctx, datasource, snapshot, tagDefinitions, serviceName, start, end, now, req.UseCache)
+		serviceRows, serviceCacheHit, servicePartial, err := s.searchServiceWindow(ctx, datasource, snapshot, tagDefinitions, serviceName, start, end, now, req.UseCache, previewLimit)
 		if err != nil {
 			return nil, model.QuerySourceStatus{}, false, true, err
 		}
@@ -360,12 +371,13 @@ func (s *Service) searchServiceWindow(
 	serviceName string,
 	start, end, now time.Time,
 	useCache bool,
+	previewLimit int,
 ) ([]model.SearchResult, bool, bool, error) {
 	rows := make([]model.SearchResult, 0)
 	cacheHit := true
 	partial := false
 	for day := cacheDay(start); !day.After(cacheDay(end)); day = day.Add(24 * time.Hour) {
-		partition, partitionCacheHit, partitionPartial, err := s.loadPartitionWindow(ctx, datasource, snapshot, tagDefinitions, serviceName, day, now, useCache)
+		partition, partitionCacheHit, partitionPartial, err := s.loadPartitionWindow(ctx, datasource, snapshot, tagDefinitions, serviceName, day, start, end, now, useCache, previewLimit)
 		if err != nil {
 			return nil, false, true, err
 		}
@@ -382,8 +394,9 @@ func (s *Service) loadPartitionWindow(
 	snapshot model.DatasourceTagSnapshot,
 	tagDefinitions []model.TagDefinition,
 	serviceName string,
-	day, now time.Time,
+	day, windowStart, windowEnd, now time.Time,
 	useCache bool,
+	previewLimit int,
 ) (cache.LocalLogPartition, bool, bool, error) {
 	if useCache {
 		partition, hit, err := s.cache.LoadLogPartition(day, serviceName, datasource)
@@ -401,6 +414,30 @@ func (s *Service) loadPartitionWindow(
 				zap.String("day", cacheDay(day).Format("2006-01-02")),
 				zap.Int("rows", len(partition.Rows)),
 			)
+			if partition.Meta.Building {
+				if s.cache.LogPartitionBuildStale(partition.Meta, now) && !s.isPartitionSyncActive(day, datasource, serviceName) {
+					task, created := s.startPartitionSync(day, datasource, serviceName, "query-build-retry", partitionSyncQueueInteractive, func(syncCtx context.Context) error {
+						_, _, buildErr := s.buildPartitionFromSource(syncCtx, datasource, snapshot, tagDefinitions, serviceName, day, time.Now().UTC())
+						return buildErr
+					})
+					if created {
+						s.logger.Info("requeueing stale building log partition",
+							zap.String("datasource", datasource.Name),
+							zap.String("service", displayServiceName(serviceName)),
+							zap.String("day", cacheDay(day).Format("2006-01-02")),
+						)
+					} else if task != nil {
+						s.logger.Info("building log partition still pending",
+							zap.String("datasource", datasource.Name),
+							zap.String("service", displayServiceName(serviceName)),
+							zap.String("day", cacheDay(day).Format("2006-01-02")),
+							zap.String("queue", string(task.queue)),
+							zap.Bool("started", task.started),
+						)
+					}
+				}
+				return partition, false, true, nil
+			}
 			if s.cache.LogPartitionNeedsRefresh(partition.Meta, day, now) {
 				s.logger.Info("queueing hot log partition refresh",
 					zap.String("datasource", datasource.Name),
@@ -419,6 +456,34 @@ func (s *Service) loadPartitionWindow(
 	}
 
 	if useCache {
+		previewRows := []model.SearchResult{}
+		if previewLimit > 0 {
+			previewStart, previewEnd := intersectWindowWithDay(day, windowStart, windowEnd, now)
+			if previewEnd.After(previewStart) {
+				previewRows, _ = s.fetchPreviewSourceRange(ctx, datasource, snapshot, tagDefinitions, serviceName, previewStart, previewEnd, previewLimit)
+			}
+		}
+		previewRows = normalizePartitionRows(previewRows)
+		placeholder := cache.LocalLogPartition{
+			Meta: s.cache.PreparePendingLogPartitionMeta(day, serviceName, datasource, len(previewRows), now),
+			Rows: previewRows,
+		}
+		if len(previewRows) > 0 {
+			s.logger.Info("prepared preview rows while partition is building",
+				zap.String("datasource", datasource.Name),
+				zap.String("service", displayServiceName(serviceName)),
+				zap.String("day", cacheDay(day).Format("2006-01-02")),
+				zap.Int("rows", len(previewRows)),
+			)
+		}
+		if err := s.cache.StoreLogPartition(placeholder); err != nil {
+			s.logger.Warn("store pending log partition placeholder failed",
+				zap.Error(err),
+				zap.String("datasource", datasource.Name),
+				zap.String("service", displayServiceName(serviceName)),
+				zap.String("day", cacheDay(day).Format("2006-01-02")),
+			)
+		}
 		task, created := s.startPartitionSync(day, datasource, serviceName, "query-build", partitionSyncQueueInteractive, func(syncCtx context.Context) error {
 			_, _, buildErr := s.buildPartitionFromSource(syncCtx, datasource, snapshot, tagDefinitions, serviceName, day, time.Now().UTC())
 			return buildErr
@@ -438,10 +503,7 @@ func (s *Service) loadPartitionWindow(
 				zap.Bool("started", task.started),
 			)
 		}
-		return cache.LocalLogPartition{
-			Meta: s.cache.PrepareLogPartitionMeta(day, serviceName, datasource, 0, now, true),
-			Rows: []model.SearchResult{},
-		}, false, true, nil
+		return placeholder, false, true, nil
 	}
 
 	s.logger.Info("building log partition from source synchronously",
@@ -527,6 +589,26 @@ func (s *Service) refreshPartitionIncremental(
 		)
 	}
 	return partition, partition.Meta.Partial, nil
+}
+
+func (s *Service) fetchPreviewSourceRange(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	serviceName string,
+	start, end time.Time,
+	limit int,
+) ([]model.SearchResult, error) {
+	if !end.After(start) || limit <= 0 {
+		return []model.SearchResult{}, nil
+	}
+	logsql := buildSourceLogsQL(datasource, snapshot, serviceName)
+	rows, _, err := s.fetchDatasourceWindow(ctx, datasource, snapshot, tagDefinitions, logsql, start, end, limit)
+	if err != nil {
+		return nil, err
+	}
+	return dedupeRows(rows), nil
 }
 
 func (s *Service) fetchCompleteSourceRange(
@@ -1336,6 +1418,20 @@ func dayBounds(day, now time.Time) (time.Time, time.Time) {
 		end = nowUTC
 	}
 	return start, end
+}
+
+func intersectWindowWithDay(day, windowStart, windowEnd, now time.Time) (time.Time, time.Time) {
+	dayStart, dayEnd := dayBounds(day, now)
+	if windowStart.After(dayStart) {
+		dayStart = windowStart
+	}
+	if windowEnd.Before(dayEnd) {
+		dayEnd = windowEnd
+	}
+	if dayEnd.Before(dayStart) {
+		return dayStart, dayStart
+	}
+	return dayStart, dayEnd
 }
 
 func displayServiceName(serviceName string) string {
