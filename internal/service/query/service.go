@@ -342,6 +342,7 @@ func (s *Service) searchDatasource(
 	if err != nil {
 		return nil, model.QuerySourceStatus{}, false, true, err
 	}
+	explicitServiceSelection := len(req.ServiceNames) > 0
 	for _, serviceName := range services {
 		s.markServiceInteractive(datasource, serviceName, now)
 	}
@@ -350,13 +351,24 @@ func (s *Service) searchDatasource(
 	cacheHit := true
 	partial := false
 	previewLimit := 0
-	if len(req.ServiceNames) > 0 {
+	if explicitServiceSelection {
 		previewLimit = pageSize
 		if previewLimit <= 0 {
 			previewLimit = 200
 		}
 		if previewLimit > 1000 {
 			previewLimit = 1000
+		}
+	} else {
+		previewLimit = pageSize
+		if previewLimit <= 0 {
+			previewLimit = 200
+		}
+		if previewLimit < 100 {
+			previewLimit = 100
+		}
+		if previewLimit > 300 {
+			previewLimit = 300
 		}
 	}
 	for _, serviceName := range services {
@@ -368,6 +380,43 @@ func (s *Service) searchDatasource(
 		cacheHit = cacheHit && serviceCacheHit
 		partial = partial || servicePartial
 	}
+
+	if !explicitServiceSelection && (len(rows) == 0 || partial) {
+		aggregatePreviewLimit := pageSize
+		if aggregatePreviewLimit <= 0 {
+			aggregatePreviewLimit = 200
+		}
+		if aggregatePreviewLimit < 100 {
+			aggregatePreviewLimit = 100
+		}
+		if aggregatePreviewLimit > 300 {
+			aggregatePreviewLimit = 300
+		}
+		previewRows, previewPartial, previewErr := s.fetchDatasourcePreviewWindow(ctx, datasource, snapshot, tagDefinitions, start, end, aggregatePreviewLimit)
+		if previewErr != nil {
+			s.logger.Warn("prepare datasource-wide preview failed",
+				zap.Error(previewErr),
+				zap.String("datasource", datasource.Name),
+				zap.Time("start", start),
+				zap.Time("end", end),
+				zap.Int("limit", aggregatePreviewLimit),
+			)
+		} else if len(previewRows) > 0 {
+			mergedRows, mergePartial := s.mergeSourceRowsLimited(rows, previewRows, datasource, "", cacheDay(start), "all-service-preview")
+			normalizedRows, normalizePartial := s.normalizeRowsForPartition(mergedRows, datasource, "", cacheDay(start), "all-service-preview")
+			rows = normalizedRows
+			cacheHit = false
+			partial = partial || previewPartial || mergePartial || normalizePartial
+			s.logger.Info("prepared datasource-wide preview rows",
+				zap.String("datasource", datasource.Name),
+				zap.Time("start", start),
+				zap.Time("end", end),
+				zap.Int("rows", len(previewRows)),
+				zap.Int("limit", aggregatePreviewLimit),
+			)
+		}
+	}
+
 	rows = applySearchFilters(rows, req)
 
 	return rows, model.QuerySourceStatus{
@@ -696,6 +745,34 @@ func (s *Service) fetchPreviewSourceRange(
 	return rows, nil
 }
 
+func (s *Service) fetchDatasourcePreviewWindow(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	start, end time.Time,
+	limit int,
+) ([]model.SearchResult, bool, error) {
+	if !end.After(start) || limit <= 0 {
+		return []model.SearchResult{}, false, nil
+	}
+	rows, truncated, err := s.fetchDatasourceWindow(
+		ctx,
+		datasource,
+		snapshot,
+		tagDefinitions,
+		buildSourceLogsQL(datasource, snapshot, ""),
+		start,
+		end,
+		limit,
+	)
+	if err != nil {
+		return nil, true, err
+	}
+	rows, guardPartial := s.normalizeRowsForPartition(rows, datasource, "", cacheDay(start), "datasource-preview")
+	return rows, truncated || guardPartial, nil
+}
+
 func (s *Service) fetchCompleteSourceRange(
 	ctx context.Context,
 	datasource model.Datasource,
@@ -809,18 +886,7 @@ func (s *Service) resolveServiceTargets(ctx context.Context, datasourceID string
 	if items := uniqueStrings(requested); len(items) > 0 {
 		return items, nil
 	}
-	entries, err := s.store.ListServiceCatalog(ctx, datasourceID)
-	if err != nil {
-		return nil, err
-	}
-	if len(entries) == 0 {
-		return []string{""}, nil
-	}
-	names := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		names = append(names, entry.ServiceName)
-	}
-	return uniqueStrings(names), nil
+	return []string{""}, nil
 }
 
 func (s *Service) serviceChunkConcurrency() int {

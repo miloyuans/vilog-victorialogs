@@ -3340,6 +3340,272 @@ highlight = function (text) {
     const pod = item.pod || item.service || "-";
     return `<div class="log-entry compact-log-entry ${String(item._index) === state.search.selectedResultKey ? "active" : ""}"><div class="log-meta">${pill(formatDate(item.timestamp), "tone-soft")}${pill(item.datasource || "-", "tone-neutral")}<span class="log-meta-pod" title="${esc(pod)}">${esc(pod)}</span>${pill(item._level.toUpperCase(), levelTone(item._level))}</div><p class="log-message compact-log-message log-message-wrap">${highlight(item.message || "", "")}</p><div class="log-labels">${renderLabelChips(item.labels)}</div><div class="form-actions"><button class="button button-small" type="button" data-select-result="${esc(String(item._index))}">${esc(s("\u8be6\u60c5", "Detail"))}</button></div></div>`;
   };
+
+  function renderDatasourceMenuListItem(item) {
+    const selected = safeArray(state.search.selectedDatasourceIDs).indexOf(item.id) >= 0;
+    const isCatalog = item.id === state.search.catalogDatasourceID;
+    const searchText = [item.name, item.base_url, item.id, item.enabled ? "enabled" : "disabled"].join(" ");
+    return `<button class="menu-check-item ${selected ? "active" : ""}" type="button" data-search-datasource-id="${esc(item.id)}" data-menu-search="${esc(searchText)}"><span class="menu-check-indicator">${selected ? "&#10003;" : ""}</span><span class="menu-check-main"><strong>${esc(item.name)}</strong><small>${esc(item.base_url || "-")}</small></span><span class="menu-check-meta">${pill(isCatalog ? s("\u4e3b\u76ee\u5f55", "Catalog") : item.enabled ? s("\u542f\u7528", "Enabled") : s("\u505c\u7528", "Disabled"), isCatalog ? "tone-neutral" : item.enabled ? "tone-ok" : "tone-warn")}</span></button>`;
+  }
+
+  function renderServiceMenuListItem(name) {
+    const selected = safeArray(state.search.serviceNames).indexOf(name) >= 0;
+    return `<button class="menu-check-item ${selected ? "active" : ""}" type="button" data-search-service-name="${esc(name)}" data-menu-search="${esc(name)}"><span class="menu-check-indicator">${selected ? "&#10003;" : ""}</span><span class="menu-check-main"><strong>${esc(name)}</strong><small>${esc(s("\u5355\u9009\u3001\u591a\u9009\u6216 ALL\u90fd\u53ef\u4ee5\u3002", "Single, multi-select, or ALL are all supported."))}</small></span></button>`;
+  }
+
+  function applyMenuSearchFilter(kind) {
+    const menu = byId(kind === "service" ? "search-service-menu" : "search-datasource-menu");
+    if (!menu) return;
+    const keyword = getMenuSearchValue(kind);
+    let visible = 0;
+    menu.querySelectorAll(".menu-check-item").forEach((node) => {
+      const haystack = String(node.getAttribute("data-menu-search") || node.textContent || "");
+      const show = fuzzyMatch(haystack, keyword);
+      node.hidden = !show;
+      if (show) visible += 1;
+    });
+    const emptyState = menu.querySelector("[data-menu-filter-empty]");
+    if (emptyState) emptyState.hidden = visible > 0;
+  }
+
+  function getSearchMenuTrigger(menuName) {
+    return document.querySelector(`[data-open-menu="${menuName}"]`);
+  }
+
+  function positionSearchMenuPanel(menuName) {
+    const menu = byId(menuName === "datasource" ? "search-datasource-menu" : menuName === "service" ? "search-service-menu" : "search-time-menu");
+    const trigger = getSearchMenuTrigger(menuName);
+    if (!menu || !trigger || !menu.classList.contains("open")) return;
+    const padding = 12;
+    const width = Math.min(menuName === "time" ? 420 : 360, window.innerWidth - padding * 2);
+    const triggerRect = trigger.getBoundingClientRect();
+    let top = triggerRect.bottom + 6;
+    let left = menuName === "time" ? triggerRect.right - width : triggerRect.left;
+    if (left + width > window.innerWidth - padding) left = window.innerWidth - width - padding;
+    if (left < padding) left = padding;
+    let maxHeight = window.innerHeight - top - padding;
+    if (maxHeight < 180) {
+      top = Math.max(padding, triggerRect.top - Math.min(window.innerHeight * 0.55, 360));
+      maxHeight = window.innerHeight - top - padding;
+    }
+    menu.style.left = `${Math.round(left)}px`;
+    menu.style.top = `${Math.round(top)}px`;
+    menu.style.width = `${Math.round(width)}px`;
+    menu.style.maxHeight = `${Math.max(180, Math.round(maxHeight))}px`;
+  }
+
+  function positionOpenSearchMenus() {
+    if (!state.ui.openMenu) return;
+    positionSearchMenuPanel(state.ui.openMenu);
+  }
+
+  syncSearchMenuState = function () {
+    const datasourceMenu = byId("search-datasource-menu");
+    const serviceMenu = byId("search-service-menu");
+    const timeMenu = byId("search-time-menu");
+    if (datasourceMenu) datasourceMenu.classList.toggle("open", state.ui.openMenu === "datasource");
+    if (serviceMenu) serviceMenu.classList.toggle("open", state.ui.openMenu === "service");
+    if (timeMenu) timeMenu.classList.toggle("open", state.ui.openMenu === "time");
+    positionOpenSearchMenus();
+  };
+
+  if (!window.__vilogSearchMenuPositionBound) {
+    window.addEventListener("resize", positionOpenSearchMenus);
+    window.addEventListener("scroll", positionOpenSearchMenus, true);
+    window.__vilogSearchMenuPositionBound = true;
+  }
+
+  loadSearchCatalogs = async function () {
+    normalizeFrontendCollections();
+    syncCatalogDatasource();
+    if (!state.search.catalogDatasourceID) {
+      state.search.services = [];
+      state.search.serviceNames = [];
+      state.search.tagCatalog = [];
+      state.search.activeFilters = {};
+      state.search.tagValues = {};
+      renderSearchControls();
+      return;
+    }
+
+    const selectedDatasourceIDs = safeArray(state.search.selectedDatasourceIDs).length
+      ? safeArray(state.search.selectedDatasourceIDs)
+      : [state.search.catalogDatasourceID];
+    const tagParams = new URLSearchParams({ datasource_id: state.search.catalogDatasourceID });
+    if (safeArray(state.search.serviceNames).length === 1) tagParams.set("service", state.search.serviceNames[0]);
+
+    const serviceResponses = await Promise.allSettled(
+      selectedDatasourceIDs.map((id) => request("/api/query/services?datasource_id=" + encodeURIComponent(id))),
+    );
+    const tagResponse = await Promise.allSettled([
+      request("/api/query/tags?" + tagParams.toString()),
+    ]);
+
+    const mergedServices = unique(serviceResponses.flatMap((entry) => {
+      if (entry.status !== "fulfilled") return [];
+      return safeArray(entry.value && entry.value.services);
+    }));
+    state.search.services = mergedServices.sort((left, right) => String(left).localeCompare(String(right)));
+    state.search.serviceNames = safeArray(state.search.serviceNames).filter((name) => state.search.services.indexOf(name) >= 0);
+    state.search.tagCatalog = safeArray(tagResponse[0] && tagResponse[0].status === "fulfilled" ? tagResponse[0].value && tagResponse[0].value.tags : []);
+    if (!tagResponse[0] || tagResponse[0].status !== "fulfilled") {
+      state.search.activeFilters = {};
+      state.search.tagValues = {};
+    }
+    pruneSearchFilters();
+
+    if (state.ui.openMenu === "datasource" || state.ui.openMenu === "service") {
+      renderSearchCatalogDatasourceOptions();
+      renderSearchServiceOptions();
+      renderSearchContext();
+      renderSearchCatalogs();
+      renderSearchLevelFilters();
+      renderSearchHighlightPalette();
+      syncSearchMenuState();
+      return;
+    }
+
+    renderSearchControls();
+  };
+
+  renderSearchCatalogDatasourceOptions = function () {
+    normalizeFrontendCollections();
+    const trigger = byId("search-datasource-trigger");
+    const menu = byId("search-datasource-menu");
+    if (trigger) trigger.textContent = getSearchDatasourceLabel();
+    if (!menu) return;
+    const allItems = safeArray(state.datasources);
+    if (!allItems.length) {
+      menu.innerHTML = empty(s("\u6682\u65e0\u6570\u636e\u6e90\u3002", "No datasource."));
+      return;
+    }
+    const selectedItems = allItems.filter((item) => safeArray(state.search.selectedDatasourceIDs).indexOf(item.id) >= 0);
+    menu.innerHTML = `
+      <div class="toolbar-menu-section">
+        <div class="menu-section-title">${esc(s("\u67e5\u8be2\u6570\u636e\u6e90", "Search Datasources"))}</div>
+        <div class="menu-search-row">
+          <input class="menu-search-input" id="search-datasource-menu-search" type="search" placeholder="${esc(s("\u6a21\u7cca\u5339\u914d\u6570\u636e\u6e90\u540d\u79f0 / \u5730\u5740 / ID", "Fuzzy-match datasource name / URL / ID"))}" value="${esc(getMenuSearchValue("datasource"))}" />
+          <div class="menu-selection-strip compact">${renderSelectedMenuTokens(selectedItems, "datasource")}</div>
+        </div>
+        <div class="menu-action-row">
+          <button class="chip-button ${safeArray(state.search.selectedDatasourceIDs).length >= allItems.length ? "active" : ""}" type="button" data-search-datasource-all="1">ALL</button>
+          <span class="menu-meta-tip">${esc(s("\u652f\u6301\u591a\u9009\uff0c\u9ed8\u8ba4 ALL\u3002", "Multi-select supported, default ALL."))}</span>
+        </div>
+        <div class="menu-check-list">
+          ${allItems.map(renderDatasourceMenuListItem).join("")}
+          <div class="empty-state" data-menu-filter-empty hidden>${esc(s("\u6ca1\u6709\u5339\u914d\u5f53\u524d\u5173\u952e\u5b57\u7684\u6570\u636e\u6e90\u3002", "No datasource matches the current keyword."))}</div>
+        </div>
+      </div>
+    `;
+    applyMenuSearchFilter("datasource");
+  };
+
+  renderSearchServiceOptions = function () {
+    normalizeFrontendCollections();
+    const trigger = byId("search-service-trigger");
+    const menu = byId("search-service-menu");
+    if (trigger) trigger.textContent = getSearchServiceLabel();
+    if (!menu) return;
+    if (!state.search.catalogDatasourceID) {
+      menu.innerHTML = empty(s("\u5148\u9009\u62e9\u6570\u636e\u6e90\u3002", "Pick a datasource first."));
+      return;
+    }
+    const services = safeArray(state.search.services);
+    if (!services.length) {
+      menu.innerHTML = empty(s("\u670d\u52a1\u76ee\u5f55\u4e3a\u7a7a\uff0c\u8bf7\u5148\u6267\u884c Discover\u3002", "Service catalog is empty. Run Discover first."));
+      return;
+    }
+    menu.innerHTML = `
+      <div class="toolbar-menu-section">
+        <div class="menu-section-title">${esc(s("\u670d\u52a1\u76ee\u5f55", "Service Catalog"))}</div>
+        <div class="menu-search-row">
+          <input class="menu-search-input" id="search-service-menu-search" type="search" placeholder="${esc(s("\u6a21\u7cca\u5339\u914d\u670d\u52a1\u540d\u79f0", "Fuzzy-match service name"))}" value="${esc(getMenuSearchValue("service"))}" />
+          <div class="menu-selection-strip compact">${renderSelectedMenuTokens(safeArray(state.search.serviceNames), "service")}</div>
+        </div>
+        <div class="menu-action-row">
+          <button class="chip-button ${safeArray(state.search.serviceNames).length === 0 || safeArray(state.search.serviceNames).length >= services.length ? "active" : ""}" type="button" data-search-service-all="1">ALL</button>
+          <span class="menu-meta-tip">${esc(s("\u670d\u52a1\u5217\u8868\u4f1a\u6839\u968f\u6570\u636e\u6e90\u81ea\u52a8\u5237\u65b0\u5e76\u53bb\u91cd\u3002", "The service list follows the selected datasources and is automatically deduplicated."))}</span>
+        </div>
+        <div class="menu-check-list">
+          ${services.map(renderServiceMenuListItem).join("")}
+          <div class="empty-state" data-menu-filter-empty hidden>${esc(s("\u6ca1\u6709\u5339\u914d\u5f53\u524d\u5173\u952e\u5b57\u7684\u670d\u52a1\u3002", "No service matches the current keyword."))}</div>
+        </div>
+      </div>
+    `;
+    applyMenuSearchFilter("service");
+  };
+
+  const __latestHandleInput = handleInput;
+  handleInput = function (event) {
+    const target = event.target;
+    if (target instanceof HTMLElement && target.id === "search-datasource-menu-search") {
+      setMenuSearchValue("datasource", target.value);
+      applyMenuSearchFilter("datasource");
+      positionOpenSearchMenus();
+      return;
+    }
+    if (target instanceof HTMLElement && target.id === "search-service-menu-search") {
+      setMenuSearchValue("service", target.value);
+      applyMenuSearchFilter("service");
+      positionOpenSearchMenus();
+      return;
+    }
+    return __latestHandleInput(event);
+  };
+
+  function refreshSearchMenusSoon() {
+    renderSearchToolbar();
+    renderSearchCatalogDatasourceOptions();
+    renderSearchServiceOptions();
+    renderSearchContext();
+    renderSearchLevelFilters();
+    renderSearchHighlightPalette();
+    syncSearchMenuState();
+    Promise.resolve()
+      .then(() => loadSearchCatalogs())
+      .catch((error) => {
+        console.error(error);
+        toast(error && error.message ? error.message : "Failed to refresh search catalogs.", "error");
+      });
+  }
+
+  toggleSearchDatasource = function (id) {
+    normalizeFrontendCollections();
+    const selected = safeArray(state.search.selectedDatasourceIDs);
+    state.search.selectedDatasourceIDs = selected.indexOf(id) >= 0
+      ? selected.filter((item) => item !== id)
+      : selected.concat([id]);
+    syncCatalogDatasource();
+    refreshSearchMenusSoon();
+  };
+
+  selectAllSearchDatasources = function () {
+    normalizeFrontendCollections();
+    const enabled = safeArray(state.datasources).filter((item) => item && item.enabled);
+    const pool = enabled.length ? enabled : safeArray(state.datasources);
+    state.search.selectedDatasourceIDs = pool.map((item) => item.id);
+    syncCatalogDatasource();
+    refreshSearchMenusSoon();
+  };
+
+  toggleSearchService = function (name) {
+    normalizeFrontendCollections();
+    const selected = safeArray(state.search.serviceNames);
+    state.search.serviceNames = selected.indexOf(name) >= 0
+      ? selected.filter((item) => item !== name)
+      : selected.concat([name]);
+    state.search.activeFilters = {};
+    state.search.tagValues = {};
+    refreshSearchMenusSoon();
+  };
+
+  selectAllSearchServices = function () {
+    normalizeFrontendCollections();
+    state.search.serviceNames = [];
+    state.search.activeFilters = {};
+    state.search.tagValues = {};
+    refreshSearchMenusSoon();
+  };
 })();
 
 bootstrap();

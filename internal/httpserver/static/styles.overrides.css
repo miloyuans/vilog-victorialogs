@@ -402,3 +402,6 @@ mark.highlight-tone-purple{background:rgba(176,132,245,.28);color:#e7d3ff}
 .compact-log-entry .form-actions{margin-top:4px}
 .compact-log-entry .log-labels{margin-top:3px}
 .log-meta-pod{display:inline-block;max-width:168px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.68rem;line-height:1.08;color:var(--ink-soft);padding:2px 7px;border:1px solid rgba(255,255,255,.08);border-radius:999px;background:rgba(255,255,255,.03);vertical-align:middle}
+.toolbar-menu-panel{position:fixed!important;top:0;left:0;right:auto!important;width:min(360px,calc(100vw - 24px))!important;max-height:calc(100vh - 24px);overflow:auto;overscroll-behavior:contain}
+#search-service-menu,#search-time-menu{left:0!important;right:auto!important}
+.menu-check-item[hidden],[data-menu-filter-empty][hidden]{display:none!important}
