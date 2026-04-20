@@ -507,7 +507,7 @@ func (s *Service) searchDatasource(
 		if aggregatePreviewLimit > 300 {
 			aggregatePreviewLimit = 300
 		}
-		previewRows, previewPartial, previewErr := s.fetchAllServicePreviewWindow(ctx, datasource, snapshot, tagDefinitions, start, end, aggregatePreviewLimit)
+		previewRows, previewPartial, previewErr := s.fetchAllServicePreviewWindow(ctx, datasource, snapshot, tagDefinitions, req, start, end, aggregatePreviewLimit)
 		if previewErr != nil {
 			s.logger.Warn("prepare all-service preview failed",
 				zap.Error(previewErr),
@@ -950,16 +950,58 @@ func (s *Service) fetchDatasourcePreviewWindow(
 	return rows, truncated || guardPartial, nil
 }
 
+func (s *Service) fetchFilteredDatasourcePreviewWindow(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	req model.SearchRequest,
+	start, end time.Time,
+	perServiceLimit int,
+) ([]model.SearchResult, bool, error) {
+	if !end.After(start) || perServiceLimit <= 0 {
+		return []model.SearchResult{}, false, nil
+	}
+	scanLimit := s.filteredPreviewScanLimit(perServiceLimit)
+	rows, truncated, err := s.fetchDatasourceWindow(
+		ctx,
+		datasource,
+		snapshot,
+		tagDefinitions,
+		buildSourceLogsQL(datasource, snapshot, ""),
+		start,
+		end,
+		scanLimit,
+	)
+	if err != nil {
+		return nil, true, err
+	}
+	rows, guardPartial := s.normalizeRowsForPartition(rows, datasource, "", cacheDay(start), "datasource-filtered-preview")
+	rows = applySearchFilters(rows, req)
+	sortSearchResults(rows)
+	rows = limitResultsPerService(rows, perServiceLimit)
+	maxVisible := responseVisibleLimit(perServiceLimit, rows)
+	if len(rows) > maxVisible {
+		rows = rows[:maxVisible]
+		truncated = true
+	}
+	return rows, truncated || guardPartial, nil
+}
+
 func (s *Service) fetchAllServicePreviewWindow(
 	ctx context.Context,
 	datasource model.Datasource,
 	snapshot model.DatasourceTagSnapshot,
 	tagDefinitions []model.TagDefinition,
+	req model.SearchRequest,
 	start, end time.Time,
 	perServiceLimit int,
 ) ([]model.SearchResult, bool, error) {
 	entries, err := s.store.ListServiceCatalog(ctx, datasource.ID)
 	if err != nil {
+		if hasPrimarySearchFilters(req) {
+			return s.fetchFilteredDatasourcePreviewWindow(ctx, datasource, snapshot, tagDefinitions, req, start, end, perServiceLimit)
+		}
 		return s.fetchDatasourcePreviewWindow(ctx, datasource, snapshot, tagDefinitions, start, end, perServiceLimit)
 	}
 	serviceNames := make([]string, 0, len(entries))
@@ -971,12 +1013,16 @@ func (s *Service) fetchAllServicePreviewWindow(
 	}
 	serviceNames = uniqueStrings(serviceNames)
 	if len(serviceNames) == 0 {
+		if hasPrimarySearchFilters(req) {
+			return s.fetchFilteredDatasourcePreviewWindow(ctx, datasource, snapshot, tagDefinitions, req, start, end, perServiceLimit)
+		}
 		return s.fetchDatasourcePreviewWindow(ctx, datasource, snapshot, tagDefinitions, start, end, perServiceLimit)
 	}
 
 	type previewResult struct {
-		rows []model.SearchResult
-		err  error
+		rows    []model.SearchResult
+		partial bool
+		err     error
 	}
 
 	workerLimit := s.serviceChunkConcurrency()
@@ -997,8 +1043,13 @@ func (s *Service) fetchAllServicePreviewWindow(
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			if hasPrimarySearchFilters(req) {
+				rows, previewPartial, fetchErr := s.fetchFilteredPreviewSourceRange(ctx, datasource, snapshot, tagDefinitions, req, name, start, end, perServiceLimit)
+				resultsCh <- previewResult{rows: rows, partial: previewPartial, err: fetchErr}
+				return
+			}
 			rows, fetchErr := s.fetchPreviewSourceRange(ctx, datasource, snapshot, tagDefinitions, name, start, end, perServiceLimit)
-			resultsCh <- previewResult{rows: rows, err: fetchErr}
+			resultsCh <- previewResult{rows: rows, partial: false, err: fetchErr}
 		}()
 	}
 
@@ -1013,6 +1064,7 @@ func (s *Service) fetchAllServicePreviewWindow(
 			continue
 		}
 		merged = append(merged, item.rows...)
+		partial = partial || item.partial
 	}
 	sortSearchResults(merged)
 	merged = limitResultsPerService(merged, perServiceLimit)
@@ -1022,6 +1074,45 @@ func (s *Service) fetchAllServicePreviewWindow(
 		partial = true
 	}
 	return merged, partial, nil
+}
+
+func (s *Service) fetchFilteredPreviewSourceRange(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	req model.SearchRequest,
+	serviceName string,
+	start, end time.Time,
+	perServiceLimit int,
+) ([]model.SearchResult, bool, error) {
+	if !end.After(start) || perServiceLimit <= 0 {
+		return []model.SearchResult{}, false, nil
+	}
+	scanLimit := s.filteredPreviewScanLimit(perServiceLimit)
+	logsql := buildSourceLogsQL(datasource, snapshot, serviceName)
+	rows, truncated, err := s.fetchDatasourceWindow(ctx, datasource, snapshot, tagDefinitions, logsql, start, end, scanLimit)
+	if err != nil {
+		return nil, true, err
+	}
+	rows, guardPartial := s.normalizeRowsForPartition(rows, datasource, serviceName, cacheDay(start), "filtered-preview")
+	rows = applySearchFilters(rows, req)
+	sortSearchResults(rows)
+	if len(rows) > perServiceLimit {
+		rows = rows[:perServiceLimit]
+	}
+	return rows, truncated || guardPartial, nil
+}
+
+func (s *Service) filteredPreviewScanLimit(perServiceLimit int) int {
+	limit := s.sourceWindowLimit()
+	if limit <= 0 {
+		limit = 2000
+	}
+	if perServiceLimit > limit {
+		limit = perServiceLimit
+	}
+	return limit
 }
 
 func (s *Service) fetchCompleteSourceRange(
@@ -1980,6 +2071,18 @@ func splitKeywords(raw string) []string {
 	return uniqueStrings(strings.FieldsFunc(raw, func(r rune) bool {
 		return r == '\n' || r == '\r' || r == ',' || r == ';'
 	}))
+}
+
+func hasPrimarySearchFilters(req model.SearchRequest) bool {
+	if len(splitKeywords(req.Keyword)) > 0 {
+		return true
+	}
+	for _, values := range req.Tags {
+		if len(uniqueStrings(values)) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func matchesKeywordFilter(row model.SearchResult, keywords []string, mode string) bool {
