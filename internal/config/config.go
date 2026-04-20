@@ -58,6 +58,7 @@ type CacheConfig struct {
 	QueryTTL                time.Duration `yaml:"query_ttl"`
 	ServiceListTTL          time.Duration `yaml:"service_list_ttl"`
 	TagValuesTTL            time.Duration `yaml:"tag_values_ttl"`
+	BackgroundSyncEnabled   bool          `yaml:"background_sync_enabled"`
 	LocalQueryDir           string        `yaml:"local_query_dir"`
 	LocalQueryRetention     time.Duration `yaml:"local_query_retention"`
 	LocalLogDir             string        `yaml:"local_log_dir"`
@@ -156,11 +157,12 @@ func Default() Config {
 			QueryTTL:                5 * time.Minute,
 			ServiceListTTL:          30 * time.Minute,
 			TagValuesTTL:            30 * time.Minute,
+			BackgroundSyncEnabled:   false,
 			LocalQueryDir:           "./data/query-cache",
 			LocalQueryRetention:     24 * time.Hour,
 			LocalLogDir:             "./data/log-cache",
 			LocalLogHotDays:         2,
-			LocalLogRefreshInterval: 60 * time.Second,
+			LocalLogRefreshInterval: 3 * time.Minute,
 			LocalLogDailyCheckAt:    "00:05",
 			LocalLogCheckConcurrency: 1,
 			InteractiveSyncConcurrency: 1,
@@ -438,6 +440,9 @@ func applyEnvOverrides(cfg *Config) error {
 		return err
 	}
 	if err := setDuration("VILOG_CACHE_TAG_VALUES_TTL", &cfg.Cache.TagValuesTTL); err != nil {
+		return err
+	}
+	if err := setBool("VILOG_CACHE_BACKGROUND_SYNC_ENABLED", &cfg.Cache.BackgroundSyncEnabled); err != nil {
 		return err
 	}
 	setString("VILOG_CACHE_LOCAL_QUERY_DIR", &cfg.Cache.LocalQueryDir)

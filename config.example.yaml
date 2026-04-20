@@ -46,11 +46,12 @@ cache:
   query_ttl: 5m
   service_list_ttl: 30m
   tag_values_ttl: 30m
+  background_sync_enabled: false
   local_query_dir: ./data/query-cache
   local_query_retention: 24h
   local_log_dir: ./data/log-cache
   local_log_hot_days: 2
-  local_log_refresh_interval: 60s
+  local_log_refresh_interval: 3m
   local_log_daily_check_at: "00:05"
   local_log_check_concurrency: 1
   interactive_sync_concurrency: 1

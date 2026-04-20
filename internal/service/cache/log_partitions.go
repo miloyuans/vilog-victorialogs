@@ -226,7 +226,17 @@ func (s *Service) LogPartitionNeedsRefresh(meta LocalLogPartitionMeta, day, now 
 	if meta.LastSyncAt.IsZero() {
 		return true
 	}
-	return now.UTC().Sub(meta.LastSyncAt.UTC()) >= s.cfg.LocalLogRefreshInterval
+	interval := s.cfg.LocalLogRefreshInterval
+	if interval <= 0 {
+		interval = 60 * time.Second
+	}
+	if meta.Partial {
+		interval = interval * 5
+		if interval < 5*time.Minute {
+			interval = 5 * time.Minute
+		}
+	}
+	return now.UTC().Sub(meta.LastSyncAt.UTC()) >= interval
 }
 
 func (s *Service) LogPartitionBuildStale(meta LocalLogPartitionMeta, now time.Time) bool {

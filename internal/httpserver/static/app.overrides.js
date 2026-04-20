@@ -1453,7 +1453,7 @@ highlight = function (text) {
 
   function normalizeAutoRefreshInterval(value) {
     const candidate = String(value || "").trim().toLowerCase();
-    return AUTO_REFRESH_PRESETS.indexOf(candidate) >= 0 ? candidate : "5s";
+    return AUTO_REFRESH_PRESETS.indexOf(candidate) >= 0 ? candidate : "1m";
   }
 
   function autoRefreshIntervalMs(value) {
@@ -1602,7 +1602,7 @@ highlight = function (text) {
     state.search.pageSizeMode = String(state.search.pageSizeMode || getActivePageSizeMode());
     state.search.pageSizeError = !!state.search.pageSizeError;
     state.search.autoRefreshEnabled = state.search.autoRefreshEnabled !== false;
-    state.search.autoRefreshInterval = normalizeAutoRefreshInterval(state.search.autoRefreshInterval || "5s");
+    state.search.autoRefreshInterval = normalizeAutoRefreshInterval(state.search.autoRefreshInterval || "1m");
     state.search.columnWidths = safeObject(state.search.columnWidths);
     state.search.useCache = true;
     state.search.page = 1;
@@ -2857,6 +2857,10 @@ highlight = function (text) {
         syncSearchAutoRefresh();
         return;
       }
+      if (document.hidden) {
+        syncSearchAutoRefresh();
+        return;
+      }
       if (safeArray(state.search.selectedDatasourceIDs).length) {
         await runSearchWindow(1, {
           silentSuccess: true,
@@ -3216,7 +3220,7 @@ highlight = function (text) {
       return;
     }
     if (target.id === "search-auto-interval") {
-      state.search.autoRefreshInterval = normalizeAutoRefreshInterval(target.value || "5s");
+      state.search.autoRefreshInterval = normalizeAutoRefreshInterval(target.value || "1m");
       renderSearchToolbar();
       syncSearchAutoRefresh();
       return;
@@ -3267,7 +3271,7 @@ highlight = function (text) {
     state.search.pageSize = 500;
     state.search.pageSizeCustom = 1500;
     state.search.autoRefreshEnabled = true;
-    state.search.autoRefreshInterval = "5s";
+    state.search.autoRefreshInterval = "1m";
     if (byId("search-page-size")) byId("search-page-size").value = "500";
     if (byId("search-page-size-custom")) byId("search-page-size-custom").value = "";
     state.search.selectedDatasourceIDs = [];

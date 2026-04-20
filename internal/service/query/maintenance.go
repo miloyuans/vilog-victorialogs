@@ -19,6 +19,10 @@ func (s *Service) StartMaintenance(ctx context.Context) {
 		s.logger.Info("query maintenance disabled: cache service unavailable")
 		return
 	}
+	if !s.cfg.BackgroundSyncEnabled {
+		s.logger.Info("query maintenance disabled: background sync disabled")
+		return
+	}
 	if strings.TrimSpace(s.cfg.LocalLogDir) == "" {
 		s.logger.Info("query maintenance disabled: local_log_dir is empty")
 		return

@@ -96,6 +96,10 @@ func (s *Service) StartHotSync(ctx context.Context) {
 }
 
 func (s *Service) runHotSyncCycle(ctx context.Context) {
+	if s.hasInteractiveSyncPressure() {
+		s.logger.Debug("skip tracked hot log cache sync cycle because interactive syncs are active")
+		return
+	}
 	if err := s.refreshTrackedHotPartitions(ctx); err != nil {
 		s.logger.Warn("refresh tracked hot log partitions failed", zap.Error(err))
 	}
@@ -480,6 +484,28 @@ func (s *Service) loadPartitionWindow(
 				zap.String("day", cacheDay(day).Format("2006-01-02")),
 				zap.Int("rows", len(partition.Rows)),
 			)
+			if !s.cfg.BackgroundSyncEnabled {
+				if previewLimit > 0 && (len(partition.Rows) == 0 || s.cache.LogPartitionNeedsRefresh(partition.Meta, day, now)) {
+					previewPartition, previewPartial, previewErr := s.buildPreviewOnlyPartition(ctx, datasource, snapshot, tagDefinitions, serviceName, day, windowStart, windowEnd, now, previewLimit, true)
+					if previewErr != nil {
+						s.logger.Warn("refresh preview-only log partition failed",
+							zap.Error(previewErr),
+							zap.String("datasource", datasource.Name),
+							zap.String("service", displayServiceName(serviceName)),
+							zap.String("day", cacheDay(day).Format("2006-01-02")),
+						)
+					} else if len(previewPartition.Rows) > 0 || len(partition.Rows) == 0 {
+						s.logger.Info("refreshed preview-only log partition",
+							zap.String("datasource", datasource.Name),
+							zap.String("service", displayServiceName(serviceName)),
+							zap.String("day", cacheDay(day).Format("2006-01-02")),
+							zap.Int("rows", len(previewPartition.Rows)),
+						)
+						return previewPartition, false, previewPartial, nil
+					}
+				}
+				return partition, true, true, nil
+			}
 			if partition.Meta.Building {
 				previewRefreshed := false
 				if previewLimit > 0 && len(partition.Rows) == 0 && s.shouldRefreshBuildingPreview(partition.Meta, now) {
@@ -562,6 +588,21 @@ func (s *Service) loadPartitionWindow(
 	}
 
 	if useCache {
+		if !s.cfg.BackgroundSyncEnabled {
+			previewPartition, previewPartial, previewErr := s.buildPreviewOnlyPartition(ctx, datasource, snapshot, tagDefinitions, serviceName, day, windowStart, windowEnd, now, previewLimit, true)
+			if previewErr != nil {
+				return cache.LocalLogPartition{}, false, true, previewErr
+			}
+			if len(previewPartition.Rows) > 0 {
+				s.logger.Info("prepared preview-only log partition",
+					zap.String("datasource", datasource.Name),
+					zap.String("service", displayServiceName(serviceName)),
+					zap.String("day", cacheDay(day).Format("2006-01-02")),
+					zap.Int("rows", len(previewPartition.Rows)),
+				)
+			}
+			return previewPartition, false, previewPartial, nil
+		}
 		previewRows := []model.SearchResult{}
 		if previewLimit > 0 {
 			previewStart, previewEnd := intersectWindowWithDay(day, windowStart, windowEnd, now)
@@ -622,6 +663,45 @@ func (s *Service) loadPartitionWindow(
 		return cache.LocalLogPartition{}, false, true, err
 	}
 	return partition, false, partial, nil
+}
+
+func (s *Service) buildPreviewOnlyPartition(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	serviceName string,
+	day, windowStart, windowEnd, now time.Time,
+	previewLimit int,
+	persist bool,
+) (cache.LocalLogPartition, bool, error) {
+	previewRows := []model.SearchResult{}
+	if previewLimit > 0 {
+		previewStart, previewEnd := intersectWindowWithDay(day, windowStart, windowEnd, now)
+		if previewEnd.After(previewStart) {
+			var previewErr error
+			previewRows, previewErr = s.fetchPreviewSourceRange(ctx, datasource, snapshot, tagDefinitions, serviceName, previewStart, previewEnd, previewLimit)
+			if previewErr != nil {
+				return cache.LocalLogPartition{}, true, previewErr
+			}
+		}
+	}
+	previewRows, _ = s.normalizeRowsForPartition(previewRows, datasource, serviceName, day, "preview-only")
+	partition := cache.LocalLogPartition{
+		Meta: s.cache.PrepareLogPartitionMeta(day, serviceName, datasource, len(previewRows), now, true),
+		Rows: previewRows,
+	}
+	if persist {
+		if err := s.cache.StoreLogPartition(partition); err != nil {
+			s.logger.Warn("store preview-only log partition failed",
+				zap.Error(err),
+				zap.String("datasource", datasource.Name),
+				zap.String("service", displayServiceName(serviceName)),
+				zap.String("day", cacheDay(day).Format("2006-01-02")),
+			)
+		}
+	}
+	return partition, true, nil
 }
 
 func (s *Service) buildPartitionFromSource(

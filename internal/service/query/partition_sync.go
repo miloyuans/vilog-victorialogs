@@ -124,6 +124,23 @@ func (s *Service) isPartitionSyncActive(day time.Time, datasource model.Datasour
 	return ok
 }
 
+func (s *Service) hasInteractiveSyncPressure() bool {
+	s.partitionSyncMu.Lock()
+	defer s.partitionSyncMu.Unlock()
+	if len(s.interactivePendingSyncs) > 0 {
+		return true
+	}
+	for _, task := range s.partitionSyncs {
+		if task == nil {
+			continue
+		}
+		if task.queue == partitionSyncQueueInteractive {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Service) startPartitionWorkers(queue partitionSyncQueue, concurrency int) {
 	if concurrency <= 0 {
 		return
