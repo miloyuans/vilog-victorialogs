@@ -174,6 +174,7 @@ function getRawDecoratedResults() {
 function setSearchLoading(isLoading) {
   state.ui.searchLoading = !!isLoading;
   renderSearchLoadingState();
+  if (typeof syncSearchLiveStatus === "function") syncSearchLiveStatus();
   const submit = byId("search-submit");
   if (submit) submit.disabled = !!isLoading;
 }
@@ -998,7 +999,21 @@ renderSearchInspector = function () {
 renderSearchLoadingState = function () {
   const target = byId("search-loading-overlay");
   if (!target) return;
-  target.classList.toggle("open", !!state.ui.searchLoading);
+  const loading = !!state.ui.searchLoading;
+  target.classList.toggle("open", loading);
+  target.setAttribute("aria-hidden", loading ? "false" : "true");
+  target.innerHTML = `
+    <div class="search-loading-dialog">
+      <div class="search-loading-inline">
+        <div class="search-loading-spinner"></div>
+        <div class="search-loading-copy">
+          <strong>${esc(s("\u67e5\u8be2\u8fdb\u884c\u4e2d", "Query In Progress"))}</strong>
+          <span>${esc(s("\u5f53\u524d\u7ed3\u679c\u7a97\u53e3\u4f1a\u4fdd\u6301\u53ef\u8bfb\uff0c\u65b0\u7ed3\u679c\u4f1a\u5728\u51c6\u5907\u597d\u540e\u9759\u9ed8\u5237\u65b0\u3002", "The current result window stays readable. New rows will refresh silently when ready."))}</span>
+        </div>
+      </div>
+    </div>
+  `;
+  syncSearchLiveStatus();
 };
 
 renderDatasourceList = function () {
@@ -1622,6 +1637,9 @@ highlight = function (text) {
     state.search.exporting = !!state.search.exporting;
     state.search.exportStatusText = String(state.search.exportStatusText || "");
     state.search.exportStatusTone = String(state.search.exportStatusTone || "idle");
+    state.search.lastRunStatus = String(state.search.lastRunStatus || "idle");
+    state.search.lastRunMessage = String(state.search.lastRunMessage || "");
+    state.search.lastRunAt = Number(state.search.lastRunAt || 0);
   }
 
   if (!ensureEnhancedState.__base) {
@@ -2841,6 +2859,75 @@ highlight = function (text) {
     };
   }
 
+  function normalizeSearchRequestErrorMessage(error) {
+    const raw = String(error && error.message || error || "").trim();
+    const lowered = raw.toLowerCase();
+    if (!raw) {
+      return s("\u67e5\u8be2\u5931\u8d25\uff0c\u5f53\u524d\u7ed3\u679c\u5df2\u4fdd\u7559\u3002", "The query failed and the current result set was kept.");
+    }
+    if (lowered.indexOf("failed to fetch") >= 0) {
+      return s("\u7f51\u7edc\u8fde\u63a5\u6216\u4e0a\u6e38\u7f51\u5173\u6682\u65f6\u4e0d\u53ef\u7528\uff0c\u5f53\u524d\u7ed3\u679c\u5df2\u4fdd\u7559\u3002", "The network connection or upstream gateway is temporarily unavailable. Current results were kept.");
+    }
+    if (lowered.indexOf("502") >= 0 || lowered.indexOf("bad gateway") >= 0) {
+      return s("\u4e0a\u6e38\u7f51\u5173\u8fd4\u56de 502\uff0c\u8bf7\u7f29\u5c0f\u67e5\u8be2\u8303\u56f4\u540e\u91cd\u8bd5\u3002\u5f53\u524d\u7ed3\u679c\u5df2\u4fdd\u7559\u3002", "The upstream gateway returned 502. Narrow the query and retry. Current results were kept.");
+    }
+    if (lowered.indexOf("504") >= 0 || lowered.indexOf("gateway timeout") >= 0 || lowered.indexOf("timeout") >= 0) {
+      return s("\u67e5\u8be2\u8d85\u65f6\uff0c\u8bf7\u7f29\u5c0f\u65f6\u95f4\u8303\u56f4\u6216\u6570\u636e\u6e90\u8303\u56f4\u540e\u91cd\u8bd5\u3002", "The query timed out. Narrow the time range or datasource scope and retry.");
+    }
+    if (lowered.indexOf("<!doctype html") >= 0 || lowered.indexOf("<html") >= 0) {
+      return s("\u4e0a\u6e38\u8fd4\u56de\u4e86 HTML \u9519\u8bef\u9875\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u6216\u7f29\u5c0f\u67e5\u8be2\u8303\u56f4\u3002", "The upstream returned an HTML error page. Retry shortly or narrow the query scope.");
+    }
+    return raw.length > 220 ? raw.slice(0, 220) + "..." : raw;
+  }
+
+  function getSearchRuntimeStatus() {
+    normalizeFrontendCollections();
+    if (state.ui.searchLoading) {
+      return {
+        tone: "tone-soft is-loading",
+        text: s("\u67e5\u8be2\u8fdb\u884c\u4e2d\uff0c\u5f53\u524d\u7ed3\u679c\u4fdd\u6301\u53ef\u8bfb", "Query in progress. Current results stay readable."),
+      };
+    }
+    if (state.search.lastRunStatus === "error") {
+      return {
+        tone: "tone-warn",
+        text: state.search.lastRunMessage || s("\u6700\u8fd1\u4e00\u6b21\u5237\u65b0\u5931\u8d25\uff0c\u5df2\u4fdd\u7559\u65e7\u7ed3\u679c", "The latest refresh failed and the previous results were kept."),
+      };
+    }
+    if (state.search.lastRunStatus === "partial") {
+      return {
+        tone: "tone-soft",
+        text: state.search.lastRunMessage || s("\u7ed3\u679c\u5c1a\u5728\u6301\u7eed\u5237\u65b0", "Results are still refreshing."),
+      };
+    }
+    if (state.search.lastRunStatus === "ok") {
+      return {
+        tone: "tone-ok",
+        text: state.search.lastRunMessage || s("\u7ed3\u679c\u5df2\u66f4\u65b0", "Results updated."),
+      };
+    }
+    return {
+      tone: "tone-soft",
+      text: s("\u5c31\u7eea", "Ready"),
+    };
+  }
+
+  function syncSearchLiveStatus() {
+    const node = byId("search-live-status");
+    if (!node) return;
+    const runtimeStatus = getSearchRuntimeStatus();
+    node.className = `toolbar-mini-meta toolbar-mini-search-status ${runtimeStatus.tone}`.trim();
+    node.textContent = `${s("\u67e5\u8be2\u72b6\u6001", "Search")}: ${runtimeStatus.text}`;
+  }
+
+  function setSearchRuntimeStatus(status, message) {
+    normalizeFrontendCollections();
+    state.search.lastRunStatus = String(status || "idle");
+    state.search.lastRunMessage = String(message || "");
+    if (status === "ok" || status === "partial") state.search.lastRunAt = Date.now();
+    syncSearchLiveStatus();
+  }
+
   function syncSearchAutoRefresh() {
     clearSearchAutoRefresh();
     normalizeFrontendCollections();
@@ -2913,6 +3000,7 @@ highlight = function (text) {
     state.search.pageSizeMode = pageInfo.mode;
     state.search.useCache = true;
     const previousSelectedKey = state.search.selectedResultKey;
+    setSearchRuntimeStatus("loading", s("\u67e5\u8be2\u8fdb\u884c\u4e2d\uff0c\u5f53\u524d\u7ed3\u679c\u4fdd\u6301\u53ef\u8bfb\u3002", "Query in progress. Current results stay readable."));
     if (!(options && options.background)) {
       setSearchLoading(true);
     }
@@ -2934,23 +3022,26 @@ highlight = function (text) {
       state.ui.detailOpen = false;
       renderSearchControls();
       renderSearchResults();
-      if (!(options && options.silentSuccess)) {
-        const successMessage = response.partial && results.length
-          ? s("\u5df2\u8fd4\u56de\u4e00\u6279\u5373\u65f6\u9884\u89c8\u7ed3\u679c\uff0c\u540e\u53f0\u4ecd\u5728\u7ee7\u7eed\u8865\u9f50\u672c\u5730\u7f13\u5b58\u3002", "A live preview is already available. Background backfill is still completing the local cache.")
-          : response.partial && !results.length
-            ? s("\u672c\u5730\u7f13\u5b58\u6b63\u5728\u540e\u53f0\u8865\u6570\uff0c\u7ed3\u679c\u4f1a\u968f auto \u67e5\u8be2\u9010\u6b65\u5237\u65b0\u3002", "Local cache backfill is running in the background. Results will appear incrementally through auto refresh.")
-            : results.length
-              ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\u3002", "Search completed.")
-              : s("\u67e5\u8be2\u5b8c\u6210\uff0c\u4f46\u5f53\u524d\u6761\u4ef6\u4e0b\u6ca1\u6709\u6570\u636e\u3002", "Search completed, but no data matched the current filters.");
-        toast(successMessage, results.length ? "success" : "info");
+      const successMessage = response.partial && results.length
+        ? s("\u65b0\u7ed3\u679c\u5df2\u9759\u9ed8\u5408\u5e76\uff0c\u540e\u7eed\u7ed3\u679c\u4f1a\u7ee7\u7eed\u5237\u65b0\u3002", "New results were merged silently. More rows will continue to refresh.")
+        : response.partial && !results.length
+          ? s("\u5f53\u524d\u6761\u4ef6\u6682\u672a\u547d\u4e2d\uff0c\u7cfb\u7edf\u4f1a\u7ee7\u7eed\u9759\u9ed8\u5237\u65b0\u3002", "No matches yet for the current filters. The system will continue refreshing silently.")
+          : results.length
+            ? s("\u7ed3\u679c\u5df2\u66f4\u65b0\uff0c\u53ef\u7ee7\u7eed\u6d4f\u89c8\u5f53\u524d\u5217\u8868\u3002", "Results were updated. You can keep browsing the current list.")
+            : s("\u6ca1\u6709\u5339\u914d\u5f53\u524d\u8fc7\u6ee4\u6761\u4ef6\u7684\u65e5\u5fd7\u3002", "No logs matched the current filters.");
+      setSearchRuntimeStatus(response.partial ? "partial" : "ok", successMessage);
+      if (!(options && options.silentSuccess) && !results.length) {
+        toast(successMessage, "info");
       }
       return true;
     } catch (error) {
       if (error && (error.name === "AbortError" || String(error.message || "").indexOf("aborted") >= 0)) {
         return false;
       }
+      const message = normalizeSearchRequestErrorMessage(error);
+      setSearchRuntimeStatus("error", message);
       if (!(options && options.background)) {
-        toast(error.message || String(error), "error");
+        toast(message, "error");
       }
       return false;
     } finally {
@@ -3001,6 +3092,7 @@ highlight = function (text) {
     const pageInfo = getSearchPageSizeFromState();
     const autoEnabled = state.search.autoRefreshEnabled !== false;
     const autoInterval = normalizeAutoRefreshInterval(state.search.autoRefreshInterval);
+    const runtimeStatus = getSearchRuntimeStatus();
     const target = byId("search-toolbar-controls");
     if (!target) return;
     syncHiddenQueryInput();
@@ -3068,6 +3160,7 @@ highlight = function (text) {
         <div class="toolbar-mini-meta">${esc(s("\u67e5\u8be2\u6570\u636e\u6e90", "Query datasources"))}: ${esc(String(selectedCount || "ALL"))}</div>
         <div class="toolbar-mini-meta">${esc(s("\u670d\u52a1\u76ee\u5f55", "Services"))}: ${esc(String(serviceCount || "ALL"))}</div>
         <div class="toolbar-mini-meta">${esc(s("\u5f53\u524d\u53ef\u89c1", "Visible"))}: ${esc(String(resultCount))}</div>
+        <div class="toolbar-mini-meta toolbar-mini-search-status ${runtimeStatus.tone}" id="search-live-status">${esc(s("\u67e5\u8be2\u72b6\u6001", "Search"))}: ${esc(runtimeStatus.text)}</div>
         <div class="toolbar-export-inline">
           <button class="button button-small button-primary toolbar-export-inline-button" type="button" data-action="export-search-all" ${exportBusy || !resultCount ? "disabled" : ""}>${esc(s("\u5168\u90e8\u4e0b\u8f7d", "Download All"))}</button>
           <div class="toolbar-mini-meta toolbar-mini-export-status ${exportTone}">${esc(s("\u5bfc\u51fa\u72b6\u6001", "Export"))}: ${esc(exportBusy ? s("\u5bfc\u51fa\u4e2d", "Exporting") : exportStatusText)}</div>
@@ -3159,7 +3252,7 @@ highlight = function (text) {
     let content = "";
     if (!results.length) {
       content = empty((state.search.response && state.search.response.partial)
-        ? s("\u540e\u53f0\u6b63\u5728\u8865\u9f50\u672c\u5730\u7f13\u5b58\uff0c\u7ed3\u679c\u4f1a\u968f auto \u67e5\u8be2\u9010\u6b65\u51fa\u73b0\u3002", "Background cache backfill is running. Results will appear incrementally through auto refresh.")
+        ? s("\u7cfb\u7edf\u6b63\u5728\u6269\u5927\u67e5\u8be2\u7a97\u53e3\u5e76\u7ee7\u7eed\u8fc7\u6ee4\uff0c\u6709\u65b0\u547d\u4e2d\u65f6\u4f1a\u9759\u9ed8\u5237\u65b0\u5230\u5f53\u524d\u7ed3\u679c\u7a97\u53e3\u3002", "The system is widening the search window and continuing to filter. New matches will refresh silently into the current result window.")
         : s("\u5f53\u524d\u6761\u4ef6\u4e0b\u6ca1\u6709\u65e5\u5fd7\u7ed3\u679c\u3002", "No logs matched the current query."));
     } else if (state.search.view === "json") {
       content = `<div class="raw-view compact-raw-view"><pre>${esc(JSON.stringify(results.map(stripRuntimeFields), null, 2))}</pre></div>`;

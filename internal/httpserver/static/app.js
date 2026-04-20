@@ -1577,7 +1577,38 @@ function setPanel(name) {
 
 async function safeFetchStatus(url) { try { return await fetchStatus(url); } catch (error) { return { ok: false, status: 0, data: { status: "error", error: error.message } }; } }
 async function fetchStatus(url) { const res = await fetch(url, { headers: { Accept: "application/json" } }); const text = await res.text(); let data = {}; try { data = text ? JSON.parse(text) : {}; } catch (_error) { data = { raw: text, status: res.ok ? "ok" : "error" }; } return { ok: res.ok, status: res.status, data }; }
-async function request(url, options) { const res = await fetch(url, { method: (options && options.method) || "GET", headers: { Accept: "application/json", "Content-Type": "application/json" }, body: options && options.body ? options.body : undefined, signal: options && options.signal ? options.signal : undefined }); const text = await res.text(); let data = null; try { data = text ? JSON.parse(text) : null; } catch (_error) { data = text; } if (!res.ok) throw new Error(data && data.error && data.error.message ? data.error.message : typeof data === "string" ? data : `${res.status} ${res.statusText}`); return data; }
+function normalizeRequestError(status, statusText, data) {
+  if (data && data.error && data.error.message) return data.error.message;
+  const raw = typeof data === "string" ? data : "";
+  const lowered = raw.toLowerCase();
+  if (status === 502 || lowered.indexOf("error code 502") >= 0 || lowered.indexOf("bad gateway") >= 0) {
+    return s("查询网关暂时不可用，请缩小范围后重试。当前结果已保留。", "The query gateway is temporarily unavailable. Narrow the query and retry. Current results were kept.");
+  }
+  if (status === 504 || lowered.indexOf("gateway timeout") >= 0) {
+    return s("查询超时，请缩小时间范围或减少数据源后重试。", "The query timed out. Narrow the time range or reduce the datasource scope and retry.");
+  }
+  if (lowered.indexOf("<!doctype html") >= 0 || lowered.indexOf("<html") >= 0) {
+    return status ? `${status} ${statusText}` : s("上游返回了非 JSON 错误页面。", "The upstream returned a non-JSON error page.");
+  }
+  if (raw) return raw.length > 220 ? raw.slice(0, 220) + "..." : raw;
+  return `${status} ${statusText}`;
+}
+async function request(url, options) {
+  try {
+    const res = await fetch(url, { method: (options && options.method) || "GET", headers: { Accept: "application/json", "Content-Type": "application/json" }, body: options && options.body ? options.body : undefined, signal: options && options.signal ? options.signal : undefined });
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch (_error) { data = text; }
+    if (!res.ok) throw new Error(normalizeRequestError(res.status, res.statusText, data));
+    return data;
+  } catch (error) {
+    if (error && error.name === "AbortError") throw error;
+    if (String(error && error.message || "").toLowerCase().indexOf("failed to fetch") >= 0) {
+      throw new Error(s("网络连接或上游网关暂时不可用，当前结果已保留。", "The network connection or upstream gateway is temporarily unavailable. Current results were kept."));
+    }
+    throw error;
+  }
+}
 async function busy(button, fn) { const original = button.textContent; button.disabled = true; button.textContent = s("处理中...", "Working..."); try { await fn(); } catch (error) { toast(error.message, "error"); } finally { button.disabled = false; button.textContent = original; } }
 
 function getDecoratedResults() { return ((state.search.response && state.search.response.results) || []).map((item, index) => ({ ...item, _index: index, _level: inferLevel(item) })); }
