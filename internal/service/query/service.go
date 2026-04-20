@@ -36,6 +36,22 @@ type Service struct {
 	interactiveUrgentSem    chan struct{}
 	servicePriorityMu       sync.Mutex
 	servicePriorityTTL      map[string]time.Time
+	previewCacheMu          sync.Mutex
+	previewCache            map[string]previewCacheEntry
+	previewFetches          map[string]*previewFetchTask
+}
+
+type previewCacheEntry struct {
+	partition cache.LocalLogPartition
+	partial   bool
+	expireAt  time.Time
+}
+
+type previewFetchTask struct {
+	done      chan struct{}
+	partition cache.LocalLogPartition
+	partial   bool
+	err       error
 }
 
 func New(store *mongostore.Store, cacheService *cache.Service, client *victorialogs.Client, cfg config.CacheConfig, logger *zap.Logger) *Service {
@@ -62,6 +78,8 @@ func New(store *mongostore.Store, cacheService *cache.Service, client *victorial
 		partitionSyncs:       make(map[string]*partitionSyncTask),
 		interactiveUrgentSem: make(chan struct{}, 1),
 		servicePriorityTTL:   make(map[string]time.Time),
+		previewCache:         make(map[string]previewCacheEntry),
+		previewFetches:       make(map[string]*previewFetchTask),
 	}
 	svc.partitionSyncCond = sync.NewCond(&svc.partitionSyncMu)
 	svc.startPartitionWorkers(partitionSyncQueueInteractive, interactiveConcurrency)
@@ -91,6 +109,95 @@ func (s *Service) StartHotSync(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.runHotSyncCycle(ctx)
+		}
+	}
+}
+
+func (s *Service) previewCacheTTL() time.Duration {
+	ttl := s.cfg.QueryTTL
+	switch {
+	case ttl <= 0:
+		ttl = time.Minute
+	case ttl > time.Minute:
+		ttl = time.Minute
+	case ttl < 10*time.Second:
+		ttl = 10 * time.Second
+	}
+	return ttl
+}
+
+func (s *Service) previewCacheKey(datasource model.Datasource, serviceName string, day, start, end time.Time, limit int) string {
+	return strings.Join([]string{
+		datasource.ID,
+		cacheDay(day).Format("2006-01-02"),
+		serviceName,
+		start.UTC().Format(time.RFC3339Nano),
+		end.UTC().Format(time.RFC3339Nano),
+		strconv.Itoa(limit),
+	}, "|")
+}
+
+func (s *Service) getPreviewCache(key string, now time.Time) (cache.LocalLogPartition, bool, bool) {
+	s.previewCacheMu.Lock()
+	defer s.previewCacheMu.Unlock()
+
+	s.cleanupExpiredPreviewCacheLocked(now.UTC())
+	entry, ok := s.previewCache[key]
+	if !ok || (!entry.expireAt.IsZero() && now.UTC().After(entry.expireAt)) {
+		delete(s.previewCache, key)
+		return cache.LocalLogPartition{}, false, false
+	}
+	return entry.partition, entry.partial, true
+}
+
+func (s *Service) beginPreviewFetch(key string) (*previewFetchTask, bool) {
+	s.previewCacheMu.Lock()
+	defer s.previewCacheMu.Unlock()
+
+	if task, ok := s.previewFetches[key]; ok {
+		return task, false
+	}
+	task := &previewFetchTask{done: make(chan struct{})}
+	s.previewFetches[key] = task
+	return task, true
+}
+
+func (s *Service) finishPreviewFetch(key string, task *previewFetchTask, partition cache.LocalLogPartition, partial bool, err error) {
+	if task == nil {
+		return
+	}
+	s.previewCacheMu.Lock()
+	if err == nil {
+		s.previewCache[key] = previewCacheEntry{
+			partition: partition,
+			partial:   partial,
+			expireAt:  time.Now().UTC().Add(s.previewCacheTTL()),
+		}
+	}
+	delete(s.previewFetches, key)
+	task.partition = partition
+	task.partial = partial
+	task.err = err
+	close(task.done)
+	s.previewCacheMu.Unlock()
+}
+
+func (s *Service) waitPreviewFetch(ctx context.Context, task *previewFetchTask) (cache.LocalLogPartition, bool, error) {
+	if task == nil {
+		return cache.LocalLogPartition{}, true, nil
+	}
+	select {
+	case <-ctx.Done():
+		return cache.LocalLogPartition{}, true, ctx.Err()
+	case <-task.done:
+		return task.partition, task.partial, task.err
+	}
+}
+
+func (s *Service) cleanupExpiredPreviewCacheLocked(now time.Time) {
+	for key, entry := range s.previewCache {
+		if !entry.expireAt.IsZero() && now.After(entry.expireAt) {
+			delete(s.previewCache, key)
 		}
 	}
 }
@@ -468,6 +575,14 @@ func (s *Service) loadPartitionWindow(
 	useCache bool,
 	previewLimit int,
 ) (cache.LocalLogPartition, bool, bool, error) {
+	if !s.cfg.BackgroundSyncEnabled {
+		previewPartition, previewPartial, previewErr := s.buildPreviewOnlyPartition(ctx, datasource, snapshot, tagDefinitions, serviceName, day, windowStart, windowEnd, now, previewLimit, false)
+		if previewErr != nil {
+			return cache.LocalLogPartition{}, false, true, previewErr
+		}
+		return previewPartition, false, previewPartial, nil
+	}
+
 	if useCache {
 		partition, hit, err := s.cache.LoadLogPartition(day, serviceName, datasource)
 		if err != nil {
@@ -484,28 +599,6 @@ func (s *Service) loadPartitionWindow(
 				zap.String("day", cacheDay(day).Format("2006-01-02")),
 				zap.Int("rows", len(partition.Rows)),
 			)
-			if !s.cfg.BackgroundSyncEnabled {
-				if previewLimit > 0 && (len(partition.Rows) == 0 || s.cache.LogPartitionNeedsRefresh(partition.Meta, day, now)) {
-					previewPartition, previewPartial, previewErr := s.buildPreviewOnlyPartition(ctx, datasource, snapshot, tagDefinitions, serviceName, day, windowStart, windowEnd, now, previewLimit, true)
-					if previewErr != nil {
-						s.logger.Warn("refresh preview-only log partition failed",
-							zap.Error(previewErr),
-							zap.String("datasource", datasource.Name),
-							zap.String("service", displayServiceName(serviceName)),
-							zap.String("day", cacheDay(day).Format("2006-01-02")),
-						)
-					} else if len(previewPartition.Rows) > 0 || len(partition.Rows) == 0 {
-						s.logger.Info("refreshed preview-only log partition",
-							zap.String("datasource", datasource.Name),
-							zap.String("service", displayServiceName(serviceName)),
-							zap.String("day", cacheDay(day).Format("2006-01-02")),
-							zap.Int("rows", len(previewPartition.Rows)),
-						)
-						return previewPartition, false, previewPartial, nil
-					}
-				}
-				return partition, true, true, nil
-			}
 			if partition.Meta.Building {
 				previewRefreshed := false
 				if previewLimit > 0 && len(partition.Rows) == 0 && s.shouldRefreshBuildingPreview(partition.Meta, now) {
@@ -588,21 +681,6 @@ func (s *Service) loadPartitionWindow(
 	}
 
 	if useCache {
-		if !s.cfg.BackgroundSyncEnabled {
-			previewPartition, previewPartial, previewErr := s.buildPreviewOnlyPartition(ctx, datasource, snapshot, tagDefinitions, serviceName, day, windowStart, windowEnd, now, previewLimit, true)
-			if previewErr != nil {
-				return cache.LocalLogPartition{}, false, true, previewErr
-			}
-			if len(previewPartition.Rows) > 0 {
-				s.logger.Info("prepared preview-only log partition",
-					zap.String("datasource", datasource.Name),
-					zap.String("service", displayServiceName(serviceName)),
-					zap.String("day", cacheDay(day).Format("2006-01-02")),
-					zap.Int("rows", len(previewPartition.Rows)),
-				)
-			}
-			return previewPartition, false, previewPartial, nil
-		}
 		previewRows := []model.SearchResult{}
 		if previewLimit > 0 {
 			previewStart, previewEnd := intersectWindowWithDay(day, windowStart, windowEnd, now)
@@ -675,16 +753,30 @@ func (s *Service) buildPreviewOnlyPartition(
 	previewLimit int,
 	persist bool,
 ) (cache.LocalLogPartition, bool, error) {
+	previewStart, previewEnd := intersectWindowWithDay(day, windowStart, windowEnd, now)
+	if !previewEnd.After(previewStart) || previewLimit <= 0 {
+		return cache.LocalLogPartition{
+			Meta: s.cache.PrepareLogPartitionMeta(day, serviceName, datasource, 0, now, true),
+			Rows: []model.SearchResult{},
+		}, true, nil
+	}
+
+	cacheKey := s.previewCacheKey(datasource, serviceName, day, previewStart, previewEnd, previewLimit)
+	if partition, partial, ok := s.getPreviewCache(cacheKey, now); ok {
+		return partition, partial, nil
+	}
+
+	task, leader := s.beginPreviewFetch(cacheKey)
+	if !leader {
+		return s.waitPreviewFetch(ctx, task)
+	}
+
 	previewRows := []model.SearchResult{}
-	if previewLimit > 0 {
-		previewStart, previewEnd := intersectWindowWithDay(day, windowStart, windowEnd, now)
-		if previewEnd.After(previewStart) {
-			var previewErr error
-			previewRows, previewErr = s.fetchPreviewSourceRange(ctx, datasource, snapshot, tagDefinitions, serviceName, previewStart, previewEnd, previewLimit)
-			if previewErr != nil {
-				return cache.LocalLogPartition{}, true, previewErr
-			}
-		}
+	var previewErr error
+	previewRows, previewErr = s.fetchPreviewSourceRange(ctx, datasource, snapshot, tagDefinitions, serviceName, previewStart, previewEnd, previewLimit)
+	if previewErr != nil {
+		s.finishPreviewFetch(cacheKey, task, cache.LocalLogPartition{}, true, previewErr)
+		return cache.LocalLogPartition{}, true, previewErr
 	}
 	previewRows, _ = s.normalizeRowsForPartition(previewRows, datasource, serviceName, day, "preview-only")
 	partition := cache.LocalLogPartition{
@@ -701,6 +793,7 @@ func (s *Service) buildPreviewOnlyPartition(
 			)
 		}
 	}
+	s.finishPreviewFetch(cacheKey, task, partition, true, nil)
 	return partition, true, nil
 }
 
