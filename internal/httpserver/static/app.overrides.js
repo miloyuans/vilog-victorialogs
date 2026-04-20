@@ -1013,7 +1013,7 @@ renderSearchLoadingState = function () {
       </div>
     </div>
   `;
-  syncSearchLiveStatus();
+  if (typeof syncSearchLiveStatus === "function") syncSearchLiveStatus();
 };
 
 renderDatasourceList = function () {
@@ -3465,9 +3465,88 @@ highlight = function (text) {
     return downloadCompressedExport(exportFilename("txt", allResults), text, "text/plain");
   };
 
+  async function executeStableSearch(options) {
+    normalizeFrontendCollections();
+    syncHiddenQueryInput();
+    if (!safeArray(state.search.selectedDatasourceIDs).length) {
+      if (!(options && options.background)) {
+        toast(s("\u8bf7\u5148\u9009\u62e9\u81f3\u5c11\u4e00\u4e2a\u67e5\u8be2\u6570\u636e\u6e90\u3002", "Select at least one search datasource."), "error");
+      }
+      return false;
+    }
+    const pageInfo = getSearchPageSizeFromState();
+    if (!pageInfo.valid) {
+      state.search.pageSizeError = true;
+      renderSearchToolbar();
+      if (!(options && options.background)) {
+        toast(s("\u81ea\u5b9a\u4e49\u6761\u6570\u6700\u5927\u4e0d\u80fd\u8d85\u8fc7 10000\u3002", "Custom rows cannot exceed 10000."), "error");
+      }
+      return false;
+    }
+    state.search.page = 1;
+    state.search.pageSize = pageInfo.value;
+    state.search.pageSizeCustom = pageInfo.mode === "custom" ? pageInfo.value : state.search.pageSizeCustom;
+    state.search.pageSizeCustomRaw = pageInfo.raw;
+    state.search.pageSizeMode = pageInfo.mode;
+    state.search.pageSizeError = false;
+    state.search.useCache = true;
+    const previousSelectedKey = state.search.selectedResultKey;
+    activeSearchAbortController = null;
+    activeSearchRequest = null;
+    activeSearchRequestKey = "";
+    setSearchRuntimeStatus("loading", s("\u67e5\u8be2\u8fdb\u884c\u4e2d\uff0c\u8bf7\u7a0d\u5019\u3002", "Query in progress. Please wait."));
+    if (!(options && options.background)) {
+      setSearchLoading(true);
+    }
+    try {
+      const payload = buildCurrentSearchPayload(1, pageInfo.value);
+      const finalState = commitSearchResponse(
+        await request("/api/query/search", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        }),
+        options,
+        previousSelectedKey,
+      );
+      const response = finalState.response;
+      const results = finalState.results;
+      const successMessage = response.partial
+        ? (results.length
+          ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\uff0c\u5f53\u524d\u8fd4\u56de\u7684\u662f\u90e8\u5206\u7ed3\u679c\u3002", "Query completed with partial results.")
+          : s("\u5f53\u524d\u6761\u4ef6\u6682\u65e0\u7ed3\u679c\uff0c\u8bf7\u7f29\u5c0f\u8303\u56f4\u6216\u653e\u5bbd\u8fc7\u6ee4\u3002", "No rows matched yet. Narrow the scope or relax the filters."))
+        : (results.length
+          ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\u3002", "Query completed.")
+          : s("\u6ca1\u6709\u5339\u914d\u5f53\u524d\u8fc7\u6ee4\u6761\u4ef6\u7684\u65e5\u5fd7\u3002", "No logs matched the current filters."));
+      setSearchRuntimeStatus(response.partial ? "partial" : "ok", successMessage);
+      if (!(options && options.silentSuccess) && !results.length && !(options && options.background)) {
+        toast(successMessage, "info");
+      }
+      return true;
+    } catch (error) {
+      if (error && (error.name === "AbortError" || String(error.message || "").indexOf("aborted") >= 0)) {
+        return false;
+      }
+      const message = normalizeSearchRequestErrorMessage(error);
+      setSearchRuntimeStatus("error", message);
+      if (!(options && options.background)) {
+        toast(message, "error");
+      }
+      return false;
+    } finally {
+      if (!(options && options.background)) {
+        setSearchLoading(false);
+      }
+      syncSearchAutoRefresh();
+    }
+  }
+
+  runSearchWindow = async function (_pageOverride, options) {
+    return executeStableSearch(options || {});
+  };
+
   submitSearch = async function (event) {
-    event.preventDefault();
-    await runSearchWindow();
+    if (event) event.preventDefault();
+    await executeStableSearch({});
   };
 
   renderLogEntry = function (item) {
@@ -3687,39 +3766,26 @@ highlight = function (text) {
     return __latestHandleInput(event);
   };
 
-  function refreshSearchMenusSoon() {
-    renderSearchCatalogDatasourceOptions();
-    renderSearchServiceOptions();
-    renderSearchContext();
-    syncSearchMenuState();
-    Promise.resolve()
-      .then(() => loadSearchCatalogs())
-      .catch((error) => {
-        console.error(error);
-        toast(error && error.message ? error.message : "Failed to refresh search catalogs.", "error");
-      });
-  }
-
-  toggleSearchDatasource = function (id) {
+  toggleSearchDatasource = async function (id) {
     normalizeFrontendCollections();
     const selected = safeArray(state.search.selectedDatasourceIDs);
     state.search.selectedDatasourceIDs = selected.indexOf(id) >= 0
       ? selected.filter((item) => item !== id)
       : selected.concat([id]);
     syncCatalogDatasource();
-    refreshSearchMenusSoon();
+    await loadSearchCatalogs();
   };
 
-  selectAllSearchDatasources = function () {
+  selectAllSearchDatasources = async function () {
     normalizeFrontendCollections();
     const enabled = safeArray(state.datasources).filter((item) => item && item.enabled);
     const pool = enabled.length ? enabled : safeArray(state.datasources);
     state.search.selectedDatasourceIDs = pool.map((item) => item.id);
     syncCatalogDatasource();
-    refreshSearchMenusSoon();
+    await loadSearchCatalogs();
   };
 
-  toggleSearchService = function (name) {
+  toggleSearchService = async function (name) {
     normalizeFrontendCollections();
     const selected = safeArray(state.search.serviceNames);
     state.search.serviceNames = selected.indexOf(name) >= 0
@@ -3727,15 +3793,15 @@ highlight = function (text) {
       : selected.concat([name]);
     state.search.activeFilters = {};
     state.search.tagValues = {};
-    refreshSearchMenusSoon();
+    await loadSearchCatalogs();
   };
 
-  selectAllSearchServices = function () {
+  selectAllSearchServices = async function () {
     normalizeFrontendCollections();
     state.search.serviceNames = [];
     state.search.activeFilters = {};
     state.search.tagValues = {};
-    refreshSearchMenusSoon();
+    await loadSearchCatalogs();
   };
 })();
 
