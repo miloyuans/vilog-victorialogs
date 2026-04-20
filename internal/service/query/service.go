@@ -346,6 +346,7 @@ func compactSearchResultsForResponse(items []model.SearchResult) []model.SearchR
 	compacted := make([]model.SearchResult, 0, len(items))
 	for _, item := range items {
 		clone := item
+		clone.SearchText = searchableRowText(item)
 		clone.Raw = nil
 		compacted = append(compacted, clone)
 	}
@@ -2055,11 +2056,63 @@ func searchableRowText(row model.SearchResult) string {
 		parts = append(parts, key, value)
 	}
 	if len(row.Raw) > 0 {
+		parts = appendSearchableValue(parts, row.Raw)
 		if raw, err := json.Marshal(row.Raw); err == nil {
 			parts = append(parts, string(raw))
 		}
 	}
 	return strings.ToLower(strings.Join(parts, "\n"))
+}
+
+func appendSearchableValue(parts []string, value any) []string {
+	switch typed := value.(type) {
+	case nil:
+		return parts
+	case string:
+		text := strings.TrimSpace(typed)
+		if text != "" {
+			parts = append(parts, text)
+		}
+		return parts
+	case []any:
+		for _, item := range typed {
+			parts = appendSearchableValue(parts, item)
+		}
+		return parts
+	case []string:
+		for _, item := range typed {
+			parts = appendSearchableValue(parts, item)
+		}
+		return parts
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			parts = append(parts, key)
+			parts = appendSearchableValue(parts, typed[key])
+		}
+		return parts
+	case map[string]string:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			parts = append(parts, key)
+			parts = appendSearchableValue(parts, typed[key])
+		}
+		return parts
+	default:
+		text := strings.TrimSpace(stringify(typed))
+		if text != "" {
+			parts = append(parts, text)
+		}
+		return parts
+	}
 }
 
 func searchResultKey(row model.SearchResult) string {

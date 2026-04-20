@@ -17,8 +17,10 @@ function createQueryLayer(mode, value) {
 function ensureEnhancedState() {
   state.ui = state.ui || {};
   state.search = state.search || {};
-  state.ui.navCollapsed = !!state.ui.navCollapsed;
-  state.ui.railCollapsed = !!state.ui.railCollapsed;
+  const navCollapsedPref = localStorage.getItem(storageKeys.navCollapsed);
+  const railCollapsedPref = localStorage.getItem(storageKeys.railCollapsed);
+  state.ui.navCollapsed = navCollapsedPref == null ? true : navCollapsedPref === "true";
+  state.ui.railCollapsed = railCollapsedPref == null ? true : railCollapsedPref === "true";
   state.ui.detailOpen = !!state.ui.detailOpen;
   state.ui.datasourceModalOpen = !!state.ui.datasourceModalOpen;
   state.ui.openMenu = state.ui.openMenu || "";
@@ -122,12 +124,12 @@ function syncHiddenQueryInput() {
 
 function searchableText(item) {
   return [
+    item.search_text || "",
     item.message || "",
     item.service || "",
     item.datasource || "",
     item.pod || "",
     JSON.stringify(item.labels || {}),
-    JSON.stringify(item.raw || {}),
   ]
     .join("\n")
     .toLowerCase();

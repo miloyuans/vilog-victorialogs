@@ -368,6 +368,27 @@ mark.highlight-tone-purple{background:rgba(176,132,245,.28);color:#e7d3ff}
 .log-results-table td,.compact-log-message,.log-cell-message{font-size:.67rem;line-height:1.1}
 .search-rail-copy strong,.search-rail-section-title{font-size:.63rem}
 .search-rail-copy span,.search-rail .tiny,.search-tag-grid .filter-chip-card strong,.search-tag-grid .filter-chip-card small{font-size:.56rem!important}
+
+@media (min-width:1101px){
+  .app-shell.nav-collapsed:has(.nav-tabs:hover){grid-template-columns:208px minmax(0,1fr)}
+  .app-shell.nav-collapsed .nav-tabs{overflow:hidden}
+  .app-shell.nav-collapsed:has(.nav-tabs:hover) .nav-brand-copy{display:grid}
+  .app-shell.nav-collapsed:has(.nav-tabs:hover) .nav-section-title,
+  .app-shell.nav-collapsed:has(.nav-tabs:hover) .tab-label{display:block}
+  .app-shell.nav-collapsed:has(.nav-tabs:hover) .tab-button{justify-content:flex-start}
+  .search-workbench.rail-collapsed:has(.search-rail:hover){grid-template-columns:176px minmax(0,1fr)}
+  .search-workbench.rail-collapsed .search-rail{position:sticky;z-index:8}
+  .search-workbench.rail-collapsed .search-rail:hover{width:176px;min-width:176px;max-width:176px;overflow:auto;box-shadow:var(--shadow-lg)}
+  .search-workbench.rail-collapsed:has(.search-rail:hover) .search-rail-copy,
+  .search-workbench.rail-collapsed:has(.search-rail:hover) .search-rail-section{display:grid}
+  .search-workbench.rail-collapsed:has(.search-rail:hover) .search-rail-actions .button,
+  .search-workbench.rail-collapsed:has(.search-rail:hover) .mode-switch{display:inline-flex}
+}
+
+.log-results-table td,
+.log-results-table th,
+.compact-log-message,
+.log-cell-message{font-size:.8rem;line-height:1.5}
 .floating-export-card{min-width:186px;max-width:min(280px,calc(100vw - 18px));padding:7px 8px;gap:4px}
 .floating-export-copy strong{font-size:.6rem}
 .floating-export-copy span,.floating-export-status span{font-size:.56rem}
@@ -405,3 +426,11 @@ mark.highlight-tone-purple{background:rgba(176,132,245,.28);color:#e7d3ff}
 .toolbar-menu-panel{position:fixed!important;top:0;left:0;right:auto!important;width:min(360px,calc(100vw - 24px))!important;max-height:calc(100vh - 24px);overflow:auto;overscroll-behavior:contain}
 #search-service-menu,#search-time-menu{left:0!important;right:auto!important}
 .menu-check-item[hidden],[data-menu-filter-empty][hidden]{display:none!important}
+
+.log-results-table td,
+.log-results-table th,
+.compact-log-message,
+.log-cell-message{font-size:.78rem!important;line-height:1.32!important}
+
+.log-cell-pod,
+.log-meta-pod{font-size:.72rem!important;line-height:1.12!important}
