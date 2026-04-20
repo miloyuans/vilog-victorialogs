@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"go.uber.org/zap"
@@ -35,6 +36,29 @@ func TestHealthzReturnsOK(t *testing.T) {
 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+}
+
+func TestIndexDisablesCacheAndVersionsAssets(t *testing.T) {
+	server := newTestServer(t, nil)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+
+	server.engine.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	if cacheControl := recorder.Header().Get("Cache-Control"); !strings.Contains(cacheControl, "no-store") {
+		t.Fatalf("cache-control = %q, want no-store", cacheControl)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "/assets/app.js?v=") {
+		t.Fatalf("index body does not contain versioned app.js asset")
+	}
+	if !strings.Contains(body, "/assets/styles.css?v=") {
+		t.Fatalf("index body does not contain versioned styles.css asset")
 	}
 }
 

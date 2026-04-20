@@ -45,6 +45,7 @@ type Server struct {
 	logger    *zap.Logger
 	checkers  []ReadinessChecker
 	buildInfo BuildInfo
+	staticVersion string
 	deps      Dependencies
 }
 
@@ -74,6 +75,7 @@ func New(cfg config.Config, logger *zap.Logger, checkers []ReadinessChecker, bui
 		logger:    logger,
 		checkers:  checkers,
 		buildInfo: buildInfo,
+		staticVersion: buildStaticVersion(buildInfo),
 		deps:      deps,
 		server: &http.Server{
 			Addr:         cfg.HTTP.Addr,
@@ -87,6 +89,22 @@ func New(cfg config.Config, logger *zap.Logger, checkers []ReadinessChecker, bui
 	srv.registerRoutes()
 
 	return srv, nil
+}
+
+func buildStaticVersion(info BuildInfo) string {
+	version := strings.TrimSpace(info.Version)
+	commit := strings.TrimSpace(info.Commit)
+	date := strings.TrimSpace(info.Date)
+	if version == "" {
+		version = "dev"
+	}
+	if commit == "" {
+		commit = "none"
+	}
+	if date == "" {
+		date = time.Now().UTC().Format("20060102150405")
+	}
+	return fmt.Sprintf("%s-%s-%s", version, commit, date)
 }
 
 func (s *Server) Run() error {
