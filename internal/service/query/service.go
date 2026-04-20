@@ -415,6 +415,43 @@ func (s *Service) loadPartitionWindow(
 				zap.Int("rows", len(partition.Rows)),
 			)
 			if partition.Meta.Building {
+				previewRefreshed := false
+				if previewLimit > 0 && len(partition.Rows) == 0 && s.shouldRefreshBuildingPreview(partition.Meta, now) {
+					previewStart, previewEnd := intersectWindowWithDay(day, windowStart, windowEnd, now)
+					if previewEnd.After(previewStart) {
+						previewRows, previewErr := s.fetchPreviewSourceRange(ctx, datasource, snapshot, tagDefinitions, serviceName, previewStart, previewEnd, previewLimit)
+						if previewErr != nil {
+							s.logger.Warn("refresh building partition preview failed",
+								zap.Error(previewErr),
+								zap.String("datasource", datasource.Name),
+								zap.String("service", displayServiceName(serviceName)),
+								zap.String("day", cacheDay(day).Format("2006-01-02")),
+							)
+						} else if len(previewRows) > 0 {
+							mergedRows, mergePartial := s.mergeSourceRowsLimited(partition.Rows, previewRows, datasource, serviceName, day, "building-preview")
+							trimmedRows, trimPartial := s.trimRowsForPartition(mergedRows, datasource, serviceName, day, "building-preview")
+							partition.Rows = trimmedRows
+							partition.Meta = s.cache.PreparePendingLogPartitionMeta(day, serviceName, datasource, len(trimmedRows), now)
+							partition.Meta.Partial = partition.Meta.Partial || mergePartial || trimPartial
+							if err := s.cache.StoreLogPartition(partition); err != nil {
+								s.logger.Warn("store building partition preview failed",
+									zap.Error(err),
+									zap.String("datasource", datasource.Name),
+									zap.String("service", displayServiceName(serviceName)),
+									zap.String("day", cacheDay(day).Format("2006-01-02")),
+								)
+							} else {
+								previewRefreshed = true
+								s.logger.Info("refreshed preview rows for building partition",
+									zap.String("datasource", datasource.Name),
+									zap.String("service", displayServiceName(serviceName)),
+									zap.String("day", cacheDay(day).Format("2006-01-02")),
+									zap.Int("rows", len(partition.Rows)),
+								)
+							}
+						}
+					}
+				}
 				if s.cache.LogPartitionBuildStale(partition.Meta, now) && !s.isPartitionSyncActive(day, datasource, serviceName) {
 					task, created := s.startPartitionSync(day, datasource, serviceName, "query-build-retry", partitionSyncQueueInteractive, func(syncCtx context.Context) error {
 						_, _, buildErr := s.buildPartitionFromSource(syncCtx, datasource, snapshot, tagDefinitions, serviceName, day, time.Now().UTC())
@@ -435,6 +472,9 @@ func (s *Service) loadPartitionWindow(
 							zap.Bool("started", task.started),
 						)
 					}
+				}
+				if previewRefreshed {
+					return partition, false, true, nil
 				}
 				return partition, false, true, nil
 			}
@@ -784,6 +824,20 @@ func (s *Service) sourceMinSplitWindow() time.Duration {
 	return 250 * time.Millisecond
 }
 
+func (s *Service) buildingPreviewRefreshInterval() time.Duration {
+	return 5 * time.Second
+}
+
+func (s *Service) shouldRefreshBuildingPreview(meta cache.LocalLogPartitionMeta, now time.Time) bool {
+	if !meta.Building {
+		return false
+	}
+	if meta.LastSyncAt.IsZero() {
+		return true
+	}
+	return now.UTC().Sub(meta.LastSyncAt.UTC()) >= s.buildingPreviewRefreshInterval()
+}
+
 func (s *Service) denseSourceWindowLimit() int {
 	limit := s.cfg.DenseWindowLimit
 	if limit <= 0 {
@@ -935,7 +989,7 @@ func (s *Service) fetchDatasourceWindow(
 			normalizedRows = append(normalizedRows, normalizeRow(datasource, snapshot, tagDefinitions, row))
 			if len(normalizedRows) >= maxRows {
 				truncated = true
-				s.logger.Warn("source window limited by safety guard",
+				s.logger.Debug("source window limited by safety guard",
 					zap.String("datasource", datasource.Name),
 					zap.Time("start", start),
 					zap.Time("end", end),

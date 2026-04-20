@@ -2915,11 +2915,13 @@ highlight = function (text) {
       renderSearchControls();
       renderSearchResults();
       if (!(options && options.silentSuccess)) {
-        const successMessage = response.partial && !results.length
-          ? s("\u672c\u5730\u7f13\u5b58\u6b63\u5728\u540e\u53f0\u8865\u6570\uff0c\u7ed3\u679c\u4f1a\u968f auto \u67e5\u8be2\u9010\u6b65\u5237\u65b0\u3002", "Local cache backfill is running in the background. Results will appear incrementally through auto refresh.")
-          : results.length
-            ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\u3002", "Search completed.")
-            : s("\u67e5\u8be2\u5b8c\u6210\uff0c\u4f46\u5f53\u524d\u6761\u4ef6\u4e0b\u6ca1\u6709\u6570\u636e\u3002", "Search completed, but no data matched the current filters.");
+        const successMessage = response.partial && results.length
+          ? s("\u5df2\u8fd4\u56de\u4e00\u6279\u5373\u65f6\u9884\u89c8\u7ed3\u679c\uff0c\u540e\u53f0\u4ecd\u5728\u7ee7\u7eed\u8865\u9f50\u672c\u5730\u7f13\u5b58\u3002", "A live preview is already available. Background backfill is still completing the local cache.")
+          : response.partial && !results.length
+            ? s("\u672c\u5730\u7f13\u5b58\u6b63\u5728\u540e\u53f0\u8865\u6570\uff0c\u7ed3\u679c\u4f1a\u968f auto \u67e5\u8be2\u9010\u6b65\u5237\u65b0\u3002", "Local cache backfill is running in the background. Results will appear incrementally through auto refresh.")
+            : results.length
+              ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\u3002", "Search completed.")
+              : s("\u67e5\u8be2\u5b8c\u6210\uff0c\u4f46\u5f53\u524d\u6761\u4ef6\u4e0b\u6ca1\u6709\u6570\u636e\u3002", "Search completed, but no data matched the current filters.");
         toast(successMessage, results.length ? "success" : "info");
       }
       return true;
