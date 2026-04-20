@@ -54,6 +54,20 @@ type previewFetchTask struct {
 	err       error
 }
 
+const (
+	searchCacheVersion          = "search-v3"
+	maxSearchTransportPageSize  = 500
+	minSearchTransportPageSize  = 200
+)
+
+type cachedSearchResultSet struct {
+	Results        []model.SearchResult      `json:"results"`
+	Sources        []model.QuerySourceStatus `json:"sources"`
+	Total          int                       `json:"total"`
+	Partial        bool                      `json:"partial"`
+	UnderlyingHit  bool                      `json:"underlying_cache_hit"`
+}
+
 func New(store *mongostore.Store, cacheService *cache.Service, client *victorialogs.Client, cfg config.CacheConfig, logger *zap.Logger) *Service {
 	if logger == nil {
 		logger = zap.NewNop()
@@ -214,9 +228,35 @@ func (s *Service) runHotSyncCycle(ctx context.Context) {
 
 func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.SearchResponse, error) {
 	startedAt := time.Now().UTC()
-	normalized, start, end, _, pageSize, err := normalizeRequest(req)
+	normalized, start, end, page, pageSize, err := normalizeRequest(req)
 	if err != nil {
 		return model.SearchResponse{}, err
+	}
+
+	cacheKey := ""
+	if normalized.UseCache {
+		cacheKey, err = buildSearchCacheKey(normalized)
+		if err != nil {
+			s.logger.Warn("build search cache key failed", zap.Error(err))
+			cacheKey = ""
+		}
+	}
+	if cacheKey != "" {
+		var cached cachedSearchResultSet
+		cacheHit, cacheErr := s.cache.Get(ctx, cache.KindQuery, cacheKey, &cached)
+		if cacheErr != nil {
+			s.logger.Warn("load cached search result failed", zap.Error(cacheErr), zap.String("key", cacheKey))
+		} else if cacheHit {
+			response := buildSearchResponsePage(cached, page, pageSize, true, time.Since(startedAt).Milliseconds())
+			s.logger.Info("search completed",
+				zap.Int("total", response.Total),
+				zap.Int("visible", len(response.Results)),
+				zap.Bool("cache_hit", response.CacheHit),
+				zap.Bool("partial", response.Partial),
+				zap.Int64("took_ms", response.TookMS),
+			)
+			return response, nil
+		}
 	}
 
 	datasources, err := s.resolveDatasources(ctx, normalized.DatasourceIDs)
@@ -314,20 +354,19 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 	allResults = limitResultsPerService(allResults, pageSize)
 
 	totalMatches := len(allResults)
-	responseLimit := responseVisibleLimit(pageSize, allResults)
-	if len(allResults) > responseLimit {
-		allResults = allResults[:responseLimit]
-		partial = true
+	cachedResult := cachedSearchResultSet{
+		Results:       compactSearchResultsForResponse(allResults),
+		Sources:       sourceStatuses,
+		Total:         totalMatches,
+		Partial:       partial,
+		UnderlyingHit: cacheHit,
 	}
-	allResults = compactSearchResultsForResponse(allResults)
-	response := model.SearchResponse{
-		Results:  allResults,
-		Sources:  sourceStatuses,
-		Total:    totalMatches,
-		Partial:  partial,
-		CacheHit: cacheHit,
-		TookMS:   time.Since(startedAt).Milliseconds(),
+	if cacheKey != "" {
+		if setErr := s.cache.Set(ctx, cache.KindQuery, cacheKey, cachedResult, s.cache.QueryTTL()); setErr != nil {
+			s.logger.Warn("store cached search result failed", zap.Error(setErr), zap.String("key", cacheKey))
+		}
 	}
+	response := buildSearchResponsePage(cachedResult, page, pageSize, cacheHit, time.Since(startedAt).Milliseconds())
 	s.logger.Info("search completed",
 		zap.Int("total", response.Total),
 		zap.Int("visible", len(response.Results)),
@@ -346,7 +385,10 @@ func compactSearchResultsForResponse(items []model.SearchResult) []model.SearchR
 	compacted := make([]model.SearchResult, 0, len(items))
 	for _, item := range items {
 		clone := item
-		clone.SearchText = searchableRowText(item)
+		clone.SearchText = strings.TrimSpace(clone.SearchText)
+		if clone.SearchText == "" {
+			clone.SearchText = searchableRowText(item)
+		}
 		clone.Raw = nil
 		compacted = append(compacted, clone)
 	}
@@ -1467,7 +1509,10 @@ func normalizeRequest(req model.SearchRequest) (model.SearchRequest, time.Time, 
 		return model.SearchRequest{}, time.Time{}, time.Time{}, 0, 0, fmt.Errorf("start must be before end")
 	}
 
-	page := 1
+	page := req.Page
+	if page <= 0 {
+		page = 1
+	}
 	pageSize := req.PageSize
 	if pageSize <= 0 {
 		pageSize = 500
@@ -2016,23 +2061,19 @@ func limitResultsPerService(rows []model.SearchResult, perServiceLimit int) []mo
 	return grouped
 }
 
-func responseVisibleLimit(pageSize int, rows []model.SearchResult) int {
-	if pageSize <= 0 {
-		pageSize = 500
+func responseVisibleLimit(pageSize int, requestedServices []string, rows []model.SearchResult) int {
+	return searchTransportPageSize(pageSize)
+}
+
+func truncateResponseText(value string, maxChars int) string {
+	text := strings.TrimSpace(value)
+	if maxChars <= 0 || len(text) <= maxChars {
+		return text
 	}
-	groups := make(map[string]struct{}, len(rows))
-	for _, row := range rows {
-		key := row.Datasource + "\x00" + firstNonEmpty(row.Service, "__all__")
-		groups[key] = struct{}{}
+	if maxChars <= 3 {
+		return text[:maxChars]
 	}
-	limit := pageSize * maxSearchInt(1, len(groups))
-	if limit > 10000 {
-		limit = 10000
-	}
-	if limit <= 0 {
-		return pageSize
-	}
-	return limit
+	return text[:maxChars-3] + "..."
 }
 
 func minSearchInt(left, right int) int {
@@ -2155,16 +2196,99 @@ func searchableRowText(row model.SearchResult) string {
 		row.Datasource,
 		row.Timestamp,
 	}
-	for key, value := range row.Labels {
-		parts = append(parts, key, value)
+	if len(row.Labels) > 0 {
+		keys := make([]string, 0, len(row.Labels))
+		for key := range row.Labels {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			parts = append(parts, key, row.Labels[key])
+		}
 	}
 	if len(row.Raw) > 0 {
 		parts = appendSearchableValue(parts, row.Raw)
-		if raw, err := json.Marshal(row.Raw); err == nil {
-			parts = append(parts, string(raw))
-		}
 	}
 	return strings.ToLower(strings.Join(parts, "\n"))
+}
+
+func buildSearchCacheKey(req model.SearchRequest) (string, error) {
+	payload := struct {
+		Version       string              `json:"version"`
+		Keyword       string              `json:"keyword"`
+		KeywordMode   string              `json:"keyword_mode"`
+		Start         string              `json:"start"`
+		End           string              `json:"end"`
+		DatasourceIDs []string            `json:"datasource_ids"`
+		ServiceNames  []string            `json:"service_names"`
+		Tags          map[string][]string `json:"tags"`
+		PageSize      int                 `json:"page_size"`
+	}{
+		Version:       searchCacheVersion,
+		Keyword:       req.Keyword,
+		KeywordMode:   req.KeywordMode,
+		Start:         req.Start,
+		End:           req.End,
+		DatasourceIDs: uniqueStrings(req.DatasourceIDs),
+		ServiceNames:  uniqueStrings(req.ServiceNames),
+		Tags:          req.Tags,
+		PageSize:      req.PageSize,
+	}
+	return util.HashJSON(payload)
+}
+
+func buildSearchResponsePage(snapshot cachedSearchResultSet, page, logicalPageSize int, cacheHit bool, tookMs int64) model.SearchResponse {
+	if page <= 0 {
+		page = 1
+	}
+	transportPageSize := searchTransportPageSize(logicalPageSize)
+	total := snapshot.Total
+	if total < len(snapshot.Results) {
+		total = len(snapshot.Results)
+	}
+	start := (page - 1) * transportPageSize
+	if start < 0 {
+		start = 0
+	}
+	if start > len(snapshot.Results) {
+		start = len(snapshot.Results)
+	}
+	end := start + transportPageSize
+	if end > len(snapshot.Results) {
+		end = len(snapshot.Results)
+	}
+	hasMore := end < len(snapshot.Results) || end < total
+	nextPage := 0
+	if hasMore {
+		nextPage = page + 1
+	}
+	pageResults := append([]model.SearchResult(nil), snapshot.Results[start:end]...)
+	return model.SearchResponse{
+		Results:  pageResults,
+		Sources:  append([]model.QuerySourceStatus(nil), snapshot.Sources...),
+		Total:    total,
+		Page:     page,
+		PageSize: transportPageSize,
+		HasMore:  hasMore,
+		NextPage: nextPage,
+		Partial:  snapshot.Partial || hasMore,
+		CacheHit: cacheHit,
+		TookMS:   tookMs,
+	}
+}
+
+func searchTransportPageSize(logicalPageSize int) int {
+	size := logicalPageSize
+	if size <= 0 {
+		size = 500
+	}
+	if size < minSearchTransportPageSize {
+		size = minSearchTransportPageSize
+	}
+	if size > maxSearchTransportPageSize {
+		size = maxSearchTransportPageSize
+	}
+	return size
 }
 
 func appendSearchableValue(parts []string, value any) []string {

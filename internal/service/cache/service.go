@@ -22,6 +22,8 @@ const (
 	KindQuery       = "query"
 	KindServiceList = "service_list"
 	KindTagValues   = "tag_values"
+
+	maxMongoQueryCacheBytes = 8 << 20
 )
 
 type Service struct {
@@ -83,6 +85,21 @@ func (s *Service) Set(ctx context.Context, kind, key string, payload any, ttl ti
 	if err != nil {
 		return err
 	}
+	localQueryStored := false
+	if kind == KindQuery {
+		if err := s.setLocalQuery(key, raw, s.localQueryTTL(ttl)); err != nil {
+			return err
+		}
+		localQueryStored = true
+		if len(raw) > maxMongoQueryCacheBytes {
+			s.logger.Debug("stored large query cache in local filesystem only",
+				zap.String("key", key),
+				zap.Int("payload_bytes", len(raw)),
+				zap.String("query_dir", strings.TrimSpace(s.cfg.LocalQueryDir)),
+			)
+			return nil
+		}
+	}
 	requestHash, err := util.HashJSON(payload)
 	if err != nil {
 		return err
@@ -99,7 +116,7 @@ func (s *Service) Set(ctx context.Context, kind, key string, payload any, ttl ti
 	}); err != nil {
 		return err
 	}
-	if kind == KindQuery {
+	if kind == KindQuery && !localQueryStored {
 		_ = s.setLocalQuery(key, raw, s.localQueryTTL(ttl))
 	}
 	return nil

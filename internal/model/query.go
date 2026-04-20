@@ -35,6 +35,10 @@ type SearchResponse struct {
 	Results  []SearchResult      `json:"results"`
 	Sources  []QuerySourceStatus `json:"sources"`
 	Total    int                 `json:"total"`
+	Page     int                 `json:"page"`
+	PageSize int                 `json:"page_size"`
+	HasMore  bool                `json:"has_more"`
+	NextPage int                 `json:"next_page,omitempty"`
 	Partial  bool                `json:"partial"`
 	CacheHit bool                `json:"cache_hit"`
 	TookMS   int64               `json:"took_ms"`
