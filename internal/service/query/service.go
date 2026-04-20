@@ -200,10 +200,13 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 	)
 
 	sortSearchResults(allResults)
+	allResults = limitResultsPerService(allResults, pageSize)
 
 	totalMatches := len(allResults)
-	if len(allResults) > pageSize {
-		allResults = allResults[:pageSize]
+	responseLimit := responseVisibleLimit(pageSize, allResults)
+	if len(allResults) > responseLimit {
+		allResults = allResults[:responseLimit]
+		partial = true
 	}
 	allResults = compactSearchResultsForResponse(allResults)
 	response := model.SearchResponse{
@@ -392,9 +395,9 @@ func (s *Service) searchDatasource(
 		if aggregatePreviewLimit > 300 {
 			aggregatePreviewLimit = 300
 		}
-		previewRows, previewPartial, previewErr := s.fetchDatasourcePreviewWindow(ctx, datasource, snapshot, tagDefinitions, start, end, aggregatePreviewLimit)
+		previewRows, previewPartial, previewErr := s.fetchAllServicePreviewWindow(ctx, datasource, snapshot, tagDefinitions, start, end, aggregatePreviewLimit)
 		if previewErr != nil {
-			s.logger.Warn("prepare datasource-wide preview failed",
+			s.logger.Warn("prepare all-service preview failed",
 				zap.Error(previewErr),
 				zap.String("datasource", datasource.Name),
 				zap.Time("start", start),
@@ -403,11 +406,11 @@ func (s *Service) searchDatasource(
 			)
 		} else if len(previewRows) > 0 {
 			mergedRows, mergePartial := s.mergeSourceRowsLimited(rows, previewRows, datasource, "", cacheDay(start), "all-service-preview")
-			normalizedRows, normalizePartial := s.normalizeRowsForPartition(mergedRows, datasource, "", cacheDay(start), "all-service-preview")
-			rows = normalizedRows
+			sortSearchResults(mergedRows)
+			rows = limitResultsPerService(mergedRows, aggregatePreviewLimit)
 			cacheHit = false
-			partial = partial || previewPartial || mergePartial || normalizePartial
-			s.logger.Info("prepared datasource-wide preview rows",
+			partial = partial || previewPartial || mergePartial
+			s.logger.Info("prepared all-service preview rows",
 				zap.String("datasource", datasource.Name),
 				zap.Time("start", start),
 				zap.Time("end", end),
@@ -771,6 +774,80 @@ func (s *Service) fetchDatasourcePreviewWindow(
 	}
 	rows, guardPartial := s.normalizeRowsForPartition(rows, datasource, "", cacheDay(start), "datasource-preview")
 	return rows, truncated || guardPartial, nil
+}
+
+func (s *Service) fetchAllServicePreviewWindow(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	start, end time.Time,
+	perServiceLimit int,
+) ([]model.SearchResult, bool, error) {
+	entries, err := s.store.ListServiceCatalog(ctx, datasource.ID)
+	if err != nil {
+		return s.fetchDatasourcePreviewWindow(ctx, datasource, snapshot, tagDefinitions, start, end, perServiceLimit)
+	}
+	serviceNames := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.ServiceName) == "" {
+			continue
+		}
+		serviceNames = append(serviceNames, entry.ServiceName)
+	}
+	serviceNames = uniqueStrings(serviceNames)
+	if len(serviceNames) == 0 {
+		return s.fetchDatasourcePreviewWindow(ctx, datasource, snapshot, tagDefinitions, start, end, perServiceLimit)
+	}
+
+	type previewResult struct {
+		rows []model.SearchResult
+		err  error
+	}
+
+	workerLimit := s.serviceChunkConcurrency()
+	if workerLimit <= 0 {
+		workerLimit = 1
+	}
+	if workerLimit > 6 {
+		workerLimit = 6
+	}
+	sem := make(chan struct{}, workerLimit)
+	resultsCh := make(chan previewResult, len(serviceNames))
+	var wg sync.WaitGroup
+
+	for _, serviceName := range serviceNames {
+		name := serviceName
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			rows, fetchErr := s.fetchPreviewSourceRange(ctx, datasource, snapshot, tagDefinitions, name, start, end, perServiceLimit)
+			resultsCh <- previewResult{rows: rows, err: fetchErr}
+		}()
+	}
+
+	wg.Wait()
+	close(resultsCh)
+
+	merged := make([]model.SearchResult, 0, len(serviceNames)*maxSearchInt(1, perServiceLimit))
+	partial := false
+	for item := range resultsCh {
+		if item.err != nil {
+			partial = true
+			continue
+		}
+		merged = append(merged, item.rows...)
+	}
+	sortSearchResults(merged)
+	merged = limitResultsPerService(merged, perServiceLimit)
+	maxVisible := responseVisibleLimit(perServiceLimit, merged)
+	if len(merged) > maxVisible {
+		merged = merged[:maxVisible]
+		partial = true
+	}
+	return merged, partial, nil
 }
 
 func (s *Service) fetchCompleteSourceRange(
@@ -1655,6 +1732,42 @@ func sortSearchResults(rows []model.SearchResult) {
 		}
 		return left.After(right)
 	})
+}
+
+func limitResultsPerService(rows []model.SearchResult, perServiceLimit int) []model.SearchResult {
+	if perServiceLimit <= 0 || len(rows) <= perServiceLimit {
+		return rows
+	}
+	grouped := make([]model.SearchResult, 0, len(rows))
+	counts := make(map[string]int, len(rows))
+	for _, row := range rows {
+		key := row.Datasource + "\x00" + firstNonEmpty(row.Service, "__all__")
+		if counts[key] >= perServiceLimit {
+			continue
+		}
+		counts[key]++
+		grouped = append(grouped, row)
+	}
+	return grouped
+}
+
+func responseVisibleLimit(pageSize int, rows []model.SearchResult) int {
+	if pageSize <= 0 {
+		pageSize = 500
+	}
+	groups := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		key := row.Datasource + "\x00" + firstNonEmpty(row.Service, "__all__")
+		groups[key] = struct{}{}
+	}
+	limit := pageSize * maxSearchInt(1, len(groups))
+	if limit > 10000 {
+		limit = 10000
+	}
+	if limit <= 0 {
+		return pageSize
+	}
+	return limit
 }
 
 func minSearchInt(left, right int) int {

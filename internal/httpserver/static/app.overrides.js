@@ -3554,12 +3554,9 @@ highlight = function (text) {
   };
 
   function refreshSearchMenusSoon() {
-    renderSearchToolbar();
     renderSearchCatalogDatasourceOptions();
     renderSearchServiceOptions();
     renderSearchContext();
-    renderSearchLevelFilters();
-    renderSearchHighlightPalette();
     syncSearchMenuState();
     Promise.resolve()
       .then(() => loadSearchCatalogs())
