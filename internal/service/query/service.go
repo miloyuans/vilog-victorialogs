@@ -205,6 +205,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 	if len(allResults) > pageSize {
 		allResults = allResults[:pageSize]
 	}
+	allResults = compactSearchResultsForResponse(allResults)
 	response := model.SearchResponse{
 		Results:  allResults,
 		Sources:  sourceStatuses,
@@ -222,6 +223,19 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 	)
 
 	return response, nil
+}
+
+func compactSearchResultsForResponse(items []model.SearchResult) []model.SearchResult {
+	if len(items) == 0 {
+		return items
+	}
+	compacted := make([]model.SearchResult, 0, len(items))
+	for _, item := range items {
+		clone := item
+		clone.Raw = nil
+		compacted = append(compacted, clone)
+	}
+	return compacted
 }
 
 func (s *Service) refreshTrackedHotPartitions(ctx context.Context) error {

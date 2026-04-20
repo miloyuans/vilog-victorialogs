@@ -20,7 +20,7 @@ type SearchResult struct {
 	Pod        string            `json:"pod"`
 	Datasource string            `json:"datasource"`
 	Labels     map[string]string `json:"labels"`
-	Raw        map[string]any    `json:"raw"`
+	Raw        map[string]any    `json:"raw,omitempty"`
 }
 
 type QuerySourceStatus struct {

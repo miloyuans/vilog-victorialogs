@@ -137,7 +137,7 @@ func Default() Config {
 		HTTP: HTTPConfig{
 			Addr:            ":8080",
 			ReadTimeout:     10 * time.Second,
-			WriteTimeout:    15 * time.Second,
+			WriteTimeout:    60 * time.Second,
 			IdleTimeout:     60 * time.Second,
 			ShutdownTimeout: 15 * time.Second,
 			TrustedProxies:  []string{},

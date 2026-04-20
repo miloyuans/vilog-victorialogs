@@ -1449,6 +1449,7 @@ highlight = function (text) {
   let searchColumnResizeState = null;
   let activeSearchRequest = null;
   let activeSearchRequestKey = "";
+  let activeSearchAbortController = null;
 
   function normalizeAutoRefreshInterval(value) {
     const candidate = String(value || "").trim().toLowerCase();
@@ -1696,10 +1697,18 @@ highlight = function (text) {
     if (activeSearchRequest && activeSearchRequestKey === requestKey) {
       return activeSearchRequest;
     }
+    if (activeSearchAbortController && activeSearchRequestKey && activeSearchRequestKey !== requestKey) {
+      activeSearchAbortController.abort();
+      activeSearchAbortController = null;
+      activeSearchRequest = null;
+      activeSearchRequestKey = "";
+    }
+    activeSearchAbortController = new AbortController();
     activeSearchRequestKey = requestKey;
     activeSearchRequest = request("/api/query/search", {
       method: "POST",
       body: JSON.stringify(payload),
+      signal: activeSearchAbortController.signal,
     }).then((rawResponse) => {
       const response = safeObject(rawResponse);
       return {
@@ -1719,6 +1728,7 @@ highlight = function (text) {
       if (activeSearchRequestKey === requestKey) {
         activeSearchRequest = null;
         activeSearchRequestKey = "";
+        activeSearchAbortController = null;
       }
     });
     return activeSearchRequest;
@@ -2843,6 +2853,10 @@ highlight = function (text) {
         syncSearchAutoRefresh();
         return;
       }
+      if (activeSearchRequest) {
+        syncSearchAutoRefresh();
+        return;
+      }
       if (safeArray(state.search.selectedDatasourceIDs).length) {
         await runSearchWindow(1, {
           silentSuccess: true,
@@ -2926,6 +2940,9 @@ highlight = function (text) {
       }
       return true;
     } catch (error) {
+      if (error && (error.name === "AbortError" || String(error.message || "").indexOf("aborted") >= 0)) {
+        return false;
+      }
       if (!(options && options.background)) {
         toast(error.message || String(error), "error");
       }

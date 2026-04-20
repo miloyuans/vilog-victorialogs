@@ -18,7 +18,7 @@ http:
   # 读取请求超时。
   read_timeout: 10s
   # 写响应超时。
-  write_timeout: 15s
+  write_timeout: 60s
   # Keep-Alive 空闲超时。
   idle_timeout: 60s
   # 优雅关闭超时。
