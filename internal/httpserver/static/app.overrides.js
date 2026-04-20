@@ -2961,6 +2961,43 @@ highlight = function (text) {
     }, autoRefreshIntervalMs(state.search.autoRefreshInterval));
   }
 
+  function shouldRunSearchWarmup(pageSize, options) {
+    if (options && options.background) return false;
+    if (safeArray(state.search.selectedDatasourceIDs).length === 0) return false;
+    if (safeArray(state.search.serviceNames).length > 0) return false;
+    if (Number(pageSize || 0) <= 60) return false;
+    return getVisibleResults().length === 0;
+  }
+
+  function getSearchWarmupPageSize(pageSize) {
+    const size = Number(pageSize || 0);
+    if (size >= 1000) return 30;
+    if (size >= 500) return 40;
+    if (size >= 200) return 50;
+    return 60;
+  }
+
+  function commitSearchResponse(rawResponse, options, previousSelectedKey) {
+    const response = safeObject(rawResponse);
+    response.results = safeArray(response.results);
+    response.sources = safeArray(response.sources);
+    response.total = Math.max(Number(response.total || 0), response.results.length);
+    state.search.response = response;
+    state.search.levelFilter = state.search.levelFilter || "all";
+    state.search.exportStatusTone = "idle";
+    state.search.exportStatusText = s("\u5c31\u7eea", "Ready");
+    const results = getVisibleResults();
+    if (options && options.preserveSelection && previousSelectedKey && results.some((item) => String(item._index) === previousSelectedKey)) {
+      state.search.selectedResultKey = previousSelectedKey;
+    } else {
+      state.search.selectedResultKey = results[0] ? String(results[0]._index) : "";
+    }
+    state.ui.detailOpen = false;
+    renderSearchControls();
+    renderSearchResults();
+    return { response, results };
+  }
+
   async function runSearchWindow(pageOverride, options) {
     normalizeFrontendCollections();
     syncHiddenQueryInput();
@@ -3005,23 +3042,21 @@ highlight = function (text) {
       setSearchLoading(true);
     }
     try {
-      const response = safeObject(await requestSearchWindow(page, pageInfo.value));
-      response.results = safeArray(response.results);
-      response.sources = safeArray(response.sources);
-      response.total = Math.max(Number(response.total || 0), response.results.length);
-      state.search.response = response;
-      state.search.levelFilter = state.search.levelFilter || "all";
-      state.search.exportStatusTone = "idle";
-      state.search.exportStatusText = s("\u5c31\u7eea", "Ready");
-      const results = getVisibleResults();
-      if (options && options.preserveSelection && previousSelectedKey && results.some((item) => String(item._index) === previousSelectedKey)) {
-        state.search.selectedResultKey = previousSelectedKey;
-      } else {
-        state.search.selectedResultKey = results[0] ? String(results[0]._index) : "";
+      if (shouldRunSearchWarmup(pageInfo.value, options)) {
+        const warmupSize = getSearchWarmupPageSize(pageInfo.value);
+        if (warmupSize > 0 && warmupSize < pageInfo.value) {
+          const warmupState = commitSearchResponse(await requestSearchWindow(page, warmupSize), {
+            preserveSelection: true,
+            silentSuccess: true,
+          }, previousSelectedKey);
+          if (warmupState.results.length) {
+            setSearchRuntimeStatus("partial", s("\u5df2\u8fd4\u56de\u9996\u5c4f\u9884\u89c8\uff0c\u6b63\u5728\u7ee7\u7eed\u8865\u5168\u66f4\u591a\u7ed3\u679c\u3002", "A first-screen preview is already available. The full result set is still loading."));
+          }
+        }
       }
-      state.ui.detailOpen = false;
-      renderSearchControls();
-      renderSearchResults();
+      const finalState = commitSearchResponse(await requestSearchWindow(page, pageInfo.value), options, previousSelectedKey);
+      const response = finalState.response;
+      const results = finalState.results;
       const successMessage = response.partial && results.length
         ? s("\u65b0\u7ed3\u679c\u5df2\u9759\u9ed8\u5408\u5e76\uff0c\u540e\u7eed\u7ed3\u679c\u4f1a\u7ee7\u7eed\u5237\u65b0\u3002", "New results were merged silently. More rows will continue to refresh.")
         : response.partial && !results.length
