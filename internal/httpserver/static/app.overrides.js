@@ -3626,6 +3626,9 @@ highlight = function (text) {
             ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\u3002", "Query completed.")
             : s("\u6ca1\u6709\u5339\u914d\u5f53\u524d\u8fc7\u6ee4\u6761\u4ef6\u7684\u65e5\u5fd7\u3002", "No logs matched the current filters."));
       setSearchRuntimeStatus((response.partial || response.has_more) ? "partial" : "ok", successMessage);
+      if (response.has_more) {
+        void drainSearchPages(activeSearchDrainRun, pageInfo.value, state.search.selectedResultKey || previousSelectedKey);
+      }
       if (!(options && options.silentSuccess) && !results.length && !(options && options.background)) {
         toast(successMessage, "info");
       }
