@@ -1629,12 +1629,11 @@ highlight = function (text) {
     state.search.autoRefreshEnabled = state.search.autoRefreshEnabled !== false;
     state.search.autoRefreshInterval = normalizeAutoRefreshInterval(state.search.autoRefreshInterval || "1m");
     state.search.columnWidths = safeObject(state.search.columnWidths);
-    state.search.useCache = true;
-    state.search.page = 1;
+    state.search.useCache = state.search.useCache !== false;
     state.search.queryLayers = safeArray(state.search.queryLayers).length
       ? safeArray(state.search.queryLayers).map((layer) => ({
           id: layer && layer.id ? String(layer.id) : nextQueryLayerID(),
-          mode: "keyword",
+          mode: layer && layer.mode === "logsql" ? "logsql" : "keyword",
           operator: layer && layer.operator === "or" ? "or" : "and",
           value: String(layer && layer.value || ""),
         }))
@@ -3022,6 +3021,14 @@ highlight = function (text) {
       row.service || "",
       row.pod || "",
       row.message || "",
+      row.search_text || "",
+      (() => {
+        try {
+          return JSON.stringify(row.raw || {});
+        } catch (_error) {
+          return "";
+        }
+      })(),
     ].join("\u0000");
   }
 

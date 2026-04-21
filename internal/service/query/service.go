@@ -507,6 +507,10 @@ func (s *Service) searchDatasource(
 		s.markServiceInteractive(datasource, serviceName, now)
 	}
 
+	if !s.cfg.BackgroundSyncEnabled {
+		return s.searchDatasourceDirectFromSource(ctx, datasource, snapshot, tagDefinitions, req, services, explicitServiceSelection, start, end, pageSize)
+	}
+
 	rows := make([]model.SearchResult, 0)
 	cacheHit := true
 	partial := false

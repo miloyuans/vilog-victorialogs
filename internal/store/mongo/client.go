@@ -18,6 +18,8 @@ const (
 	collectionServiceCatalog              = "service_catalog"
 	collectionDatasourceTagSnapshots      = "datasource_tag_snapshots"
 	collectionQueryCache                  = "query_cache"
+	collectionQueryJobs                   = "query_jobs"
+	collectionQuerySegments               = "query_segments"
 	collectionRetentionPolicyTemplates    = "retention_policy_templates"
 	collectionDatasourceRetentionBindings = "datasource_retention_bindings"
 	collectionDeleteTasks                 = "delete_tasks"
@@ -87,6 +89,16 @@ func (s *Store) InitIndexes(ctx context.Context) error {
 		collectionQueryCache: {
 			{Keys: bson.D{{Key: "kind", Value: 1}, {Key: "cache_key", Value: 1}}, Options: options.Index().SetUnique(true)},
 			{Keys: bson.D{{Key: "expire_at", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(0)},
+		},
+		collectionQueryJobs: {
+			{Keys: bson.D{{Key: "status", Value: 1}, {Key: "started_at", Value: -1}}},
+			{Keys: bson.D{{Key: "expires_at", Value: 1}}, Options: options.Index().SetExpireAfterSeconds(0)},
+			{Keys: bson.D{{Key: "started_at", Value: -1}}},
+		},
+		collectionQuerySegments: {
+			{Keys: bson.D{{Key: "job_id", Value: 1}, {Key: "sequence", Value: 1}}, Options: options.Index().SetUnique(true)},
+			{Keys: bson.D{{Key: "job_id", Value: 1}, {Key: "created_at", Value: 1}}},
+			{Keys: bson.D{{Key: "created_at", Value: 1}}},
 		},
 		collectionRetentionPolicyTemplates: {
 			{Keys: bson.D{{Key: "name", Value: 1}}, Options: options.Index().SetUnique(true)},

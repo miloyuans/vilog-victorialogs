@@ -39,18 +39,40 @@ func (c *Client) Ping(ctx context.Context, datasource model.Datasource) error {
 }
 
 func (c *Client) Query(ctx context.Context, datasource model.Datasource, req QueryRequest) ([]map[string]any, error) {
-	body, err := c.doFormRequest(ctx, datasource, datasource.QueryPaths.Query, url.Values{
+	rows := make([]map[string]any, 0, maxInt(req.Limit, 1))
+	err := c.QueryStream(ctx, datasource, QueryChunkRequest{
+		Query:  req.Query,
+		Start:  req.Start,
+		End:    req.End,
+		Limit:  req.Limit,
+		Offset: req.Offset,
+	}, func(row map[string]any) error {
+		rows = append(rows, row)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (c *Client) QueryStream(ctx context.Context, datasource model.Datasource, req QueryChunkRequest, onRow RowHandler) error {
+	if onRow == nil {
+		return fmt.Errorf("query stream row handler is required")
+	}
+	return c.doFormRequestStream(ctx, datasource, datasource.QueryPaths.Query, url.Values{
 		"query":  []string{req.Query},
 		"start":  []string{req.Start.Format(time.RFC3339)},
 		"end":    []string{req.End.Format(time.RFC3339)},
 		"limit":  []string{fmt.Sprintf("%d", req.Limit)},
 		"offset": []string{fmt.Sprintf("%d", req.Offset)},
-	}, http.MethodPost)
-	if err != nil {
-		return nil, err
-	}
-
-	return parseJSONLines(body)
+	}, http.MethodPost, func(line []byte) error {
+		var row map[string]any
+		if err := json.Unmarshal(line, &row); err != nil {
+			return fmt.Errorf("decode json line: %w", err)
+		}
+		return onRow(row)
+	})
 }
 
 func (c *Client) FieldNames(ctx context.Context, datasource model.Datasource, req ListRequest) ([]ValueStat, error) {
@@ -166,6 +188,10 @@ func (c *Client) doFormRequest(ctx context.Context, datasource model.Datasource,
 	return c.doRequest(ctx, datasource, path, method, []byte(form.Encode()), "application/x-www-form-urlencoded", "")
 }
 
+func (c *Client) doFormRequestStream(ctx context.Context, datasource model.Datasource, path string, form url.Values, method string, onLine func([]byte) error) error {
+	return c.doStreamRequest(ctx, datasource, path, method, []byte(form.Encode()), "application/x-www-form-urlencoded", "", onLine)
+}
+
 func (c *Client) doQueryRequest(ctx context.Context, datasource model.Datasource, path string, query url.Values, method string) ([]byte, error) {
 	encodedQuery := ""
 	if query != nil {
@@ -221,6 +247,59 @@ func (c *Client) doRequest(ctx context.Context, datasource model.Datasource, pat
 	}
 
 	return nil, lastErr
+}
+
+func (c *Client) doStreamRequest(ctx context.Context, datasource model.Datasource, path, method string, body []byte, contentType, encodedQuery string, onLine func([]byte) error) error {
+	requestURL, err := datasourceURL(datasource.BaseURL, path, encodedQuery)
+	if err != nil {
+		return err
+	}
+
+	var lastErr error
+	attempts := c.retries + 1
+	for attempt := 0; attempt < attempts; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, time.Duration(datasource.TimeoutSeconds)*time.Second)
+		var requestBody io.Reader
+		if body != nil {
+			requestBody = bytes.NewReader(body)
+		}
+		req, reqErr := http.NewRequestWithContext(attemptCtx, method, requestURL, requestBody)
+		if reqErr != nil {
+			cancel()
+			return fmt.Errorf("create request: %w", reqErr)
+		}
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		applyDatasourceHeaders(req, datasource)
+
+		resp, reqErr := c.httpClient.Do(req)
+		if reqErr != nil {
+			cancel()
+			lastErr = fmt.Errorf("request failed: %w", reqErr)
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			responseBody, readErr := readBody(resp)
+			cancel()
+			if readErr != nil {
+				lastErr = fmt.Errorf("read response body: %w", readErr)
+				continue
+			}
+			lastErr = fmt.Errorf("request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
+			continue
+		}
+
+		streamErr := streamJSONLines(resp.Body, onLine)
+		cancel()
+		if streamErr != nil {
+			lastErr = streamErr
+			continue
+		}
+		return nil
+	}
+
+	return lastErr
 }
 
 func datasourceURL(baseURL, path, encodedQuery string) (string, error) {
@@ -285,7 +364,34 @@ func parseJSONLines(data []byte) ([]map[string]any, error) {
 	return rows, nil
 }
 
+func streamJSONLines(body io.ReadCloser, onLine func([]byte) error) error {
+	defer body.Close()
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 128*1024), 16*1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		payload := append([]byte(nil), line...)
+		if err := onLine(payload); err != nil {
+			return err
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scan json lines: %w", err)
+	}
+	return nil
+}
+
 func readBody(resp *http.Response) ([]byte, error) {
 	defer resp.Body.Close()
 	return io.ReadAll(resp.Body)
+}
+
+func maxInt(left, right int) int {
+	if left > right {
+		return left
+	}
+	return right
 }

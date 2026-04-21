@@ -10,6 +10,16 @@ type QueryRequest struct {
 	Offset int
 }
 
+type QueryChunkRequest struct {
+	Query  string
+	Start  time.Time
+	End    time.Time
+	Limit  int
+	Offset int
+}
+
+type RowHandler func(row map[string]any) error
+
 type ListRequest struct {
 	Query       string
 	Start       time.Time

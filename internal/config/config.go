@@ -313,6 +313,9 @@ func (c *Config) Validate() error {
 	if c.HTTP.ReadTimeout <= 0 || c.HTTP.WriteTimeout <= 0 || c.HTTP.IdleTimeout <= 0 || c.HTTP.ShutdownTimeout <= 0 {
 		return fmt.Errorf("http timeouts must be positive")
 	}
+	if c.HTTP.WriteTimeout < 60*time.Second {
+		c.HTTP.WriteTimeout = 60 * time.Second
+	}
 	if strings.TrimSpace(c.Mongo.URI) == "" || strings.TrimSpace(c.Mongo.Database) == "" {
 		return fmt.Errorf("mongo.uri and mongo.database are required")
 	}
