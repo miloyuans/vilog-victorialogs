@@ -54,7 +54,7 @@ type previewFetchTask struct {
 }
 
 const (
-	searchCacheVersion          = "search-v4"
+	searchCacheVersion          = "search-v5"
 	maxSearchTransportPageSize  = 200
 	minSearchTransportPageSize  = 100
 )
@@ -328,11 +328,15 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 	sourceStatuses := make([]model.QuerySourceStatus, 0, len(datasources))
 	partial := false
 	cacheHit := len(datasources) > 0
+	sourceErrors := false
 	for item := range resultsCh {
 		allResults = append(allResults, item.results...)
 		sourceStatuses = append(sourceStatuses, item.status)
 		if item.status.Status == "error" || item.status.Status == "partial" || item.partial {
 			partial = true
+		}
+		if item.status.Status == "error" {
+			sourceErrors = true
 		}
 		if !item.cacheHit {
 			cacheHit = false
@@ -360,7 +364,7 @@ func (s *Service) Search(ctx context.Context, req model.SearchRequest) (model.Se
 		Partial:       partial,
 		UnderlyingHit: cacheHit,
 	}
-	if cacheKey != "" {
+	if cacheKey != "" && !(len(cachedResult.Results) == 0 && (partial || sourceErrors)) {
 		if setErr := s.cache.Set(ctx, cache.KindQuery, cacheKey, cachedResult, s.cache.QueryTTL()); setErr != nil {
 			s.logger.Warn("store cached search result failed", zap.Error(setErr), zap.String("key", cacheKey))
 		}
@@ -502,9 +506,6 @@ func (s *Service) searchDatasource(
 	for _, serviceName := range services {
 		s.markServiceInteractive(datasource, serviceName, now)
 	}
-	if !s.cfg.BackgroundSyncEnabled {
-		return s.searchDatasourceDirectFromSource(ctx, datasource, snapshot, tagDefinitions, req, services, explicitServiceSelection, start, end, pageSize)
-	}
 
 	rows := make([]model.SearchResult, 0)
 	cacheHit := true
@@ -529,6 +530,17 @@ func (s *Service) searchDatasource(
 		if previewLimit > 300 {
 			previewLimit = 300
 		}
+	}
+	if !explicitServiceSelection && !s.cfg.BackgroundSyncEnabled {
+		previewRows, previewPartial, previewErr := s.fetchAllServicePreviewWindow(ctx, datasource, snapshot, tagDefinitions, req, start, end, previewLimit)
+		if previewErr != nil {
+			return nil, model.QuerySourceStatus{}, false, true, previewErr
+		}
+		return previewRows, model.QuerySourceStatus{
+			Datasource: datasource.Name,
+			Status:     statusLabelForRows(previewPartial, len(previewRows) == 0),
+			Hits:       len(previewRows),
+		}, false, previewPartial, nil
 	}
 	for _, serviceName := range services {
 		serviceRows, serviceCacheHit, servicePartial, err := s.searchServiceWindow(ctx, datasource, snapshot, tagDefinitions, serviceName, start, end, now, req.UseCache, previewLimit)

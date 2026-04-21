@@ -1722,14 +1722,14 @@ highlight = function (text) {
     const requestedSize = getResolvedSearchPageSize(pageSize || state.search.pageSize || 500);
     const payload = buildCurrentSearchPayload(requestedPage, requestedSize);
     const requestKey = JSON.stringify(payload);
-    if (activeSearchRequest && activeSearchRequestKey === requestKey) {
-      return activeSearchRequest;
-    }
-    if (activeSearchAbortController && activeSearchRequestKey && activeSearchRequestKey !== requestKey) {
-      activeSearchAbortController.abort();
-      activeSearchAbortController = null;
-      activeSearchRequest = null;
-      activeSearchRequestKey = "";
+    if (activeSearchRequest) {
+      if (activeSearchRequestKey === requestKey) {
+        return activeSearchRequest;
+      }
+      try {
+        await activeSearchRequest;
+      } catch (_error) {
+      }
     }
     activeSearchAbortController = new AbortController();
     activeSearchRequestKey = requestKey;
@@ -3596,37 +3596,28 @@ highlight = function (text) {
       }
       return false;
     }
-    state.search.page = 1;
+    const requestedPage = Math.max(1, Number((byId("search-page") && byId("search-page").value) || state.search.page || 1) || 1);
+    state.search.page = requestedPage;
     state.search.pageSize = pageInfo.value;
     state.search.pageSizeCustom = pageInfo.mode === "custom" ? pageInfo.value : state.search.pageSizeCustom;
     state.search.pageSizeCustomRaw = pageInfo.raw;
     state.search.pageSizeMode = pageInfo.mode;
     state.search.pageSizeError = false;
-    state.search.useCache = true;
+    state.search.useCache = byId("search-use-cache") ? byId("search-use-cache").checked : state.search.useCache !== false;
     const previousSelectedKey = state.search.selectedResultKey;
     activeSearchDrainRun += 1;
     searchDrainInProgress = false;
-    if (activeSearchAbortController) {
-      try {
-        activeSearchAbortController.abort();
-      } catch (_error) {
-      }
-    }
-    activeSearchAbortController = null;
-    activeSearchRequest = null;
-    activeSearchRequestKey = "";
-    const runID = activeSearchDrainRun;
     setSearchRuntimeStatus("loading", s("\u67e5\u8be2\u8fdb\u884c\u4e2d\uff0c\u8bf7\u7a0d\u5019\u3002", "Query in progress. Please wait."));
     if (!(options && options.background)) {
       setSearchLoading(true);
     }
     try {
-      const finalState = commitSearchResponse(await requestSearchWindow(1, pageInfo.value), options, previousSelectedKey);
+      const finalState = commitSearchResponse(await requestSearchWindow(requestedPage, pageInfo.value), options, previousSelectedKey);
       const response = finalState.response;
       const results = finalState.results;
       const total = Math.max(Number(response.total || 0), results.length);
       const successMessage = response.has_more
-        ? searchProgressMessage(results.length, total)
+        ? s("\u5df2\u8fd4\u56de\u5f53\u524d\u5206\u9875 " + results.length + " \u6761\uff0c\u603b\u7ed3\u679c\u7ea6 " + total + " \u6761\uff0c\u53ef\u7ee7\u7eed\u7ffb\u9875\u67e5\u770b\u3002", "Returned " + results.length + " rows for the current page, about " + total + " total. Continue paging to view more.")
         : response.partial
           ? (results.length
             ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\uff0c\u5f53\u524d\u8fd4\u56de\u7684\u662f\u90e8\u5206\u7ed3\u679c\u3002", "Query completed with partial results.")
@@ -3635,9 +3626,6 @@ highlight = function (text) {
             ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\u3002", "Query completed.")
             : s("\u6ca1\u6709\u5339\u914d\u5f53\u524d\u8fc7\u6ee4\u6761\u4ef6\u7684\u65e5\u5fd7\u3002", "No logs matched the current filters."));
       setSearchRuntimeStatus((response.partial || response.has_more) ? "partial" : "ok", successMessage);
-      if (response.has_more) {
-        void drainSearchPages(runID, pageInfo.value, state.search.selectedResultKey || previousSelectedKey);
-      }
       if (!(options && options.silentSuccess) && !results.length && !(options && options.background)) {
         toast(successMessage, "info");
       }
