@@ -66,6 +66,21 @@ function ensureEnhancedState() {
 
 ensureEnhancedState();
 
+function ensureSearchJobState() {
+  normalizeFrontendCollections();
+  state.search.job = state.search.job || {
+    id: "",
+    requestKey: "",
+    cursor: "",
+    loading: false,
+    completed: false,
+    partial: false,
+    fetching: false,
+    eventSource: null,
+  };
+  return state.search.job;
+}
+
 function unique(list) {
   return Array.from(new Set((Array.isArray(list) ? list : []).filter(Boolean)));
 }
@@ -1731,7 +1746,7 @@ highlight = function (text) {
       tags: normalizeFilters(state.search.activeFilters),
       page: Number(page || state.search.page || 1),
       page_size: getResolvedSearchPageSize(pageSize || state.search.pageSize || 500),
-      use_cache: state.search.useCache !== false,
+      use_cache: false,
     };
   }
 
@@ -2767,7 +2782,7 @@ highlight = function (text) {
       tags: normalizeFilters(state.search.activeFilters),
       page: Number(page || state.search.page || 1),
       page_size: getResolvedSearchPageSize(pageSize || state.search.pageSize || 500),
-      use_cache: state.search.useCache !== false,
+      use_cache: false,
     };
   };
 
@@ -3613,6 +3628,10 @@ highlight = function (text) {
   async function executeStableSearch(options) {
     normalizeFrontendCollections();
     syncHiddenQueryInput();
+    clearSearchAutoRefresh();
+    if (state.search.timePreset !== "custom") {
+      refreshSearchTimeRangeIfNeeded();
+    }
     if (!safeArray(state.search.selectedDatasourceIDs).length) {
       if (!(options && options.background)) {
         toast(s("\u8bf7\u5148\u9009\u62e9\u81f3\u5c11\u4e00\u4e2a\u67e5\u8be2\u6570\u636e\u6e90\u3002", "Select at least one search datasource."), "error");
@@ -3628,14 +3647,14 @@ highlight = function (text) {
       }
       return false;
     }
-    const requestedPage = Math.max(1, Number((byId("search-page") && byId("search-page").value) || state.search.page || 1) || 1);
-    state.search.page = requestedPage;
+    const requestedPage = 1;
+    state.search.page = 1;
     state.search.pageSize = pageInfo.value;
     state.search.pageSizeCustom = pageInfo.mode === "custom" ? pageInfo.value : state.search.pageSizeCustom;
     state.search.pageSizeCustomRaw = pageInfo.raw;
     state.search.pageSizeMode = pageInfo.mode;
     state.search.pageSizeError = false;
-    state.search.useCache = byId("search-use-cache") ? byId("search-use-cache").checked : state.search.useCache !== false;
+    state.search.useCache = false;
     const previousSelectedKey = state.search.selectedResultKey;
     activeSearchDrainRun += 1;
     searchDrainInProgress = false;
@@ -3649,7 +3668,7 @@ highlight = function (text) {
       const results = finalState.results;
       const total = Math.max(Number(response.total || 0), results.length);
       const successMessage = response.has_more
-        ? s("\u5df2\u8fd4\u56de\u5f53\u524d\u5206\u9875 " + results.length + " \u6761\uff0c\u603b\u7ed3\u679c\u7ea6 " + total + " \u6761\uff0c\u53ef\u7ee7\u7eed\u7ffb\u9875\u67e5\u770b\u3002", "Returned " + results.length + " rows for the current page, about " + total + " total. Continue paging to view more.")
+        ? s("\u5df2\u8fd4\u56de\u6700\u65b0\u4e00\u6279 " + results.length + " \u6761\u65e5\u5fd7\uff0c\u540e\u7eed\u53ef\u901a\u8fc7\u518d\u6b21\u67e5\u8be2\u6216 auto \u67e5\u8be2\u5237\u65b0\u66f4\u65b0\u5185\u5bb9\u3002", "Returned the latest batch of " + results.length + " logs. Run the query again or rely on auto refresh to update with newer content.")
         : response.partial
           ? (results.length
             ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\uff0c\u5f53\u524d\u8fd4\u56de\u7684\u662f\u90e8\u5206\u7ed3\u679c\u3002", "Query completed with partial results.")
@@ -3658,9 +3677,6 @@ highlight = function (text) {
             ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\u3002", "Query completed.")
             : s("\u6ca1\u6709\u5339\u914d\u5f53\u524d\u8fc7\u6ee4\u6761\u4ef6\u7684\u65e5\u5fd7\u3002", "No logs matched the current filters."));
       setSearchRuntimeStatus((response.partial || response.has_more) ? "partial" : "ok", successMessage);
-      if (response.has_more) {
-        void drainSearchPages(activeSearchDrainRun, pageInfo.value, state.search.selectedResultKey || previousSelectedKey);
-      }
       if (!(options && options.silentSuccess) && !results.length && !(options && options.background)) {
         toast(successMessage, "info");
       }

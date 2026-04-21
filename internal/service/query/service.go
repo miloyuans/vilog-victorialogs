@@ -54,8 +54,8 @@ type previewFetchTask struct {
 }
 
 const (
-	searchCacheVersion          = "search-v6"
-	maxSearchTransportPageSize  = 200
+	searchCacheVersion          = "search-v7"
+	maxSearchTransportPageSize  = 500
 	minSearchTransportPageSize  = 100
 	directSourceFullServiceLimit = 3
 )
@@ -618,17 +618,12 @@ func (s *Service) searchDatasourceDirectFromSource(
 
 	if !explicitServiceSelection {
 		previewLimit := directDatasourcePreviewLimit(pageSize)
-		var previewRows []model.SearchResult
-		var previewErr error
-		if hasPrimarySearchFilters(req) {
-			previewRows, partial, previewErr = s.fetchFilteredDatasourcePreviewWindow(ctx, datasource, snapshot, tagDefinitions, req, start, end, previewLimit)
-		} else {
-			previewRows, partial, previewErr = s.fetchDatasourcePreviewWindow(ctx, datasource, snapshot, tagDefinitions, start, end, previewLimit)
-		}
+		previewRows, previewPartial, previewErr := s.fetchAllServicePreviewWindow(ctx, datasource, snapshot, tagDefinitions, req, start, end, previewLimit)
 		if previewErr != nil {
 			return nil, model.QuerySourceStatus{}, false, true, previewErr
 		}
 		rows = previewRows
+		partial = previewPartial
 	} else if len(services) > directSourceFullServiceLimit {
 		previewRows, previewPartial, previewErr := s.searchSelectedServicesPreviewDirect(ctx, datasource, snapshot, tagDefinitions, req, services, start, end, pageSize)
 		if previewErr != nil {
