@@ -74,6 +74,10 @@ func main() {
 	}
 	discoveryService := discovery.New(store, cacheService, datasourceService, victoriaClient, telegramService, cfg.Discovery, cfg.VictoriaLogs)
 	queryService := query.New(store, cacheService, victoriaClient, cfg.Cache, logger.Named("query"))
+	var queryJobService *query.JobService
+	if cfg.QueryJobs.Enabled {
+		queryJobService = query.NewJobService(queryService, cfg.QueryJobs, logger.Named("queryjob"))
+	}
 	retentionService := retention.New(store, victoriaClient, cfg.Retention)
 	schedulerManager := scheduler.New(store, retentionService)
 
@@ -87,6 +91,9 @@ func main() {
 		go discoveryService.RunStartupDiscovery(context.Background())
 	}
 	queryService.StartMaintenance(ctx)
+	if queryJobService != nil && cfg.QueryJobs.Enabled {
+		queryJobService.StartCleanup(ctx)
+	}
 
 	server, err := httpserver.New(cfg, logger, []httpserver.ReadinessChecker{store}, httpserver.BuildInfo{
 		Version: version,
@@ -96,6 +103,7 @@ func main() {
 		Datasources: datasourceService,
 		Discovery:   discoveryService,
 		Query:       queryService,
+		QueryJobs:   queryJobService,
 		Retention:   retentionService,
 		Scheduler:   schedulerManager,
 	})

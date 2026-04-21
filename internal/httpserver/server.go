@@ -35,6 +35,7 @@ type Dependencies struct {
 	Datasources *datasourcesvc.Service
 	Discovery   *discoverysvc.Service
 	Query       *querysvc.Service
+	QueryJobs   *querysvc.JobService
 	Retention   *retentionsvc.Service
 	Scheduler   *scheduler.Manager
 }
@@ -102,7 +103,7 @@ func buildStaticVersion(info BuildInfo) string {
 	if commit == "" {
 		commit = "none"
 	}
-	if date == "" {
+	if date == "" || strings.EqualFold(date, "unknown") {
 		date = time.Now().UTC().Format("20060102150405")
 	}
 	return fmt.Sprintf("%s-%s-%s", version, commit, date)

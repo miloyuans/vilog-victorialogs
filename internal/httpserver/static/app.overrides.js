@@ -3924,3 +3924,351 @@ highlight = function (text) {
 })();
 
 bootstrap();
+
+(function () {
+  if (window.__vilogStreamingJobsPatched) return;
+  window.__vilogStreamingJobsPatched = true;
+
+  const JOB_RESULT_CHUNK_SIZE = 100;
+  const JOB_STORAGE_KEY = "vilog.search.activeJobId";
+  let jobRefreshTimer = null;
+
+  function ensureSearchJobState() {
+    normalizeFrontendCollections();
+    state.search.job = state.search.job || {
+      id: "",
+      requestKey: "",
+      cursor: "",
+      loading: false,
+      completed: false,
+      partial: false,
+      fetching: false,
+      eventSource: null,
+    };
+    return state.search.job;
+  }
+
+  function persistSearchJobID(jobID) {
+    try {
+      if (jobID) {
+        localStorage.setItem(JOB_STORAGE_KEY, String(jobID));
+      } else {
+        localStorage.removeItem(JOB_STORAGE_KEY);
+      }
+    } catch (_error) {
+    }
+  }
+
+  function closeSearchJobStream() {
+    const job = ensureSearchJobState();
+    if (job.eventSource) {
+      job.eventSource.close();
+      job.eventSource = null;
+    }
+  }
+
+  function mapJobSources(page, job) {
+    const direct = safeArray(page && page.sources);
+    if (direct.length) return direct;
+    const states = safeArray(job && job.source_states);
+    return states.map((item) => ({
+      datasource: item.datasource_name || item.datasource_id || "-",
+      status: item.status || "pending",
+      hits: Number(item.rows_matched || 0),
+      error: item.error || "",
+    }));
+  }
+
+  function buildJobResponseFromPage(page, job, mergedResults) {
+    const response = safeObject(state.search.response);
+    return {
+      keyword: response.keyword || "",
+      start: response.start || "",
+      end: response.end || "",
+      results: safeArray(mergedResults),
+      total: Math.max(
+        Number(page && page.matched_total_so_far || 0),
+        Number(job && job.progress && job.progress.rows_matched || 0),
+        safeArray(mergedResults).length,
+      ),
+      page: 1,
+      page_size: Number(state.search.pageSize || 500),
+      has_more: !!(page && page.has_more),
+      next_page: 0,
+      partial: !!(page && page.partial) || !page.completed,
+      cache_hit: false,
+      took_ms: Number(response.took_ms || 0),
+      sources: mapJobSources(page, job),
+    };
+  }
+
+  function syncRuntimeForJob(job, page) {
+    const loaded = safeArray(state.search.response && state.search.response.results).length;
+    const matched = Math.max(
+      Number(page && page.matched_total_so_far || 0),
+      Number(job && job.progress && job.progress.rows_matched || 0),
+      loaded,
+    );
+    const completed = !!(page && page.completed);
+    const partial = !!(page && page.partial);
+    const failed = String(job && job.status || "") === "failed";
+
+    if (failed) {
+      setSearchRuntimeStatus("error", job && job.last_error ? String(job.last_error) : s("查询任务失败，当前结果已保留。", "The query job failed and the current results were kept."));
+      return;
+    }
+    if (!completed) {
+      if (loaded > 0) {
+        setSearchRuntimeStatus("partial", searchProgressMessage(loaded, Math.max(loaded, matched)));
+      } else {
+        setSearchRuntimeStatus("loading", s("查询任务已创建，正在等待首批结果。", "The query job was created. Waiting for the first result batch."));
+      }
+      return;
+    }
+    if (partial) {
+      setSearchRuntimeStatus("partial", loaded
+        ? s("查询完成，但部分数据源返回了部分结果。", "The query finished, but some datasources returned partial results.")
+        : s("查询完成，但当前条件没有命中任何结果。", "The query finished, but no rows matched the current filters."));
+      return;
+    }
+    if (loaded > 0) {
+      setSearchRuntimeStatus("ok", s("全部结果已补齐。", "All results were loaded."));
+      return;
+    }
+    setSearchRuntimeStatus("ok", s("查询完成，没有匹配当前条件的日志。", "The query completed with no matching logs."));
+  }
+
+  async function loadSearchJobResults(job, options) {
+    const jobState = ensureSearchJobState();
+    if (!job || !job.id || jobState.id !== job.id) return false;
+    if (jobState.fetching) return false;
+
+    const chunkSize = Math.min(JOB_RESULT_CHUNK_SIZE, Math.max(25, Number(state.search.pageSize || JOB_RESULT_CHUNK_SIZE)));
+    let cursor = options && options.reset ? "" : String(jobState.cursor || "");
+    let replace = !!(options && options.reset);
+
+    jobState.fetching = true;
+    try {
+      while (jobState.id === job.id) {
+        const params = new URLSearchParams({ page_size: String(chunkSize) });
+        if (cursor) params.set("cursor", cursor);
+        const page = safeObject(await request(`/api/query/jobs/${encodeURIComponent(job.id)}/results?${params.toString()}`));
+        const incoming = safeArray(page.results);
+        const existing = replace ? [] : safeArray(state.search.response && state.search.response.results);
+        const merged = replace ? incoming : mergeSearchResultPages(existing, incoming);
+        const noMatchCompleted = !!page.completed && !incoming.length && !merged.length && Number(page.matched_total_so_far || 0) === 0;
+
+        if (incoming.length || replace || noMatchCompleted) {
+          const nextResponse = buildJobResponseFromPage(page, job, merged);
+          commitSearchResponse(nextResponse, {
+            preserveSelection: !replace,
+            preserveDetail: true,
+            silentSuccess: true,
+          }, state.search.selectedResultKey);
+        } else {
+          const current = safeObject(state.search.response);
+          current.sources = mapJobSources(page, job);
+          current.total = Math.max(Number(current.total || 0), Number(page.matched_total_so_far || 0), safeArray(current.results).length);
+          current.partial = !!page.partial || !page.completed;
+          state.search.response = current;
+          renderSearchControls();
+          renderSearchResults();
+        }
+
+        replace = false;
+        jobState.cursor = String(page.next_cursor || cursor || "");
+        jobState.completed = !!page.completed;
+        jobState.partial = !!page.partial;
+        syncRuntimeForJob(job, page);
+
+        if (!(page.has_more && page.next_cursor)) {
+          break;
+        }
+        cursor = String(page.next_cursor || "");
+      }
+      return true;
+    } finally {
+      jobState.fetching = false;
+      syncSearchAutoRefresh();
+    }
+  }
+
+  async function refreshSearchJobSnapshot(options) {
+    const jobState = ensureSearchJobState();
+    if (!jobState.id) return false;
+      const job = safeObject(await request(`/api/query/jobs/${encodeURIComponent(jobState.id)}`));
+      if (!job.id || job.id !== jobState.id) return false;
+    await loadSearchJobResults(job, options);
+    jobState.loading = !["completed", "failed", "partial", "cancelled"].includes(String(job.status || ""));
+    jobState.completed = !jobState.loading;
+    jobState.partial = String(job.status || "") === "partial" || String(job.status || "") === "failed";
+    if (jobState.completed) {
+      closeSearchJobStream();
+    }
+    return true;
+  }
+
+  function scheduleSearchJobRefresh(delayMs, options) {
+    clearTimeout(jobRefreshTimer);
+    jobRefreshTimer = setTimeout(() => {
+      void refreshSearchJobSnapshot(options || {}).catch((error) => {
+        const message = normalizeSearchRequestErrorMessage(error);
+        if (String(message).toLowerCase().indexOf("not found") >= 0 || String(message).toLowerCase().indexOf("404") >= 0) {
+          persistSearchJobID("");
+        }
+        setSearchRuntimeStatus("error", message);
+      });
+    }, Math.max(0, Number(delayMs || 0)));
+  }
+
+  function openSearchJobStream(jobID) {
+    closeSearchJobStream();
+    const jobState = ensureSearchJobState();
+    if (!jobID) return;
+    const source = new EventSource(`/api/query/jobs/${encodeURIComponent(jobID)}/stream`);
+    jobState.eventSource = source;
+
+    const onSignal = () => {
+      scheduleSearchJobRefresh(80, {});
+    };
+    source.onmessage = onSignal;
+    ["status", "progress", "segment_ready", "completed", "partial", "failed"].forEach((eventName) => {
+      source.addEventListener(eventName, onSignal);
+    });
+    source.addEventListener("heartbeat", () => {});
+    source.onerror = function () {
+      const active = ensureSearchJobState();
+      if (active.id === jobID && !active.completed) {
+        setSearchRuntimeStatus("partial", s("查询连接正在重试，当前结果已保留。", "The query stream is reconnecting. Current results were kept."));
+      }
+    };
+  }
+
+  async function startStreamingSearch(options) {
+    normalizeFrontendCollections();
+    syncHiddenQueryInput();
+
+    if (!safeArray(state.search.selectedDatasourceIDs).length) {
+      if (!(options && options.background)) {
+        toast(s("请先选择至少一个查询数据源。", "Select at least one search datasource."), "error");
+      }
+      return false;
+    }
+
+    const pageInfo = getSearchPageSizeFromState();
+    if (!pageInfo.valid) {
+      state.search.pageSizeError = true;
+      renderSearchToolbar();
+      if (!(options && options.background)) {
+        toast(s("自定义条数最大不能超过 10000。", "Custom rows cannot exceed 10000."), "error");
+      }
+      return false;
+    }
+
+    const payload = buildCurrentSearchPayload(1, pageInfo.value);
+    payload.use_cache = false;
+    const requestKey = JSON.stringify(payload);
+    const jobState = ensureSearchJobState();
+
+    if (jobState.id && !jobState.completed && jobState.requestKey === requestKey) {
+      scheduleSearchJobRefresh(0, {});
+      return true;
+    }
+
+    state.search.page = 1;
+    state.search.pageSize = pageInfo.value;
+    state.search.pageSizeCustom = pageInfo.mode === "custom" ? pageInfo.value : state.search.pageSizeCustom;
+    state.search.pageSizeCustomRaw = pageInfo.raw;
+    state.search.pageSizeMode = pageInfo.mode;
+    state.search.pageSizeError = false;
+    state.search.useCache = false;
+    state.search.response = {
+      ...safeObject(state.search.response),
+      keyword: payload.keyword || "",
+      start: payload.start || "",
+      end: payload.end || "",
+    };
+
+    jobState.requestKey = requestKey;
+    jobState.id = "";
+    jobState.cursor = "";
+    jobState.loading = true;
+    jobState.completed = false;
+    jobState.partial = false;
+
+    closeSearchJobStream();
+    setSearchLoading(false);
+    setSearchRuntimeStatus("loading", s("查询任务创建中，当前结果保持可读。", "Creating the query job. Current results stay readable."));
+
+    try {
+      const created = safeObject(await request("/api/query/jobs", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }));
+      jobState.id = String(created.job_id || "");
+      if (!jobState.id) {
+        throw new Error(s("查询任务创建失败。", "Failed to create the query job."));
+      }
+      persistSearchJobID(jobState.id);
+      openSearchJobStream(jobState.id);
+      await refreshSearchJobSnapshot({ reset: true });
+      return true;
+    } catch (error) {
+      closeSearchJobStream();
+      persistSearchJobID("");
+      jobState.loading = false;
+      jobState.completed = false;
+      jobState.partial = false;
+      const message = normalizeSearchRequestErrorMessage(error);
+      setSearchRuntimeStatus("error", message);
+      if (!(options && options.background)) {
+        toast(message, "error");
+      }
+      return false;
+    } finally {
+      setSearchLoading(false);
+      syncSearchAutoRefresh();
+    }
+  }
+
+  const __oldFetchAllResultsForExport = fetchAllResultsForExport;
+  fetchAllResultsForExport = async function () {
+    const jobState = ensureSearchJobState();
+    if (!jobState.id) {
+      return __oldFetchAllResultsForExport();
+    }
+    await refreshSearchJobSnapshot({});
+    return applyClientSideResultFilters(safeArray(state.search.response && state.search.response.results));
+  };
+
+  runSearchWindow = async function (_pageOverride, options) {
+    return startStreamingSearch(options || {});
+  };
+
+  submitSearch = async function (event) {
+    if (event) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+    await startStreamingSearch({});
+  };
+
+  document.addEventListener("submit", function (event) {
+    const target = event && event.target;
+    if (target && target.id === "search-form") {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void startStreamingSearch({});
+    }
+  }, true);
+
+  try {
+    const restoredJobID = localStorage.getItem(JOB_STORAGE_KEY);
+    if (restoredJobID) {
+      const jobState = ensureSearchJobState();
+      jobState.id = String(restoredJobID);
+      scheduleSearchJobRefresh(0, { reset: true });
+    }
+  } catch (_error) {
+  }
+})();

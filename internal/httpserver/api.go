@@ -1,7 +1,11 @@
 package httpserver
 
 import (
+	"encoding/json"
 	"net/http"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -23,6 +27,10 @@ func (s *Server) registerDatasourceRoutes(api *gin.RouterGroup) {
 func (s *Server) registerQueryRoutes(api *gin.RouterGroup) {
 	group := api.Group("/query")
 	group.POST("/search", s.searchLogs)
+	group.POST("/jobs", s.createQueryJob)
+	group.GET("/jobs/:id/stream", s.streamQueryJob)
+	group.GET("/jobs/:id/results", s.getQueryJobResults)
+	group.GET("/jobs/:id", s.getQueryJob)
 	group.GET("/services", s.listServices)
 	group.GET("/tags", s.listQueryTags)
 	group.GET("/tag-values", s.listTagValues)
@@ -133,6 +141,135 @@ func (s *Server) searchLogs(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+func (s *Server) createQueryJob(c *gin.Context) {
+	if s.deps.QueryJobs == nil || !s.cfg.QueryJobs.Enabled {
+		writeError(c, http.StatusServiceUnavailable, "query_jobs_disabled", "query jobs are not enabled")
+		return
+	}
+
+	var req model.SearchRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+
+	result, err := s.deps.QueryJobs.Create(c.Request.Context(), req)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "query_job_create_failed", err.Error())
+		return
+	}
+	c.JSON(http.StatusAccepted, result)
+}
+
+func (s *Server) getQueryJob(c *gin.Context) {
+	if s.deps.QueryJobs == nil || !s.cfg.QueryJobs.Enabled {
+		writeError(c, http.StatusServiceUnavailable, "query_jobs_disabled", "query jobs are not enabled")
+		return
+	}
+
+	job, err := s.deps.QueryJobs.Get(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		writeError(c, http.StatusNotFound, "query_job_not_found", err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, job)
+}
+
+func (s *Server) getQueryJobResults(c *gin.Context) {
+	if s.deps.QueryJobs == nil || !s.cfg.QueryJobs.Enabled {
+		writeError(c, http.StatusServiceUnavailable, "query_jobs_disabled", "query jobs are not enabled")
+		return
+	}
+
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "100"))
+	page, err := s.deps.QueryJobs.Results(c.Request.Context(), c.Param("id"), c.Query("cursor"), pageSize)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "query_job_results_failed", err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, page)
+}
+
+func (s *Server) streamQueryJob(c *gin.Context) {
+	if s.deps.QueryJobs == nil || !s.cfg.QueryJobs.Enabled {
+		writeError(c, http.StatusServiceUnavailable, "query_jobs_disabled", "query jobs are not enabled")
+		return
+	}
+
+	job, err := s.deps.QueryJobs.Get(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		writeError(c, http.StatusNotFound, "query_job_not_found", err.Error())
+		return
+	}
+
+	c.Writer.Header().Set("Content-Type", "text/event-stream")
+	c.Writer.Header().Set("Cache-Control", "no-cache")
+	c.Writer.Header().Set("Connection", "keep-alive")
+	c.Writer.Header().Set("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+
+	writeEvent := func(eventType string, payload any) bool {
+		data, marshalErr := json.Marshal(payload)
+		if marshalErr != nil {
+			return false
+		}
+		if _, writeErr := c.Writer.Write([]byte("event: " + eventType + "\n")); writeErr != nil {
+			return false
+		}
+		if _, writeErr := c.Writer.Write([]byte("data: " + string(data) + "\n\n")); writeErr != nil {
+			return false
+		}
+		c.Writer.Flush()
+		return true
+	}
+
+	initial := model.QueryJobEvent{
+		Type:      "status",
+		JobID:     job.ID,
+		Status:    job.Status,
+		Progress:  job.Progress,
+		LastError: job.LastError,
+	}
+	if !writeEvent(initial.Type, initial) {
+		return
+	}
+
+	events, cancel := s.deps.QueryJobs.Subscribe(job.ID)
+	defer cancel()
+
+	heartbeatEvery := time.Duration(s.cfg.QueryJobs.SSEHeartbeatSeconds) * time.Second
+	if heartbeatEvery < 5*time.Second {
+		heartbeatEvery = 5 * time.Second
+	}
+	ticker := time.NewTicker(heartbeatEvery)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			return
+		case event, ok := <-events:
+			if !ok {
+				return
+			}
+			eventType := strings.TrimSpace(event.Type)
+			if eventType == "" {
+				eventType = "message"
+			}
+			if !writeEvent(eventType, event) {
+				return
+			}
+		case <-ticker.C:
+			if !writeEvent("heartbeat", model.QueryJobEvent{
+				Type:   "heartbeat",
+				JobID:  job.ID,
+				Status: job.Status,
+			}) {
+				return
+			}
+		}
+	}
 }
 
 func (s *Server) listServices(c *gin.Context) {

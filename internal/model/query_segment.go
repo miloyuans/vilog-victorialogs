@@ -36,7 +36,9 @@ type JobFilterRequest struct {
 
 type JobResultsPage struct {
 	JobID             string         `json:"job_id"`
+	Status            QueryJobStatus `json:"status"`
 	Results           []SearchResult `json:"results"`
+	Sources           []QuerySourceStatus `json:"sources,omitempty"`
 	NextCursor        string         `json:"next_cursor,omitempty"`
 	HasMore           bool           `json:"has_more"`
 	Completed         bool           `json:"completed"`
