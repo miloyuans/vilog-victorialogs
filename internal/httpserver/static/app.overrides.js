@@ -15,7 +15,13 @@ function createQueryLayer(mode, value) {
 }
 
 function createDefaultQueryLayers() {
-  return [createQueryLayer("keyword", "*"), createQueryLayer("keyword", "")];
+  return [createQueryLayer("keyword", ""), createQueryLayer("keyword", "")];
+}
+
+function normalizeLayerValue(layer, index) {
+  const raw = String(layer && layer.value || "");
+  if (index === 0 && raw.trim() === "*") return "";
+  return raw;
 }
 
 function ensureEnhancedState() {
@@ -47,12 +53,15 @@ function ensureEnhancedState() {
   if (!Array.isArray(state.search.queryLayers) || !state.search.queryLayers.length) {
     state.search.queryLayers = createDefaultQueryLayers();
   }
-  state.search.queryLayers = state.search.queryLayers.map((layer) => ({
+  state.search.queryLayers = state.search.queryLayers.map((layer, index) => ({
     id: layer && layer.id ? String(layer.id) : nextQueryLayerID(),
     mode: layer && layer.mode === "logsql" ? "logsql" : "keyword",
     operator: layer && layer.operator === "or" ? "or" : "and",
-    value: layer && typeof layer.value === "string" ? layer.value : "",
+    value: normalizeLayerValue(layer, index),
   }));
+  if (state.search.queryLayers[0] && String(state.search.queryLayers[0].value || "").trim() === "*") {
+    state.search.queryLayers[0].value = "";
+  }
 }
 
 ensureEnhancedState();
@@ -67,6 +76,7 @@ function splitKeywordTokens(value) {
       .split(/\r?\n|[;,]+/g)
       .map((part) => part.trim())
       .filter(Boolean)
+      .filter((part) => part !== "*")
       .map((part) => part.replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1")),
   );
 }
@@ -87,7 +97,7 @@ function buildBackendQueryFromLayer(layer) {
 
 function getPrimaryLayer() {
   ensureEnhancedState();
-  return state.search.queryLayers[0] || createQueryLayer("keyword", "*");
+  return state.search.queryLayers[0] || createQueryLayer("keyword", "");
 }
 
 function getLayerNote(index, layer) {
@@ -1154,16 +1164,26 @@ function formatSearchLocalDateValue(date) {
   return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}`;
 }
 
-applyQuickRange = function (name) {
+function setQuickRangeValues(name) {
   const end = new Date();
   const deltaMap = { "5m": 5 * 60 * 1000, "30m": 30 * 60 * 1000, "1h": 60 * 60 * 1000, "3h": 3 * 60 * 60 * 1000, "6h": 6 * 60 * 60 * 1000, "12h": 12 * 60 * 60 * 1000, "1d": 24 * 60 * 60 * 1000, "3d": 3 * 24 * 60 * 60 * 1000, "7d": 7 * 24 * 60 * 60 * 1000 };
   const start = new Date(end.getTime() - (deltaMap[name] || deltaMap["1h"]));
   state.search.timePreset = name;
   byId("search-start").value = formatSearchLocalDateValue(start);
   byId("search-end").value = formatSearchLocalDateValue(end);
+}
+
+applyQuickRange = function (name) {
+  setQuickRangeValues(name);
   closeSearchMenus();
   renderSearchTimePanel();
 };
+
+function refreshSearchTimeRangeIfNeeded() {
+  normalizeFrontendCollections();
+  if (state.search.timePreset === "custom") return;
+  setQuickRangeValues(state.search.timePreset || "1h");
+}
 
 applyCustomTime = function () {
   const start = byId("search-start-custom").value;
@@ -1631,11 +1651,11 @@ highlight = function (text) {
     state.search.columnWidths = safeObject(state.search.columnWidths);
     state.search.useCache = state.search.useCache !== false;
     state.search.queryLayers = safeArray(state.search.queryLayers).length
-      ? safeArray(state.search.queryLayers).map((layer) => ({
+      ? safeArray(state.search.queryLayers).map((layer, index) => ({
           id: layer && layer.id ? String(layer.id) : nextQueryLayerID(),
           mode: layer && layer.mode === "logsql" ? "logsql" : "keyword",
           operator: layer && layer.operator === "or" ? "or" : "and",
-          value: String(layer && layer.value || ""),
+          value: normalizeLayerValue(layer, index),
         }))
       : createDefaultQueryLayers();
     if (state.search.pageSizeMode !== "custom" && PAGE_SIZE_PRESETS.indexOf(Number(state.search.pageSizeMode)) >= 0) {
@@ -2736,7 +2756,7 @@ highlight = function (text) {
   buildCurrentSearchPayload = function (page, pageSize) {
     normalizeFrontendCollections();
     syncHiddenQueryInput();
-    const primaryLayer = safeArray(state.search.queryLayers)[0] || createQueryLayer("keyword", "*");
+    const primaryLayer = safeArray(state.search.queryLayers)[0] || createQueryLayer("keyword", "");
     return {
       keyword: getBackendPrimaryQuery(primaryLayer),
       keyword_mode: primaryLayer.operator === "or" ? "or" : "and",
@@ -2948,6 +2968,11 @@ highlight = function (text) {
         return;
       }
       if (state.ui.searchLoading) {
+        syncSearchAutoRefresh();
+        return;
+      }
+      const jobState = ensureSearchJobState();
+      if (jobState.loading || jobState.fetching || (jobState.id && !jobState.completed)) {
         syncSearchAutoRefresh();
         return;
       }
@@ -4104,6 +4129,7 @@ bootstrap();
     jobState.partial = String(job.status || "") === "partial" || String(job.status || "") === "failed";
     if (jobState.completed) {
       closeSearchJobStream();
+      persistSearchJobID("");
     }
     return true;
   }
@@ -4147,6 +4173,7 @@ bootstrap();
   async function startStreamingSearch(options) {
     normalizeFrontendCollections();
     syncHiddenQueryInput();
+    refreshSearchTimeRangeIfNeeded();
 
     if (!safeArray(state.search.selectedDatasourceIDs).length) {
       if (!(options && options.background)) {
@@ -4169,6 +4196,10 @@ bootstrap();
     payload.use_cache = false;
     const requestKey = JSON.stringify(payload);
     const jobState = ensureSearchJobState();
+
+    if (options && options.background && (jobState.loading || jobState.fetching || (jobState.id && !jobState.completed))) {
+      return false;
+    }
 
     if (jobState.id && !jobState.completed && jobState.requestKey === requestKey) {
       scheduleSearchJobRefresh(0, {});
@@ -4197,6 +4228,7 @@ bootstrap();
     jobState.partial = false;
 
     closeSearchJobStream();
+    persistSearchJobID("");
     setSearchLoading(false);
     setSearchRuntimeStatus("loading", s("查询任务创建中，当前结果保持可读。", "Creating the query job. Current results stay readable."));
 

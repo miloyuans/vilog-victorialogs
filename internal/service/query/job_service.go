@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -422,7 +423,10 @@ func (s *JobService) runDatasource(
 ) (bool, error) {
 	snapshot, _ := s.search.store.GetSnapshot(ctx, datasource.ID)
 	keywords := splitKeywords(req.Keyword)
-	serviceNames := uniqueStrings(req.ServiceNames)
+	serviceNames, serviceCatalogExpanded, err := s.resolveJobServiceTargets(ctx, datasource.ID, req.ServiceNames)
+	if err != nil {
+		return true, err
+	}
 	if len(serviceNames) == 0 {
 		serviceNames = []string{""}
 	}
@@ -438,6 +442,14 @@ func (s *JobService) runDatasource(
 	if sourceLimit > 500 {
 		sourceLimit = 500
 	}
+	if serviceCatalogExpanded {
+		if chunkWindow > 5*time.Minute {
+			chunkWindow = 5 * time.Minute
+		}
+		if sourceLimit > 200 {
+			sourceLimit = 200
+		}
+	}
 
 	flushLimit := s.cfg.SegmentMaxRows
 	if flushLimit <= 0 {
@@ -445,6 +457,9 @@ func (s *JobService) runDatasource(
 	}
 	if flushLimit > defaultJobFlushRows {
 		flushLimit = defaultJobFlushRows
+	}
+	if serviceCatalogExpanded && flushLimit > 100 {
+		flushLimit = 100
 	}
 
 	buffer := make([]model.SearchResult, 0, flushLimit)
@@ -572,6 +587,25 @@ func (s *JobService) runDatasource(
 	})
 
 	return false, nil
+}
+
+func (s *JobService) resolveJobServiceTargets(ctx context.Context, datasourceID string, requested []string) ([]string, bool, error) {
+	if items := uniqueStrings(requested); len(items) > 0 {
+		sort.Strings(items)
+		return items, false, nil
+	}
+
+	entries, err := s.search.store.ListServiceCatalog(ctx, datasourceID)
+	if err != nil {
+		return []string{""}, false, nil
+	}
+
+	items := uniqueServiceNames(entries)
+	if len(items) == 0 {
+		return []string{""}, false, nil
+	}
+	sort.Strings(items)
+	return items, true, nil
 }
 
 func (s *JobService) writeSegment(jobID string, sequence int64, rows []model.SearchResult) (localstore.SegmentMeta, error) {

@@ -54,9 +54,10 @@ type previewFetchTask struct {
 }
 
 const (
-	searchCacheVersion          = "search-v5"
+	searchCacheVersion          = "search-v6"
 	maxSearchTransportPageSize  = 200
 	minSearchTransportPageSize  = 100
+	directSourceFullServiceLimit = 3
 )
 
 type cachedSearchResultSet struct {
@@ -615,7 +616,27 @@ func (s *Service) searchDatasourceDirectFromSource(
 	rows := make([]model.SearchResult, 0)
 	partial := false
 
-	if explicitServiceSelection {
+	if !explicitServiceSelection {
+		previewLimit := directDatasourcePreviewLimit(pageSize)
+		var previewRows []model.SearchResult
+		var previewErr error
+		if hasPrimarySearchFilters(req) {
+			previewRows, partial, previewErr = s.fetchFilteredDatasourcePreviewWindow(ctx, datasource, snapshot, tagDefinitions, req, start, end, previewLimit)
+		} else {
+			previewRows, partial, previewErr = s.fetchDatasourcePreviewWindow(ctx, datasource, snapshot, tagDefinitions, start, end, previewLimit)
+		}
+		if previewErr != nil {
+			return nil, model.QuerySourceStatus{}, false, true, previewErr
+		}
+		rows = previewRows
+	} else if len(services) > directSourceFullServiceLimit {
+		previewRows, previewPartial, previewErr := s.searchSelectedServicesPreviewDirect(ctx, datasource, snapshot, tagDefinitions, req, services, start, end, pageSize)
+		if previewErr != nil {
+			return nil, model.QuerySourceStatus{}, false, true, previewErr
+		}
+		rows = previewRows
+		partial = previewPartial
+	} else {
 		for _, serviceName := range services {
 			serviceRows, servicePartial, err := s.fetchCompleteSourceRange(ctx, datasource, snapshot, tagDefinitions, serviceName, start, end)
 			if err != nil {
@@ -624,13 +645,6 @@ func (s *Service) searchDatasourceDirectFromSource(
 			rows = append(rows, serviceRows...)
 			partial = partial || servicePartial
 		}
-	} else {
-		allRows, sourcePartial, err := s.fetchCompleteSourceRange(ctx, datasource, snapshot, tagDefinitions, "", start, end)
-		if err != nil {
-			return nil, model.QuerySourceStatus{}, false, true, err
-		}
-		rows = allRows
-		partial = sourcePartial
 	}
 
 	rows = applySearchFilters(rows, req)
@@ -642,6 +656,113 @@ func (s *Service) searchDatasourceDirectFromSource(
 		Status:     statusLabelForRows(partial, len(rows) == 0),
 		Hits:       len(rows),
 	}, false, partial, nil
+}
+
+func directDatasourcePreviewLimit(pageSize int) int {
+	limit := pageSize
+	if limit <= 0 {
+		limit = 500
+	}
+	if limit < searchTransportPageSize(limit) {
+		limit = searchTransportPageSize(limit)
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	return limit
+}
+
+func directServicePreviewLimit(pageSize, serviceCount int) int {
+	if serviceCount <= 0 {
+		return directDatasourcePreviewLimit(pageSize)
+	}
+	limit := searchTransportPageSize(pageSize)
+	if limit <= 0 {
+		limit = 200
+	}
+	limit = (limit + serviceCount - 1) / serviceCount
+	if limit < 5 {
+		limit = 5
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	return limit
+}
+
+func (s *Service) searchSelectedServicesPreviewDirect(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	req model.SearchRequest,
+	services []string,
+	start, end time.Time,
+	pageSize int,
+) ([]model.SearchResult, bool, error) {
+	serviceNames := uniqueStrings(services)
+	if len(serviceNames) == 0 {
+		return []model.SearchResult{}, false, nil
+	}
+
+	type previewResult struct {
+		rows    []model.SearchResult
+		partial bool
+		err     error
+	}
+
+	perServiceLimit := directServicePreviewLimit(pageSize, len(serviceNames))
+	workerLimit := s.serviceChunkConcurrency()
+	if workerLimit <= 0 {
+		workerLimit = 2
+	}
+	if workerLimit > 6 {
+		workerLimit = 6
+	}
+	sem := make(chan struct{}, workerLimit)
+	resultsCh := make(chan previewResult, len(serviceNames))
+	var wg sync.WaitGroup
+
+	for _, serviceName := range serviceNames {
+		name := serviceName
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			if hasPrimarySearchFilters(req) {
+				rows, previewPartial, fetchErr := s.fetchFilteredPreviewSourceRange(ctx, datasource, snapshot, tagDefinitions, req, name, start, end, perServiceLimit)
+				resultsCh <- previewResult{rows: rows, partial: previewPartial, err: fetchErr}
+				return
+			}
+
+			rows, fetchErr := s.fetchPreviewSourceRange(ctx, datasource, snapshot, tagDefinitions, name, start, end, perServiceLimit)
+			resultsCh <- previewResult{rows: rows, partial: false, err: fetchErr}
+		}()
+	}
+
+	wg.Wait()
+	close(resultsCh)
+
+	merged := make([]model.SearchResult, 0, len(serviceNames)*perServiceLimit)
+	partial := false
+	for item := range resultsCh {
+		if item.err != nil {
+			return nil, true, item.err
+		}
+		merged = append(merged, item.rows...)
+		partial = partial || item.partial
+	}
+
+	sortSearchResults(merged)
+	merged = limitResultsPerService(merged, perServiceLimit)
+	maxVisible := responseVisibleLimit(pageSize, serviceNames, merged)
+	if len(merged) > maxVisible {
+		merged = merged[:maxVisible]
+		partial = true
+	}
+	return merged, partial, nil
 }
 
 func (s *Service) searchServiceWindow(
@@ -1587,6 +1708,7 @@ func normalizeRequest(req model.SearchRequest) (model.SearchRequest, time.Time, 
 	normalized.End = end.Format(time.RFC3339)
 	normalized.Page = page
 	normalized.PageSize = pageSize
+	normalized.Keyword = normalizeSearchKeyword(req.Keyword)
 	if strings.ToLower(strings.TrimSpace(normalized.KeywordMode)) == "or" {
 		normalized.KeywordMode = "or"
 	} else {
@@ -1604,8 +1726,17 @@ func normalizeRequest(req model.SearchRequest) (model.SearchRequest, time.Time, 
 	return normalized, start, end, page, pageSize, nil
 }
 
+func normalizeSearchKeyword(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "*" {
+		return ""
+	}
+	return trimmed
+}
+
 func buildLogsQL(datasource model.Datasource, snapshot model.DatasourceTagSnapshot, tags []model.TagDefinition, keyword string, serviceNames []string, tagFilters map[string][]string) string {
 	parts := make([]string, 0)
+	keyword = normalizeSearchKeyword(keyword)
 	if strings.TrimSpace(keyword) != "" {
 		parts = append(parts, quotePhrase(keyword))
 	}
