@@ -14,6 +14,10 @@ function createQueryLayer(mode, value) {
   };
 }
 
+function createDefaultQueryLayers() {
+  return [createQueryLayer("keyword", "*"), createQueryLayer("keyword", "")];
+}
+
 function ensureEnhancedState() {
   state.ui = state.ui || {};
   state.search = state.search || {};
@@ -41,7 +45,7 @@ function ensureEnhancedState() {
   state.search.pageSize = state.search.pageSize || 500;
   if (state.search.useCache == null) state.search.useCache = true;
   if (!Array.isArray(state.search.queryLayers) || !state.search.queryLayers.length) {
-    state.search.queryLayers = [createQueryLayer("keyword", "")];
+    state.search.queryLayers = createDefaultQueryLayers();
   }
   state.search.queryLayers = state.search.queryLayers.map((layer) => ({
     id: layer && layer.id ? String(layer.id) : nextQueryLayerID(),
@@ -74,7 +78,7 @@ function escapeQueryToken(token) {
 function buildBackendQueryFromLayer(layer) {
   if (!layer) return "";
   const raw = String(layer.value || "").trim();
-  if (!raw) return "";
+  if (!raw || raw === "*") return "";
   if (layer.mode === "logsql") return raw;
   const tokens = splitKeywordTokens(raw);
   const joiner = layer.operator === "or" ? " or " : " and ";
@@ -83,7 +87,7 @@ function buildBackendQueryFromLayer(layer) {
 
 function getPrimaryLayer() {
   ensureEnhancedState();
-  return state.search.queryLayers[0] || createQueryLayer("keyword", "");
+  return state.search.queryLayers[0] || createQueryLayer("keyword", "*");
 }
 
 function getLayerNote(index, layer) {
@@ -137,7 +141,7 @@ function searchableText(item) {
 
 function layerMatches(item, layer) {
   const raw = String(layer && layer.value ? layer.value : "").trim();
-  if (!raw) return true;
+  if (!raw || raw === "*") return true;
   const haystack = searchableText(item);
   if (layer.mode === "keyword") {
     const tokens = splitKeywordTokens(raw);
@@ -204,7 +208,7 @@ function filteredDatasourceItems() {
 function renderQueryLayer(layer, index) {
   const title = index === 0 ? s("主查询", "Primary Query") : s("递归过滤 " + index, "Recursive Filter " + index);
   return `
-    <div class="query-layer-card" data-query-layer-card="${esc(layer.id)}">
+    <div class="query-layer-card ${index === 0 ? "query-layer-card-primary" : "query-layer-card-recursive"}" data-query-layer-card="${esc(layer.id)}">
       <div class="query-layer-head">
         <div class="query-layer-copy">
           <strong>${esc(title)}</strong>
@@ -219,7 +223,7 @@ function renderQueryLayer(layer, index) {
           ${index > 0 ? `<button class="icon-button" type="button" data-action="remove-query-layer" data-layer-id="${esc(layer.id)}">x</button>` : ""}
         </div>
       </div>
-      <textarea class="query-layer-input" data-query-layer-input="${esc(layer.id)}" rows="${index === 0 ? "4" : "3"}" placeholder="${esc(getLayerPlaceholder(layer, index))}">${esc(layer.value || "")}</textarea>
+      <textarea class="query-layer-input" data-query-layer-input="${esc(layer.id)}" rows="${index === 0 ? "2" : "4"}" placeholder="${esc(getLayerPlaceholder(layer, index))}">${esc(layer.value || "")}</textarea>
       <div class="query-layer-foot">
         <span>${esc(index === 0 ? s("Enter 直接执行查询，Shift+Enter 换行。", "Press Enter to run and Shift+Enter for a line break.") : s("这一层只作用于上一层结果，不会重新向后端发起新的请求。", "This layer filters the previous result set locally without re-querying the backend."))}</span>
       </div>
@@ -721,7 +725,7 @@ handleClick = function (event) {
   }
   if (action === "remove-query-layer" && layerID) {
     state.search.queryLayers = state.search.queryLayers.filter((layer) => layer.id !== layerID);
-    if (!state.search.queryLayers.length) state.search.queryLayers = [createQueryLayer("keyword", "")];
+    if (!state.search.queryLayers.length) state.search.queryLayers = createDefaultQueryLayers();
     renderSearchControls();
     return;
   }
@@ -1031,7 +1035,7 @@ clearSearchFilters = async function () {
   state.search.activeFilters = {};
   state.search.tagValues = {};
   state.search.levelFilter = "all";
-  state.search.queryLayers = [createQueryLayer("keyword", "")];
+  state.search.queryLayers = createDefaultQueryLayers();
   state.search.highlightTone = "yellow";
   state.ui.detailOpen = false;
   if (byId("search-page")) byId("search-page").value = "1";
@@ -1572,7 +1576,9 @@ highlight = function (text) {
 
   function getBackendPrimaryQuery(layer) {
     if (!layer) return "";
-    return layer.mode === "keyword" ? String(layer.value || "").trim() : "";
+    const raw = String(layer.value || "").trim();
+    if (raw === "*") return "";
+    return layer.mode === "keyword" ? raw : "";
   }
 
   function getBackendPrimaryKeywordMode(layer) {
@@ -1613,7 +1619,7 @@ highlight = function (text) {
     state.search.tagCatalog = safeArray(state.search.tagCatalog);
     state.search.tagValues = safeObject(state.search.tagValues);
     state.search.activeFilters = safeObject(state.search.activeFilters);
-    state.search.queryLayers = safeArray(state.search.queryLayers).length ? state.search.queryLayers : [createQueryLayer("keyword", "")];
+    state.search.queryLayers = safeArray(state.search.queryLayers).length ? state.search.queryLayers : createDefaultQueryLayers();
     state.search.page = Math.max(1, Number(state.search.page || 1) || 1);
     state.search.pageSize = getResolvedSearchPageSize(state.search.pageSize || 500);
     state.search.pageSizeCustom = getResolvedSearchPageSize(state.search.pageSizeCustom || state.search.pageSize || 1500);
@@ -1632,7 +1638,7 @@ highlight = function (text) {
           operator: layer && layer.operator === "or" ? "or" : "and",
           value: String(layer && layer.value || ""),
         }))
-      : [createQueryLayer("keyword", "")];
+      : createDefaultQueryLayers();
     if (state.search.pageSizeMode !== "custom" && PAGE_SIZE_PRESETS.indexOf(Number(state.search.pageSizeMode)) >= 0) {
       state.search.pageSize = getResolvedSearchPageSize(state.search.pageSizeMode);
     }
@@ -2523,7 +2529,7 @@ highlight = function (text) {
     }
     if (action === "remove-query-layer" && layerID) {
       state.search.queryLayers = safeArray(state.search.queryLayers).filter((layer) => layer.id !== layerID);
-      if (!state.search.queryLayers.length) state.search.queryLayers = [createQueryLayer("keyword", "")];
+      if (!state.search.queryLayers.length) state.search.queryLayers = createDefaultQueryLayers();
       renderSearchControls();
       return;
     }
@@ -2590,7 +2596,7 @@ highlight = function (text) {
     state.search.activeFilters = {};
     state.search.tagValues = {};
     state.search.levelFilter = "all";
-    state.search.queryLayers = [createQueryLayer("keyword", "")];
+    state.search.queryLayers = createDefaultQueryLayers();
     state.search.highlightTone = "yellow";
     state.ui.detailOpen = false;
     state.ui.menuSearch = { datasource: "", service: "" };
@@ -2731,18 +2737,18 @@ highlight = function (text) {
   buildCurrentSearchPayload = function (page, pageSize) {
     normalizeFrontendCollections();
     syncHiddenQueryInput();
-    const primaryLayer = safeArray(state.search.queryLayers)[0] || createQueryLayer("keyword", "");
+    const primaryLayer = safeArray(state.search.queryLayers)[0] || createQueryLayer("keyword", "*");
     return {
-      keyword: String(primaryLayer.value || "").trim(),
+      keyword: getBackendPrimaryQuery(primaryLayer),
       keyword_mode: primaryLayer.operator === "or" ? "or" : "and",
       start: localToRFC3339((byId("search-start") && byId("search-start").value) || ""),
       end: localToRFC3339((byId("search-end") && byId("search-end").value) || ""),
       datasource_ids: safeArray(state.search.selectedDatasourceIDs).slice(),
       service_names: safeArray(state.search.serviceNames).slice(),
       tags: normalizeFilters(state.search.activeFilters),
-      page: 1,
+      page: Number(page || state.search.page || 1),
       page_size: getResolvedSearchPageSize(pageSize || state.search.pageSize || 500),
-      use_cache: true,
+      use_cache: state.search.useCache !== false,
     };
   };
 
@@ -3505,7 +3511,7 @@ highlight = function (text) {
     state.search.activeFilters = {};
     state.search.tagValues = {};
     state.search.levelFilter = "all";
-    state.search.queryLayers = [createQueryLayer("keyword", "")];
+    state.search.queryLayers = createDefaultQueryLayers();
     state.search.highlightTone = "yellow";
     state.ui.detailOpen = false;
     state.ui.menuSearch = { datasource: "", service: "" };

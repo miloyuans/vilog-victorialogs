@@ -54,9 +54,9 @@ type previewFetchTask struct {
 }
 
 const (
-	searchCacheVersion          = "search-v3"
-	maxSearchTransportPageSize  = 500
-	minSearchTransportPageSize  = 200
+	searchCacheVersion          = "search-v4"
+	maxSearchTransportPageSize  = 200
+	minSearchTransportPageSize  = 100
 )
 
 type cachedSearchResultSet struct {
@@ -502,6 +502,9 @@ func (s *Service) searchDatasource(
 	for _, serviceName := range services {
 		s.markServiceInteractive(datasource, serviceName, now)
 	}
+	if !s.cfg.BackgroundSyncEnabled {
+		return s.searchDatasourceDirectFromSource(ctx, datasource, snapshot, tagDefinitions, req, services, explicitServiceSelection, start, end, pageSize)
+	}
 
 	rows := make([]model.SearchResult, 0)
 	cacheHit := true
@@ -580,6 +583,49 @@ func (s *Service) searchDatasource(
 		Status:     statusLabelForRows(partial, len(rows) == 0),
 		Hits:       len(rows),
 	}, cacheHit, partial, nil
+}
+
+func (s *Service) searchDatasourceDirectFromSource(
+	ctx context.Context,
+	datasource model.Datasource,
+	snapshot model.DatasourceTagSnapshot,
+	tagDefinitions []model.TagDefinition,
+	req model.SearchRequest,
+	services []string,
+	explicitServiceSelection bool,
+	start, end time.Time,
+	pageSize int,
+) ([]model.SearchResult, model.QuerySourceStatus, bool, bool, error) {
+	rows := make([]model.SearchResult, 0)
+	partial := false
+
+	if explicitServiceSelection {
+		for _, serviceName := range services {
+			serviceRows, servicePartial, err := s.fetchCompleteSourceRange(ctx, datasource, snapshot, tagDefinitions, serviceName, start, end)
+			if err != nil {
+				return nil, model.QuerySourceStatus{}, false, true, err
+			}
+			rows = append(rows, serviceRows...)
+			partial = partial || servicePartial
+		}
+	} else {
+		allRows, sourcePartial, err := s.fetchCompleteSourceRange(ctx, datasource, snapshot, tagDefinitions, "", start, end)
+		if err != nil {
+			return nil, model.QuerySourceStatus{}, false, true, err
+		}
+		rows = allRows
+		partial = sourcePartial
+	}
+
+	rows = applySearchFilters(rows, req)
+	sortSearchResults(rows)
+	rows = limitResultsPerService(rows, pageSize)
+
+	return rows, model.QuerySourceStatus{
+		Datasource: datasource.Name,
+		Status:     statusLabelForRows(partial, len(rows) == 0),
+		Hits:       len(rows),
+	}, false, partial, nil
 }
 
 func (s *Service) searchServiceWindow(
@@ -1989,25 +2035,44 @@ func (s *Service) rowsBeforePartialLimit() int {
 	return 8000
 }
 
-func (s *Service) partitionRowLimit() int {
-	if s.cfg.MaxPartitionRows > 0 {
-		return s.cfg.MaxPartitionRows
+func (s *Service) queryResultRowLimit() int {
+	if s.cfg.MaxQueryWindow > 0 {
+		return s.cfg.MaxQueryWindow
 	}
-	return 10000
+	return 100000
+}
+
+func (s *Service) partitionRowLimit() int {
+	limit := 10000
+	if s.cfg.MaxPartitionRows > 0 {
+		limit = s.cfg.MaxPartitionRows
+	}
+	if !s.cfg.BackgroundSyncEnabled {
+		limit = maxSearchInt(limit, s.queryResultRowLimit())
+	}
+	return limit
 }
 
 func (s *Service) maxDedupeRowsLimit() int {
+	limit := maxSearchInt(12000, s.partitionRowLimit())
 	if s.cfg.MaxDedupeRows > 0 {
-		return s.cfg.MaxDedupeRows
+		limit = s.cfg.MaxDedupeRows
 	}
-	return maxSearchInt(12000, s.partitionRowLimit())
+	if !s.cfg.BackgroundSyncEnabled {
+		limit = maxSearchInt(limit, s.queryResultRowLimit())
+	}
+	return limit
 }
 
 func (s *Service) maxSortRowsLimit() int {
+	limit := maxSearchInt(12000, s.rowsBeforePartialLimit())
 	if s.cfg.MaxSortRows > 0 {
-		return s.cfg.MaxSortRows
+		limit = s.cfg.MaxSortRows
 	}
-	return maxSearchInt(12000, s.rowsBeforePartialLimit())
+	if !s.cfg.BackgroundSyncEnabled {
+		limit = maxSearchInt(limit, s.queryResultRowLimit())
+	}
+	return limit
 }
 
 func dedupeRows(rows []model.SearchResult) []model.SearchResult {
@@ -2108,9 +2173,18 @@ func applySearchFilters(rows []model.SearchResult, req model.SearchRequest) []mo
 }
 
 func splitKeywords(raw string) []string {
-	return uniqueStrings(strings.FieldsFunc(raw, func(r rune) bool {
+	tokens := uniqueStrings(strings.FieldsFunc(raw, func(r rune) bool {
 		return r == '\n' || r == '\r' || r == ',' || r == ';'
 	}))
+	filtered := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		trimmed := strings.TrimSpace(token)
+		if trimmed == "" || trimmed == "*" {
+			continue
+		}
+		filtered = append(filtered, trimmed)
+	}
+	return filtered
 }
 
 func hasPrimarySearchFilters(req model.SearchRequest) bool {

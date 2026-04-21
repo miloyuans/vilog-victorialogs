@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,8 @@ const (
 	KindTagValues   = "tag_values"
 
 	maxMongoQueryCacheBytes = 8 << 20
+	maxMemoryQueryCacheBytes = 256 << 20
+	maxMemoryQueryCacheEntries = 32
 )
 
 type Service struct {
@@ -33,22 +36,28 @@ type Service struct {
 	cleanupMu          sync.Mutex
 	lastLocalCleanup   time.Time
 	lastLogDirCleanup  time.Time
+	memoryQueryMu      sync.Mutex
+	memoryQueryBytes   int
+	memoryQueries      map[string]memoryQueryEnvelope
+}
+
+type memoryQueryEnvelope struct {
+	ExpireAt time.Time
+	StoredAt time.Time
+	Payload  []byte
 }
 
 func New(store *mongostore.Store, cfg config.CacheConfig, logger *zap.Logger) *Service {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
+	cfg.LocalQueryDir = ensureWritableCacheDir(cfg.LocalQueryDir, "query", logger)
+	cfg.LocalLogDir = ensureWritableCacheDir(cfg.LocalLogDir, "log", logger)
 	service := &Service{
 		store: store,
 		cfg:   cfg,
 		logger: logger,
-	}
-	if strings.TrimSpace(cfg.LocalQueryDir) != "" {
-		_ = os.MkdirAll(cfg.LocalQueryDir, 0o755)
-	}
-	if strings.TrimSpace(cfg.LocalLogDir) != "" {
-		_ = os.MkdirAll(cfg.LocalLogDir, 0o755)
+		memoryQueries: make(map[string]memoryQueryEnvelope),
 	}
 	logger.Info("local cache directories ready",
 		zap.String("query_dir", strings.TrimSpace(cfg.LocalQueryDir)),
@@ -57,8 +66,38 @@ func New(store *mongostore.Store, cfg config.CacheConfig, logger *zap.Logger) *S
 	return service
 }
 
+func ensureWritableCacheDir(dir string, kind string, logger *zap.Logger) string {
+	cleaned := strings.TrimSpace(dir)
+	if cleaned == "" {
+		return ""
+	}
+	if err := os.MkdirAll(cleaned, 0o755); err != nil {
+		logger.Warn("local cache directory is unavailable; disabling filesystem cache for this kind",
+			zap.String("kind", kind),
+			zap.String("dir", cleaned),
+			zap.Error(err),
+		)
+		return ""
+	}
+	probePath := filepath.Join(cleaned, ".vilog-write-probe")
+	if err := os.WriteFile(probePath, []byte("ok"), 0o644); err != nil {
+		logger.Warn("local cache directory is not writable; disabling filesystem cache for this kind",
+			zap.String("kind", kind),
+			zap.String("dir", cleaned),
+			zap.Error(err),
+		)
+		return ""
+	}
+	_ = os.Remove(probePath)
+	return cleaned
+}
+
 func (s *Service) Get(ctx context.Context, kind, key string, out any) (bool, error) {
 	if kind == KindQuery {
+		memoryHit, err := s.getMemoryQuery(key, out)
+		if err == nil && memoryHit {
+			return true, nil
+		}
 		localHit, err := s.getLocalQuery(ctx, key, out)
 		if err == nil && localHit {
 			return true, nil
@@ -70,6 +109,7 @@ func (s *Service) Get(ctx context.Context, kind, key string, out any) (bool, err
 			return false, err
 		}
 		if kind == KindQuery {
+			s.setMemoryQuery(key, entry.Payload, s.localQueryTTL(s.cfg.QueryTTL))
 			_ = s.setLocalQuery(key, entry.Payload, s.localQueryTTL(s.cfg.QueryTTL))
 		}
 		return true, nil
@@ -87,12 +127,18 @@ func (s *Service) Set(ctx context.Context, kind, key string, payload any, ttl ti
 	}
 	localQueryStored := false
 	if kind == KindQuery {
+		s.setMemoryQuery(key, raw, s.localQueryTTL(ttl))
 		if err := s.setLocalQuery(key, raw, s.localQueryTTL(ttl)); err != nil {
-			return err
+			s.logger.Warn("store query cache in local filesystem failed",
+				zap.Error(err),
+				zap.String("key", key),
+				zap.String("query_dir", strings.TrimSpace(s.cfg.LocalQueryDir)),
+			)
+		} else {
+			localQueryStored = true
 		}
-		localQueryStored = true
 		if len(raw) > maxMongoQueryCacheBytes {
-			s.logger.Debug("stored large query cache in local filesystem only",
+			s.logger.Debug("stored large query cache in memory/local cache only",
 				zap.String("key", key),
 				zap.Int("payload_bytes", len(raw)),
 				zap.String("query_dir", strings.TrimSpace(s.cfg.LocalQueryDir)),
@@ -137,6 +183,100 @@ func (s *Service) TagValuesTTL() time.Duration {
 type localQueryEnvelope struct {
 	ExpireAt time.Time       `json:"expire_at"`
 	Payload  json.RawMessage `json:"payload"`
+}
+
+func (s *Service) getMemoryQuery(key string, out any) (bool, error) {
+	if strings.TrimSpace(key) == "" {
+		return false, nil
+	}
+
+	s.memoryQueryMu.Lock()
+	s.cleanupMemoryQueriesLocked(time.Now().UTC())
+	entry, ok := s.memoryQueries[key]
+	if !ok || (!entry.ExpireAt.IsZero() && time.Now().UTC().After(entry.ExpireAt)) {
+		s.deleteMemoryQueryLocked(key)
+		s.memoryQueryMu.Unlock()
+		return false, nil
+	}
+	payload := append([]byte(nil), entry.Payload...)
+	s.memoryQueryMu.Unlock()
+
+	if err := json.Unmarshal(payload, out); err != nil {
+		s.memoryQueryMu.Lock()
+		s.deleteMemoryQueryLocked(key)
+		s.memoryQueryMu.Unlock()
+		return false, nil
+	}
+	return true, nil
+}
+
+func (s *Service) setMemoryQuery(key string, payload []byte, ttl time.Duration) {
+	if strings.TrimSpace(key) == "" || len(payload) == 0 {
+		return
+	}
+	if ttl <= 0 {
+		ttl = s.QueryTTL()
+	}
+	now := time.Now().UTC()
+	entry := memoryQueryEnvelope{
+		ExpireAt: now.Add(ttl),
+		StoredAt: now,
+		Payload:  append([]byte(nil), payload...),
+	}
+
+	s.memoryQueryMu.Lock()
+	if existing, ok := s.memoryQueries[key]; ok {
+		s.memoryQueryBytes -= len(existing.Payload)
+		if s.memoryQueryBytes < 0 {
+			s.memoryQueryBytes = 0
+		}
+	}
+	s.memoryQueries[key] = entry
+	s.memoryQueryBytes += len(entry.Payload)
+	s.cleanupMemoryQueriesLocked(now)
+	s.evictMemoryQueriesLocked()
+	s.memoryQueryMu.Unlock()
+}
+
+func (s *Service) deleteMemoryQueryLocked(key string) {
+	entry, ok := s.memoryQueries[key]
+	if !ok {
+		return
+	}
+	delete(s.memoryQueries, key)
+	s.memoryQueryBytes -= len(entry.Payload)
+	if s.memoryQueryBytes < 0 {
+		s.memoryQueryBytes = 0
+	}
+}
+
+func (s *Service) cleanupMemoryQueriesLocked(now time.Time) {
+	for key, entry := range s.memoryQueries {
+		if !entry.ExpireAt.IsZero() && now.After(entry.ExpireAt) {
+			s.deleteMemoryQueryLocked(key)
+		}
+	}
+}
+
+func (s *Service) evictMemoryQueriesLocked() {
+	if len(s.memoryQueries) <= maxMemoryQueryCacheEntries && s.memoryQueryBytes <= maxMemoryQueryCacheBytes {
+		return
+	}
+	keys := make([]string, 0, len(s.memoryQueries))
+	for key := range s.memoryQueries {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		left := s.memoryQueries[keys[i]]
+		right := s.memoryQueries[keys[j]]
+		return left.StoredAt.Before(right.StoredAt)
+	})
+	for _, key := range keys {
+		if len(s.memoryQueries) <= maxMemoryQueryCacheEntries && s.memoryQueryBytes <= maxMemoryQueryCacheBytes {
+			break
+		}
+		s.deleteMemoryQueryLocked(key)
+	}
 }
 
 func (s *Service) localQueryTTL(fallback time.Duration) time.Duration {

@@ -514,3 +514,25 @@ mark.highlight-tone-purple{background:rgba(176,132,245,.28);color:#e7d3ff}
     max-width:min(320px,calc(100vw - 24px));
   }
 }
+
+.query-layer-stack{
+  align-items:start;
+}
+
+.query-layer-card-primary{
+  opacity:.94;
+}
+
+.query-layer-card-primary .query-layer-input{
+  min-height:42px;
+}
+
+.query-layer-card-recursive{
+  border-color:rgba(87,148,242,.34)!important;
+  background:rgba(87,148,242,.08)!important;
+  box-shadow:0 0 0 1px rgba(87,148,242,.14);
+}
+
+.query-layer-card-recursive .query-layer-input{
+  min-height:88px;
+}
