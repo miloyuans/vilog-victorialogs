@@ -2,7 +2,6 @@ package query
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -1022,7 +1021,7 @@ func (s *Service) fetchFilteredDatasourcePreviewWindow(
 	rows = applySearchFilters(rows, req)
 	sortSearchResults(rows)
 	rows = limitResultsPerService(rows, perServiceLimit)
-	maxVisible := responseVisibleLimit(perServiceLimit, rows)
+	maxVisible := responseVisibleLimit(perServiceLimit, nil, rows)
 	if len(rows) > maxVisible {
 		rows = rows[:maxVisible]
 		truncated = true
@@ -1110,7 +1109,7 @@ func (s *Service) fetchAllServicePreviewWindow(
 	}
 	sortSearchResults(merged)
 	merged = limitResultsPerService(merged, perServiceLimit)
-	maxVisible := responseVisibleLimit(perServiceLimit, merged)
+	maxVisible := responseVisibleLimit(perServiceLimit, nil, merged)
 	if len(merged) > maxVisible {
 		merged = merged[:maxVisible]
 		partial = true
@@ -2213,6 +2212,16 @@ func searchableRowText(row model.SearchResult) string {
 }
 
 func buildSearchCacheKey(req model.SearchRequest) (string, error) {
+	datasourceIDs := append([]string(nil), uniqueStrings(req.DatasourceIDs)...)
+	serviceNames := append([]string(nil), uniqueStrings(req.ServiceNames)...)
+	sort.Strings(datasourceIDs)
+	sort.Strings(serviceNames)
+	tags := make(map[string][]string, len(req.Tags))
+	for key, values := range req.Tags {
+		copied := append([]string(nil), uniqueStrings(values)...)
+		sort.Strings(copied)
+		tags[key] = copied
+	}
 	payload := struct {
 		Version       string              `json:"version"`
 		Keyword       string              `json:"keyword"`
@@ -2229,9 +2238,9 @@ func buildSearchCacheKey(req model.SearchRequest) (string, error) {
 		KeywordMode:   req.KeywordMode,
 		Start:         req.Start,
 		End:           req.End,
-		DatasourceIDs: uniqueStrings(req.DatasourceIDs),
-		ServiceNames:  uniqueStrings(req.ServiceNames),
-		Tags:          req.Tags,
+		DatasourceIDs: datasourceIDs,
+		ServiceNames:  serviceNames,
+		Tags:          tags,
 		PageSize:      req.PageSize,
 	}
 	return util.HashJSON(payload)

@@ -1467,6 +1467,8 @@ highlight = function (text) {
   let activeSearchRequest = null;
   let activeSearchRequestKey = "";
   let activeSearchAbortController = null;
+  let activeSearchDrainRun = 0;
+  let searchDrainInProgress = false;
 
   function normalizeAutoRefreshInterval(value) {
     const candidate = String(value || "").trim().toLowerCase();
@@ -1710,7 +1712,7 @@ highlight = function (text) {
 
   async function requestSearchWindow(page, pageSize) {
     normalizeFrontendCollections();
-    const requestedPage = 1;
+    const requestedPage = Math.max(1, Number(page || state.search.page || 1) || 1);
     const requestedSize = getResolvedSearchPageSize(pageSize || state.search.pageSize || 500);
     const payload = buildCurrentSearchPayload(requestedPage, requestedSize);
     const requestKey = JSON.stringify(payload);
@@ -1737,8 +1739,10 @@ highlight = function (text) {
         end: payload.end || "",
         results: safeArray(response.results),
         total: Math.max(Number(response.total || 0), safeArray(response.results).length),
-        page: requestedPage,
-        page_size: requestedSize,
+        page: Math.max(1, Number(response.page || requestedPage) || requestedPage),
+        page_size: Math.max(1, Number(response.page_size || requestedSize) || requestedSize),
+        has_more: !!response.has_more,
+        next_page: Math.max(0, Number(response.next_page || 0) || 0),
         partial: !!response.partial,
         cache_hit: !!response.cache_hit,
         took_ms: Number(response.took_ms || 0),
@@ -2946,6 +2950,10 @@ highlight = function (text) {
         syncSearchAutoRefresh();
         return;
       }
+      if (searchDrainInProgress) {
+        syncSearchAutoRefresh();
+        return;
+      }
       if (document.hidden) {
         syncSearchAutoRefresh();
         return;
@@ -2992,10 +3000,98 @@ highlight = function (text) {
     } else {
       state.search.selectedResultKey = results[0] ? String(results[0]._index) : "";
     }
-    state.ui.detailOpen = false;
+    if (!(options && options.preserveDetail)) {
+      state.ui.detailOpen = false;
+    }
     renderSearchControls();
     renderSearchResults();
     return { response, results };
+  }
+
+  function searchResultIdentity(item) {
+    const row = safeObject(item);
+    return [
+      row.timestamp || "",
+      row.datasource || "",
+      row.service || "",
+      row.pod || "",
+      row.message || "",
+    ].join("\u0000");
+  }
+
+  function mergeSearchResultPages(current, incoming) {
+    const merged = [];
+    const seen = new Set();
+    safeArray(current).concat(safeArray(incoming)).forEach((item) => {
+      const key = searchResultIdentity(item);
+      if (seen.has(key)) return;
+      seen.add(key);
+      merged.push(item);
+    });
+    return merged;
+  }
+
+  function mergePagedSearchResponse(rawResponse, previousSelectedKey) {
+    const current = safeObject(state.search.response);
+    const incoming = safeObject(rawResponse);
+    incoming.results = mergeSearchResultPages(current.results, incoming.results);
+    incoming.sources = safeArray(incoming.sources).length ? safeArray(incoming.sources) : safeArray(current.sources);
+    incoming.total = Math.max(Number(incoming.total || 0), incoming.results.length, Number(current.total || 0));
+    incoming.page = Math.max(1, Number(incoming.page || current.page || 1) || 1);
+    incoming.page_size = Math.max(1, Number(incoming.page_size || current.page_size || state.search.pageSize || 500) || (state.search.pageSize || 500));
+    incoming.has_more = !!incoming.has_more;
+    incoming.next_page = Math.max(0, Number(incoming.next_page || 0) || 0);
+    incoming.partial = !!incoming.partial;
+    incoming.cache_hit = !!incoming.cache_hit;
+    return commitSearchResponse(incoming, {
+      preserveSelection: true,
+      preserveDetail: true,
+      silentSuccess: true,
+    }, previousSelectedKey);
+  }
+
+  function searchProgressMessage(loaded, total) {
+    return s(
+      "\u5df2\u52a0\u8f7d " + loaded + " / " + total + " \u6761\uff0c\u5269\u4f59\u7ed3\u679c\u6b63\u5728\u9759\u9ed8\u8865\u9f50\u3002",
+      "Loaded " + loaded + " / " + total + " rows. Remaining results are loading silently.",
+    );
+  }
+
+  async function drainSearchPages(runID, pageSize, previousSelectedKey) {
+    searchDrainInProgress = true;
+    activeSearchDrainRun = runID;
+    try {
+      let nextPage = Math.max(0, Number(state.search.response && state.search.response.next_page || 0) || 0);
+      while (activeSearchDrainRun === runID && nextPage > 0) {
+        const nextResponse = await requestSearchWindow(nextPage, pageSize);
+        if (activeSearchDrainRun !== runID) {
+          return false;
+        }
+        const mergedState = mergePagedSearchResponse(nextResponse, previousSelectedKey);
+        const loaded = safeArray(mergedState.response.results).length;
+        const total = Math.max(Number(mergedState.response.total || 0), loaded);
+        if (nextResponse.has_more) {
+          setSearchRuntimeStatus("partial", searchProgressMessage(loaded, total));
+        } else if (nextResponse.partial) {
+          setSearchRuntimeStatus("partial", s("\u5df2\u5b8c\u6210\u5168\u90e8\u5206\u9875\u88c5\u8f7d\uff0c\u4f46\u7ed3\u679c\u4ecd\u662f\u90e8\u5206\u547d\u4e2d\u3002", "All pages were loaded, but the result set is still partial."));
+        } else {
+          setSearchRuntimeStatus("ok", s("\u5168\u90e8\u7ed3\u679c\u5df2\u9759\u9ed8\u8865\u9f50\u3002", "All results were loaded silently."));
+        }
+        nextPage = Math.max(0, Number(nextResponse.next_page || 0) || 0);
+      }
+      return true;
+    } catch (error) {
+      if (error && (error.name === "AbortError" || String(error.message || "").indexOf("aborted") >= 0)) {
+        return false;
+      }
+      setSearchRuntimeStatus("error", normalizeSearchRequestErrorMessage(error));
+      return false;
+    } finally {
+      if (activeSearchDrainRun === runID) {
+        searchDrainInProgress = false;
+      }
+      syncSearchAutoRefresh();
+    }
   }
 
   async function runSearchWindow(pageOverride, options) {
@@ -3064,7 +3160,7 @@ highlight = function (text) {
           : results.length
             ? s("\u7ed3\u679c\u5df2\u66f4\u65b0\uff0c\u53ef\u7ee7\u7eed\u6d4f\u89c8\u5f53\u524d\u5217\u8868\u3002", "Results were updated. You can keep browsing the current list.")
             : s("\u6ca1\u6709\u5339\u914d\u5f53\u524d\u8fc7\u6ee4\u6761\u4ef6\u7684\u65e5\u5fd7\u3002", "No logs matched the current filters.");
-      setSearchRuntimeStatus(response.partial ? "partial" : "ok", successMessage);
+      setSearchRuntimeStatus((response.partial || response.has_more) ? "partial" : "ok", successMessage);
       if (!(options && options.silentSuccess) && !results.length) {
         toast(successMessage, "info");
       }
@@ -3440,12 +3536,23 @@ highlight = function (text) {
     if (current.length && current.length >= responseTotal) {
       return applyClientSideResultFilters(current);
     }
-    const payload = buildCurrentSearchPayload(1, MAX_UI_PAGE_SIZE);
-    const response = await request("/api/query/search", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-    return applyClientSideResultFilters(safeArray(response && response.results));
+    const exportPageSize = Math.min(MAX_UI_PAGE_SIZE, Math.max(200, Number(state.search.pageSize || 500)));
+    let page = 1;
+    let merged = [];
+    while (page <= 200) {
+      const payload = buildCurrentSearchPayload(page, exportPageSize);
+      const response = safeObject(await request("/api/query/search", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }));
+      merged = mergeSearchResultPages(merged, safeArray(response.results));
+      const total = Math.max(Number(response.total || 0), merged.length);
+      if (!response.has_more || merged.length >= total || merged.length >= SEARCH_EXPORT_LIMIT) {
+        break;
+      }
+      page = Math.max(page + 1, Number(response.next_page || 0) || (page + 1));
+    }
+    return applyClientSideResultFilters(merged.slice(0, SEARCH_EXPORT_LIMIT));
   };
 
   downloadDecoratedResults = async function (format, results, allResults) {
@@ -3491,33 +3598,40 @@ highlight = function (text) {
     state.search.pageSizeError = false;
     state.search.useCache = true;
     const previousSelectedKey = state.search.selectedResultKey;
+    activeSearchDrainRun += 1;
+    searchDrainInProgress = false;
+    if (activeSearchAbortController) {
+      try {
+        activeSearchAbortController.abort();
+      } catch (_error) {
+      }
+    }
     activeSearchAbortController = null;
     activeSearchRequest = null;
     activeSearchRequestKey = "";
+    const runID = activeSearchDrainRun;
     setSearchRuntimeStatus("loading", s("\u67e5\u8be2\u8fdb\u884c\u4e2d\uff0c\u8bf7\u7a0d\u5019\u3002", "Query in progress. Please wait."));
     if (!(options && options.background)) {
       setSearchLoading(true);
     }
     try {
-      const payload = buildCurrentSearchPayload(1, pageInfo.value);
-      const finalState = commitSearchResponse(
-        await request("/api/query/search", {
-          method: "POST",
-          body: JSON.stringify(payload),
-        }),
-        options,
-        previousSelectedKey,
-      );
+      const finalState = commitSearchResponse(await requestSearchWindow(1, pageInfo.value), options, previousSelectedKey);
       const response = finalState.response;
       const results = finalState.results;
-      const successMessage = response.partial
-        ? (results.length
-          ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\uff0c\u5f53\u524d\u8fd4\u56de\u7684\u662f\u90e8\u5206\u7ed3\u679c\u3002", "Query completed with partial results.")
-          : s("\u5f53\u524d\u6761\u4ef6\u6682\u65e0\u7ed3\u679c\uff0c\u8bf7\u7f29\u5c0f\u8303\u56f4\u6216\u653e\u5bbd\u8fc7\u6ee4\u3002", "No rows matched yet. Narrow the scope or relax the filters."))
-        : (results.length
-          ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\u3002", "Query completed.")
-          : s("\u6ca1\u6709\u5339\u914d\u5f53\u524d\u8fc7\u6ee4\u6761\u4ef6\u7684\u65e5\u5fd7\u3002", "No logs matched the current filters."));
-      setSearchRuntimeStatus(response.partial ? "partial" : "ok", successMessage);
+      const total = Math.max(Number(response.total || 0), results.length);
+      const successMessage = response.has_more
+        ? searchProgressMessage(results.length, total)
+        : response.partial
+          ? (results.length
+            ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\uff0c\u5f53\u524d\u8fd4\u56de\u7684\u662f\u90e8\u5206\u7ed3\u679c\u3002", "Query completed with partial results.")
+            : s("\u5f53\u524d\u6761\u4ef6\u6682\u65e0\u7ed3\u679c\uff0c\u8bf7\u7f29\u5c0f\u8303\u56f4\u6216\u653e\u5bbd\u8fc7\u6ee4\u3002", "No rows matched yet. Narrow the scope or relax the filters."))
+          : (results.length
+            ? s("\u67e5\u8be2\u5df2\u5b8c\u6210\u3002", "Query completed.")
+            : s("\u6ca1\u6709\u5339\u914d\u5f53\u524d\u8fc7\u6ee4\u6761\u4ef6\u7684\u65e5\u5fd7\u3002", "No logs matched the current filters."));
+      setSearchRuntimeStatus((response.partial || response.has_more) ? "partial" : "ok", successMessage);
+      if (response.has_more) {
+        void drainSearchPages(runID, pageInfo.value, state.search.selectedResultKey || previousSelectedKey);
+      }
       if (!(options && options.silentSuccess) && !results.length && !(options && options.background)) {
         toast(successMessage, "info");
       }
