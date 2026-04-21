@@ -20,6 +20,7 @@ type Config struct {
 	Mongo        MongoConfig        `yaml:"mongo"`
 	Logging      LoggingConfig      `yaml:"logging"`
 	Cache        CacheConfig        `yaml:"cache"`
+	QueryJobs    QueryJobsConfig    `yaml:"query_jobs"`
 	Datasources  []ConfiguredDatasource `yaml:"datasources"`
 	VictoriaLogs VictoriaLogsConfig `yaml:"victorialogs"`
 	Security     SecurityConfig     `yaml:"security"`
@@ -80,6 +81,18 @@ type CacheConfig struct {
 	MaxSortRows             int           `yaml:"max_sort_rows"`
 	MaxPendingPartitionSyncs int          `yaml:"max_pending_partition_syncs"`
 	MaxQueryWindow          int           `yaml:"max_query_window"`
+}
+
+type QueryJobsConfig struct {
+	Enabled                    bool          `yaml:"enabled"`
+	BaseDir                    string        `yaml:"base_dir"`
+	TTLHours                   int           `yaml:"ttl_hours"`
+	SegmentMaxRows             int           `yaml:"segment_max_rows"`
+	SegmentMaxBytes            int           `yaml:"segment_max_bytes"`
+	MaxConcurrentJobs          int           `yaml:"max_concurrent_jobs"`
+	MaxConcurrentSourcesPerJob int           `yaml:"max_concurrent_sources_per_job"`
+	SSEHeartbeatSeconds        int           `yaml:"sse_heartbeat_seconds"`
+	ChunkWindow                time.Duration `yaml:"chunk_window"`
 }
 
 type ConfiguredDatasource struct {
@@ -180,6 +193,17 @@ func Default() Config {
 			MaxPendingPartitionSyncs: 256,
 			MaxQueryWindow:          100000,
 		},
+		QueryJobs: QueryJobsConfig{
+			Enabled:                    true,
+			BaseDir:                    "./data/query-cache/jobs",
+			TTLHours:                   24,
+			SegmentMaxRows:             2000,
+			SegmentMaxBytes:            4 << 20,
+			MaxConcurrentJobs:          4,
+			MaxConcurrentSourcesPerJob: 4,
+			SSEHeartbeatSeconds:        10,
+			ChunkWindow:                15 * time.Minute,
+		},
 		VictoriaLogs: VictoriaLogsConfig{
 			RequestRetries: 1,
 			DiscoveryLimit: 200,
@@ -248,6 +272,13 @@ func resolveLocalPaths(cfg *Config, configPath string) error {
 	}
 	if strings.TrimSpace(cfg.Cache.LocalLogDir) != "" && !filepath.IsAbs(cfg.Cache.LocalLogDir) {
 		cfg.Cache.LocalLogDir = filepath.Clean(filepath.Join(baseDir, cfg.Cache.LocalLogDir))
+	}
+	if strings.TrimSpace(cfg.QueryJobs.BaseDir) == "" {
+		if strings.TrimSpace(cfg.Cache.LocalQueryDir) != "" {
+			cfg.QueryJobs.BaseDir = filepath.Clean(filepath.Join(cfg.Cache.LocalQueryDir, "jobs"))
+		}
+	} else if !filepath.IsAbs(cfg.QueryJobs.BaseDir) {
+		cfg.QueryJobs.BaseDir = filepath.Clean(filepath.Join(baseDir, cfg.QueryJobs.BaseDir))
 	}
 	return nil
 }
@@ -364,6 +395,34 @@ func (c *Config) Validate() error {
 	}
 	if c.Cache.MaxSortRows < c.Cache.MaxRowsBeforePartial {
 		c.Cache.MaxSortRows = c.Cache.MaxRowsBeforePartial
+	}
+	if strings.TrimSpace(c.QueryJobs.BaseDir) == "" {
+		if strings.TrimSpace(c.Cache.LocalQueryDir) != "" {
+			c.QueryJobs.BaseDir = filepath.Clean(filepath.Join(c.Cache.LocalQueryDir, "jobs"))
+		} else {
+			c.QueryJobs.BaseDir = "./data/query-cache/jobs"
+		}
+	}
+	if c.QueryJobs.TTLHours <= 0 {
+		c.QueryJobs.TTLHours = 24
+	}
+	if c.QueryJobs.SegmentMaxRows <= 0 {
+		c.QueryJobs.SegmentMaxRows = 2000
+	}
+	if c.QueryJobs.SegmentMaxBytes <= 0 {
+		c.QueryJobs.SegmentMaxBytes = 4 << 20
+	}
+	if c.QueryJobs.MaxConcurrentJobs <= 0 {
+		c.QueryJobs.MaxConcurrentJobs = 4
+	}
+	if c.QueryJobs.MaxConcurrentSourcesPerJob <= 0 {
+		c.QueryJobs.MaxConcurrentSourcesPerJob = 4
+	}
+	if c.QueryJobs.SSEHeartbeatSeconds <= 0 {
+		c.QueryJobs.SSEHeartbeatSeconds = 10
+	}
+	if c.QueryJobs.ChunkWindow <= 0 {
+		c.QueryJobs.ChunkWindow = 15 * time.Minute
 	}
 	if c.VictoriaLogs.RequestRetries < 0 || c.VictoriaLogs.DiscoveryLimit <= 0 || c.VictoriaLogs.TagValueLimit <= 0 {
 		return fmt.Errorf("victorialogs settings must be positive")
@@ -500,6 +559,31 @@ func applyEnvOverrides(cfg *Config) error {
 		return err
 	}
 	if err := setInt("VILOG_CACHE_MAX_QUERY_WINDOW", &cfg.Cache.MaxQueryWindow); err != nil {
+		return err
+	}
+	if err := setBool("VILOG_QUERY_JOBS_ENABLED", &cfg.QueryJobs.Enabled); err != nil {
+		return err
+	}
+	setString("VILOG_QUERY_JOBS_BASE_DIR", &cfg.QueryJobs.BaseDir)
+	if err := setInt("VILOG_QUERY_JOBS_TTL_HOURS", &cfg.QueryJobs.TTLHours); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_QUERY_JOBS_SEGMENT_MAX_ROWS", &cfg.QueryJobs.SegmentMaxRows); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_QUERY_JOBS_SEGMENT_MAX_BYTES", &cfg.QueryJobs.SegmentMaxBytes); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_QUERY_JOBS_MAX_CONCURRENT_JOBS", &cfg.QueryJobs.MaxConcurrentJobs); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_QUERY_JOBS_MAX_CONCURRENT_SOURCES_PER_JOB", &cfg.QueryJobs.MaxConcurrentSourcesPerJob); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_QUERY_JOBS_SSE_HEARTBEAT_SECONDS", &cfg.QueryJobs.SSEHeartbeatSeconds); err != nil {
+		return err
+	}
+	if err := setDuration("VILOG_QUERY_JOBS_CHUNK_WINDOW", &cfg.QueryJobs.ChunkWindow); err != nil {
 		return err
 	}
 

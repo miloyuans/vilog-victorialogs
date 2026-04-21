@@ -69,6 +69,17 @@ cache:
   max_pending_partition_syncs: 256
   max_query_window: 100000
 
+query_jobs:
+  enabled: true
+  base_dir: ./data/query-cache/jobs
+  ttl_hours: 24
+  segment_max_rows: 2000
+  segment_max_bytes: 4194304
+  max_concurrent_jobs: 4
+  max_concurrent_sources_per_job: 4
+  sse_heartbeat_seconds: 10
+  chunk_window: 15m
+
 datasources:
   - id: cfg_vilogs_us
     name: vilogs-us
