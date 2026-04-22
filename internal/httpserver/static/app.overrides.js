@@ -4019,7 +4019,7 @@ highlight = function (text) {
 bootstrap();
 
 (function () {
-  if (window.__vilogStreamingJobsPatched) return;
+  if (window.__vilogStreamingJobsPatched || window.__vilogExploreControllerOwnsSearch) return;
   window.__vilogStreamingJobsPatched = true;
 
   const JOB_RESULT_CHUNK_SIZE = 100;

@@ -352,19 +352,74 @@
     }));
   }
 
+  function isTerminalJobStatus(status) {
+    return TERMINAL_JOB_STATUSES.has(String(status || ""));
+  }
+
+  function previewHitsByDatasource(results) {
+    const counts = Object.create(null);
+    safeList(results).forEach((item) => {
+      const datasource = String(item && item.datasource || "-");
+      counts[datasource] = Number(counts[datasource] || 0) + 1;
+    });
+    return counts;
+  }
+
+  function mapVisibleSources(job, page, results) {
+    const base = mapSources(job, page);
+    const status = String((page && page.status) || (job && job.status) || "");
+    if (isTerminalJobStatus(status)) {
+      return base;
+    }
+
+    const previewHits = previewHitsByDatasource(results);
+    if (!Object.keys(previewHits).length) {
+      return base;
+    }
+
+    const seen = new Set();
+    const mapped = base.map((item) => {
+      const datasource = String(item && item.datasource || "-");
+      seen.add(datasource);
+      return {
+        datasource,
+        status: item.status || "pending",
+        hits: Number(previewHits[datasource] || 0),
+        error: item.error || "",
+      };
+    });
+
+    Object.keys(previewHits).forEach((datasource) => {
+      if (seen.has(datasource)) {
+        return;
+      }
+      mapped.push({
+        datasource,
+        status: "running",
+        hits: Number(previewHits[datasource] || 0),
+        error: "",
+      });
+    });
+
+    return mapped;
+  }
+
   function buildResponse(job, page, results) {
     const controller = ensureState();
     const payload = safeMap(controller.lastPayload);
+    const terminal = isTerminalJobStatus((page && page.status) || (job && job.status));
     return {
       keyword: payload.keyword || "",
       start: payload.start || "",
       end: payload.end || "",
       results: results,
-      total: Math.max(
-        Number(page && page.matched_total_so_far || 0),
-        Number(job && job.progress && job.progress.rows_matched || 0),
-        safeList(results).length
-      ),
+      total: terminal
+        ? Math.max(
+          Number(page && page.matched_total_so_far || 0),
+          Number(job && job.progress && job.progress.rows_matched || 0),
+          safeList(results).length
+        )
+        : safeList(results).length,
       page: 1,
       page_size: Number(payload.page_size || state.search.pageSize || 500),
       has_more: !!(page && page.has_more),
@@ -372,7 +427,7 @@
       partial: !!(page && page.partial) || !page.completed,
       cache_hit: false,
       took_ms: Number((state.search.response && state.search.response.took_ms) || 0),
-      sources: mapSources(job, page),
+      sources: mapVisibleSources(job, page, results),
     };
   }
 
@@ -398,11 +453,7 @@
       start: String(payload && payload.start || ""),
       end: String(payload && payload.end || ""),
       results: [],
-      total: Math.max(
-        Number(job && job.progress && job.progress.rows_matched || 0),
-        Number(job && job.totals && job.totals.rows_matched || 0),
-        0
-      ),
+      total: 0,
       page: 1,
       page_size: Number(payload && payload.page_size || state.search.pageSize || 500),
       has_more: false,
@@ -410,7 +461,12 @@
       partial: true,
       cache_hit: false,
       took_ms: 0,
-      sources: safeList(sources),
+      sources: safeList(sources).map((item) => ({
+        datasource: String(item && item.datasource || "-"),
+        status: String(item && item.status || "pending"),
+        hits: 0,
+        error: String(item && item.error || ""),
+      })),
     };
     if (isFn(window.commitSearchResponse)) {
       window.commitSearchResponse(response, {
@@ -503,6 +559,7 @@
     const preserveVisible = !!controller.keepVisibleUntilSettled;
     let cursor = reset ? "" : String(controller.stagedCursor || controller.cursor || "");
     let loaded = reset ? 0 : safeList(controller.stagedResults).length;
+    let finalPage = null;
 
     if (reset) {
       controller.stagedResults = [];
@@ -518,6 +575,7 @@
         }
         const route = fetchAll ? "results/all" : "results";
         const page = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(job.id)}/${route}?${params.toString()}`));
+        finalPage = page;
         const incoming = safeList(page.results);
         const staged = isFn(window.mergeSearchResultPages)
           ? window.mergeSearchResultPages(safeList(controller.stagedResults), incoming)
@@ -529,28 +587,24 @@
         controller.completed = !!page.completed;
         controller.partial = !!page.partial || String(job.status || "") === "partial" || String(job.status || "") === "failed";
 
-        // Keep the previous visible result set until the new run yields rows
-        // or conclusively finishes with an empty result.
-        const promoteEmptyTerminal = !!page.completed && String(job.status || "") === "completed";
-        const shouldPromote =
-          !fetchAll && (
-            loaded > 0
-          || promoteEmptyTerminal
-          || (!preserveVisible && !controller.hasPromotedResults)
-          );
-
-        if (shouldPromote) {
-          commitVisibleResponse(job, page, staged);
-          controller.keepVisibleUntilSettled = false;
-          controller.hasPromotedResults = loaded > 0 || promoteEmptyTerminal;
-        }
-
-        syncStatus(job, page, loaded);
-
         if (!(page.has_more && page.next_cursor)) {
           break;
         }
         cursor = String(page.next_cursor || "");
+      }
+
+      if (!fetchAll && finalPage) {
+        const promoteEmptyTerminal = !!finalPage.completed && String(job.status || "") === "completed";
+        const shouldPromote =
+          loaded > 0
+          || promoteEmptyTerminal
+          || (!preserveVisible && !controller.hasPromotedResults);
+        if (shouldPromote) {
+          commitVisibleResponse(job, finalPage, safeList(controller.stagedResults));
+          controller.keepVisibleUntilSettled = false;
+          controller.hasPromotedResults = loaded > 0 || promoteEmptyTerminal;
+        }
+        syncStatus(job, finalPage, loaded);
       }
       return true;
     } finally {
@@ -575,10 +629,21 @@
         commitPendingResponse(controller.lastPayload, mapSources(job, null), job);
       }
 
-      await drainResults(job, { reset: !!reset });
       controller.loading = !TERMINAL_JOB_STATUSES.has(String(job.status || ""));
       controller.completed = !controller.loading;
       controller.partial = String(job.status || "") === "partial" || String(job.status || "") === "failed";
+
+      const shouldRefreshPreview = !!reset || !controller.hasPromotedResults || controller.completed;
+      if (shouldRefreshPreview) {
+        await drainResults(job, { reset: !!reset || controller.completed });
+      } else {
+        syncStatus(job, {
+          status: job.status,
+          completed: false,
+          partial: controller.partial,
+          matched_total_so_far: Number(job && job.progress && job.progress.rows_matched || 0),
+        }, safeList(controller.stagedResults).length);
+      }
 
       if (controller.completed) {
         closeStream();
@@ -650,6 +715,61 @@
         setRuntime("partial", "查询连接正在重试，当前结果已保留。");
       }
     };
+  }
+
+  async function restoreActiveJob() {
+    const restoredJobID = String(readStorage(JOB_STORAGE_KEY) || "").trim();
+    if (!restoredJobID) {
+      return false;
+    }
+
+    const controller = ensureState();
+    const runID = ++runSequence;
+    controller.runID = runID;
+    controller.activeJobID = restoredJobID;
+    controller.requestKey = "";
+    controller.cursor = "";
+    controller.loading = true;
+    controller.fetching = false;
+    controller.refreshing = false;
+    controller.completed = false;
+    controller.partial = false;
+    controller.lastPayload = null;
+    controller.lastStartedAt = Date.now();
+    controller.stagedResults = [];
+    controller.stagedCursor = "";
+    controller.keepVisibleUntilSettled = false;
+    controller.hasPromotedResults = false;
+
+    if (state.search.job) {
+      state.search.job.id = restoredJobID;
+      state.search.job.requestKey = "";
+      state.search.job.cursor = "";
+      state.search.job.loading = true;
+      state.search.job.fetching = false;
+      state.search.job.completed = false;
+      state.search.job.partial = false;
+    }
+
+    try {
+      const job = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(restoredJobID)}`));
+      if (!job.id) {
+        throw new Error("active query job not found");
+      }
+      controller.lastPayload = safeMap(job.request);
+      commitPendingResponse(controller.lastPayload, mapSources(job, null), job);
+      openStream(restoredJobID, runID);
+      await refreshJob(true);
+      return true;
+    } catch (_error) {
+      closeStream();
+      writeStorage(JOB_STORAGE_KEY, "");
+      controller.activeJobID = "";
+      controller.loading = false;
+      controller.completed = true;
+      controller.partial = false;
+      return false;
+    }
   }
 
   async function startSearch(options) {
@@ -951,6 +1071,7 @@
   bindEvents();
   normalizeInitialPageSizeState();
   closeStream();
-  writeStorage(JOB_STORAGE_KEY, "");
-  restartAutoTimer();
+  void restoreActiveJob().finally(() => {
+    restartAutoTimer();
+  });
 })();
