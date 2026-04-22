@@ -3473,7 +3473,7 @@ highlight = function (text) {
     let content = "";
     if (!results.length) {
       content = empty((state.search.response && state.search.response.partial)
-        ? s("\u7cfb\u7edf\u6b63\u5728\u6269\u5927\u67e5\u8be2\u7a97\u53e3\u5e76\u7ee7\u7eed\u8fc7\u6ee4\uff0c\u6709\u65b0\u547d\u4e2d\u65f6\u4f1a\u9759\u9ed8\u5237\u65b0\u5230\u5f53\u524d\u7ed3\u679c\u7a97\u53e3\u3002", "The system is widening the search window and continuing to filter. New matches will refresh silently into the current result window.")
+        ? s("\u540e\u53f0\u4ecd\u5728\u6267\u884c\u67e5\u8be2\uff0c\u6b63\u5728\u7b49\u5f85\u9996\u6279\u547d\u4e2d\u6216\u6700\u7ec8\u7edf\u8ba1\u7ed3\u679c\u3002", "The query is still running in the background. Waiting for the first matching rows or the final counted result.")
         : s("\u5f53\u524d\u6761\u4ef6\u4e0b\u6ca1\u6709\u65e5\u5fd7\u7ed3\u679c\u3002", "No logs matched the current query."));
     } else if (state.search.view === "json") {
       content = `<div class="raw-view compact-raw-view"><pre>${esc(JSON.stringify(results.map(stripRuntimeFields), null, 2))}</pre></div>`;

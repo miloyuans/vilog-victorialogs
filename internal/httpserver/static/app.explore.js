@@ -410,6 +410,7 @@
       Number(job && job.progress && job.progress.rows_matched || 0),
       loaded
     );
+    const desiredVisible = Math.max(100, Number(state.search.pageSize || 500) || 500);
 
     if (status === "failed") {
       setRuntime("error", String(job.last_error || "查询任务失败，当前结果已保留。"));
@@ -418,7 +419,11 @@
 
     if (!page.completed) {
       if (loaded > 0) {
-        setRuntime("partial", progressMessage(loaded, Math.max(loaded, matched)));
+        if (loaded >= desiredVisible) {
+          setRuntime("partial", `Loaded preview ${desiredVisible}. Counting remaining matches in background.`);
+        } else {
+          setRuntime("partial", progressMessage(loaded, Math.max(loaded, matched)));
+        }
       } else {
         setRuntime("loading", "查询已开始，正在等待首批结果。");
       }
@@ -450,6 +455,7 @@
     }
     controller.fetching = true;
     const desiredVisible = Math.max(100, Number(state.search.pageSize || 500) || 500);
+    const fetchAll = !!(options && options.fetchAll);
     const reset = !!(options && options.reset);
     const preserveVisible = !!controller.keepVisibleUntilSettled;
     let cursor = reset ? "" : String(controller.stagedCursor || controller.cursor || "");
@@ -459,6 +465,10 @@
       controller.stagedResults = [];
       controller.stagedCursor = "";
       controller.hasPromotedResults = false;
+    }
+
+    if (!reset && !fetchAll && loaded >= desiredVisible) {
+      return false;
     }
 
     try {
@@ -483,9 +493,11 @@
         // or conclusively finishes with an empty result.
         const promoteEmptyTerminal = !!page.completed && String(job.status || "") === "completed";
         const shouldPromote =
-          loaded > 0
+          !fetchAll && (
+            loaded > 0
           || promoteEmptyTerminal
-          || (!preserveVisible && !controller.hasPromotedResults);
+          || (!preserveVisible && !controller.hasPromotedResults)
+          );
 
         if (shouldPromote) {
           commitVisibleResponse(job, page, staged);
@@ -498,7 +510,7 @@
         if (!(page.has_more && page.next_cursor)) {
           break;
         }
-        if (loaded >= desiredVisible) {
+        if (!fetchAll && loaded >= desiredVisible) {
           break;
         }
         cursor = String(page.next_cursor || "");
@@ -852,11 +864,20 @@
       if (!controller.activeJobID) {
         return legacyFetchAllResultsForExport();
       }
-      await refreshJob(false);
-      while (controller.activeJobID && !controller.completed && controller.cursor) {
-        await refreshJob(false);
+      let job = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(controller.activeJobID)}`));
+      if (!job.id) {
+        return safeList(controller.stagedResults);
       }
-      return safeList(state.search.response && state.search.response.results);
+      await drainResults(job, { reset: false, fetchAll: true });
+      while (controller.activeJobID && !TERMINAL_JOB_STATUSES.has(String(job.status || ""))) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        job = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(controller.activeJobID)}`));
+        if (!job.id) {
+          break;
+        }
+        await drainResults(job, { reset: false, fetchAll: true });
+      }
+      return safeList(controller.stagedResults);
     };
   }
 
