@@ -22,7 +22,7 @@ import (
 
 const (
 	defaultJobResultsPageSize = 100
-	maxJobResultsPageSize     = 200
+	maxJobResultsPageSize     = 100
 	defaultJobFlushRows       = 200
 )
 

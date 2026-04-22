@@ -389,10 +389,7 @@ func compactSearchResultsForResponse(items []model.SearchResult) []model.SearchR
 	compacted := make([]model.SearchResult, 0, len(items))
 	for _, item := range items {
 		clone := item
-		clone.SearchText = strings.TrimSpace(clone.SearchText)
-		if clone.SearchText == "" {
-			clone.SearchText = searchableRowText(item)
-		}
+		clone.SearchText = ""
 		clone.Raw = nil
 		compacted = append(compacted, clone)
 	}

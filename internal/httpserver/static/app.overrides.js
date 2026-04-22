@@ -3005,6 +3005,12 @@ highlight = function (text) {
 
   function syncSearchAutoRefresh() {
     clearSearchAutoRefresh();
+    if (window.__vilogExploreControllerOwnsSearch) {
+      if (window.syncSearchAutoRefresh && window.syncSearchAutoRefresh !== syncSearchAutoRefresh) {
+        window.syncSearchAutoRefresh();
+      }
+      return;
+    }
     normalizeFrontendCollections();
     if (state.activePanel !== "search") return;
     if (state.search.autoRefreshEnabled === false) return;

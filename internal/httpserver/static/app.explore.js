@@ -5,7 +5,7 @@
   window.__vilogExploreQueryControllerPatched = true;
 
   const JOB_STORAGE_KEY = "vilog.search.activeJobId";
-  const STREAM_PAGE_SIZE = 200;
+  const STREAM_PAGE_SIZE = 100;
   const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "partial", "cancelled"]);
   const DEFAULT_PAGE_SIZE = 500;
   const MIN_PAGE_SIZE = 50;
@@ -36,10 +36,12 @@
       cursor: "",
       loading: false,
       fetching: false,
+      refreshing: false,
       completed: false,
       partial: false,
       eventSource: null,
       lastPayload: null,
+      lastStartedAt: 0,
     };
     return state.search.exploreController;
   }
@@ -434,7 +436,7 @@
 
   function isJobActive() {
     const controller = ensureState();
-    return controller.loading || controller.fetching || (!!controller.activeJobID && !controller.completed);
+    return controller.loading || controller.fetching || controller.refreshing || (!!controller.activeJobID && !controller.completed);
   }
 
   async function drainResults(job, options) {
@@ -480,26 +482,31 @@
 
   async function refreshJob(reset) {
     const controller = ensureState();
-    if (!controller.activeJobID) {
+    if (!controller.activeJobID || controller.refreshing) {
       return false;
     }
-    const currentRun = controller.runID;
-    const job = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(controller.activeJobID)}`));
-    if (!job.id || controller.runID !== currentRun || controller.activeJobID !== job.id) {
-      return false;
-    }
+    controller.refreshing = true;
+    try {
+      const currentRun = controller.runID;
+      const job = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(controller.activeJobID)}`));
+      if (!job.id || controller.runID !== currentRun || controller.activeJobID !== job.id) {
+        return false;
+      }
 
-    await drainResults(job, { reset: !!reset });
-    controller.loading = !TERMINAL_JOB_STATUSES.has(String(job.status || ""));
-    controller.completed = !controller.loading;
-    controller.partial = String(job.status || "") === "partial" || String(job.status || "") === "failed";
+      await drainResults(job, { reset: !!reset });
+      controller.loading = !TERMINAL_JOB_STATUSES.has(String(job.status || ""));
+      controller.completed = !controller.loading;
+      controller.partial = String(job.status || "") === "partial" || String(job.status || "") === "failed";
 
-    if (controller.completed) {
-      closeStream();
-      writeStorage(JOB_STORAGE_KEY, "");
-      restartAutoTimer();
+      if (controller.completed) {
+        closeStream();
+        writeStorage(JOB_STORAGE_KEY, "");
+        restartAutoTimer();
+      }
+      return true;
+    } finally {
+      controller.refreshing = false;
     }
-    return true;
   }
 
   function scheduleRefresh(delayMs, reset) {
@@ -527,7 +534,7 @@
       if (ensureState().runID !== runID) {
         return;
       }
-      scheduleRefresh(80, false);
+      scheduleRefresh(350, false);
     };
     source.onmessage = onSignal;
     ["status", "progress", "segment_ready", "completed", "partial", "failed"].forEach((eventName) => {
@@ -546,17 +553,6 @@
     const background = !!(options && options.background);
 
     clearAutoTimer();
-    clearRefreshTimer();
-    closeStream();
-
-    if (state.search.job) {
-      state.search.job.id = "";
-      state.search.job.cursor = "";
-      state.search.job.loading = false;
-      state.search.job.fetching = false;
-      state.search.job.completed = true;
-      state.search.job.partial = false;
-    }
 
     let payloadInfo;
     try {
@@ -579,16 +575,47 @@
       return false;
     }
 
+    const nextRequestKey = JSON.stringify(payloadInfo.payload);
+    const activeSameRequest = controller.activeJobID
+      && !controller.completed
+      && controller.requestKey === nextRequestKey;
+    if (activeSameRequest) {
+      if (!background) {
+        setRuntime("loading", "当前查询仍在执行，继续等待结果补齐。");
+      }
+      scheduleRefresh(0, false);
+      return true;
+    }
+
+    const now = Date.now();
+    if (controller.loading && (now - Number(controller.lastStartedAt || 0)) < 800) {
+      return false;
+    }
+
+    clearRefreshTimer();
+    closeStream();
+
+    if (state.search.job) {
+      state.search.job.id = "";
+      state.search.job.cursor = "";
+      state.search.job.loading = false;
+      state.search.job.fetching = false;
+      state.search.job.completed = true;
+      state.search.job.partial = false;
+    }
+
     const runID = ++runSequence;
     controller.runID = runID;
     controller.activeJobID = "";
-    controller.requestKey = JSON.stringify(payloadInfo.payload);
+    controller.requestKey = nextRequestKey;
     controller.cursor = "";
     controller.loading = true;
     controller.fetching = false;
+    controller.refreshing = false;
     controller.completed = false;
     controller.partial = false;
     controller.lastPayload = payloadInfo.payload;
+    controller.lastStartedAt = now;
 
     state.search.page = 1;
     state.search.useCache = false;
@@ -650,7 +677,6 @@
 
   function restartAutoTimer() {
     clearAutoTimer();
-    clearRefreshTimer();
     call(window.normalizeFrontendCollections);
 
     if (state.activePanel !== "search") {
