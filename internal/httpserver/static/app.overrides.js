@@ -4310,6 +4310,28 @@ bootstrap();
     }
   }, true);
 
+  if (!window.__vilogSearchSubmitCaptureBound) {
+    document.addEventListener("click", function (event) {
+      const button = event.target && event.target.closest ? event.target.closest("button") : null;
+      if (!button || button.id !== "search-submit") return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void startStreamingSearch({});
+    }, true);
+
+    document.addEventListener("keydown", function (event) {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      if (!target.classList.contains("query-layer-input")) return;
+      if (event.key !== "Enter" || event.shiftKey) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void startStreamingSearch({});
+    }, true);
+
+    window.__vilogSearchSubmitCaptureBound = true;
+  }
+
   try {
     const restoredJobID = localStorage.getItem(JOB_STORAGE_KEY);
     if (restoredJobID) {
