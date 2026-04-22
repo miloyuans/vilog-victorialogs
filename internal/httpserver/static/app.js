@@ -377,7 +377,7 @@ function renderSearchMarkup() {
             <div class="form-actions">
               <button class="button button-ghost" type="button" id="search-refresh-catalogs">${esc(s("刷新目录", "Refresh Catalog"))}</button>
               <button class="button button-muted" type="button" id="search-clear-filters">${esc(s("清空筛选", "Clear Filters"))}</button>
-              <button class="button button-primary" type="submit" id="search-submit">${esc(s("执行查询", "Run Search"))}</button>
+              <button class="button button-primary" type="button" id="search-submit">${esc(s("执行查询", "Run Search"))}</button>
             </div>
           </form>
         </div>

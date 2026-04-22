@@ -310,7 +310,7 @@ function renderSearchToolbar() {
         </label>
         <button class="button button-small button-ghost" type="button" id="search-refresh-catalogs">${esc(s("刷新", "Refresh"))}</button>
         <button class="button button-small button-muted" type="button" id="search-clear-filters">${esc(s("清空", "Clear"))}</button>
-        <button class="button button-small button-primary" type="submit" id="search-submit">${esc(s("执行查询", "Run Query"))}</button>
+        <button class="button button-small button-primary" type="button" id="search-submit">${esc(s("执行查询", "Run Query"))}</button>
       </div>
     </div>
     <div class="search-toolbar-row search-toolbar-row-query">
@@ -605,8 +605,13 @@ handleGlobalKeydown = function (event) {
   if (!target.classList.contains("query-layer-input")) return;
   if (event.key !== "Enter" || event.shiftKey) return;
   event.preventDefault();
-  const form = byId("search-form");
-  if (form && typeof form.requestSubmit === "function") form.requestSubmit();
+  if (typeof runSearchWindow === "function") {
+    void runSearchWindow(1, {});
+    return;
+  }
+  if (typeof submitSearch === "function") {
+    void submitSearch();
+  }
 };
 
 handleClick = function (event) {
@@ -644,6 +649,17 @@ handleClick = function (event) {
 
   if (button.id === "search-refresh-catalogs") return refreshCatalogs();
   if (button.id === "search-clear-filters") return clearSearchFilters();
+  if (button.id === "search-submit") {
+    event.preventDefault();
+    if (typeof runSearchWindow === "function") {
+      void runSearchWindow(1, {});
+      return;
+    }
+    if (typeof submitSearch === "function") {
+      void submitSearch();
+      return;
+    }
+  }
 
   const menu = button.getAttribute("data-open-menu");
   if (menu) {
@@ -2094,7 +2110,7 @@ highlight = function (text) {
           </label>
           <button class="button button-small button-ghost" type="button" id="search-refresh-catalogs">${esc(s("刷新", "Refresh"))}</button>
           <button class="button button-small button-muted" type="button" id="search-clear-filters">${esc(s("清空", "Clear"))}</button>
-          <button class="button button-small button-primary" type="submit" id="search-submit">${esc(s("执行查询", "Run Query"))}</button>
+          <button class="button button-small button-primary" type="button" id="search-submit">${esc(s("执行查询", "Run Query"))}</button>
         </div>
       </div>
       <div class="search-toolbar-row search-toolbar-row-query">
@@ -2461,6 +2477,17 @@ highlight = function (text) {
 
     if (button.id === "search-refresh-catalogs") return refreshCatalogs();
     if (button.id === "search-clear-filters") return clearSearchFilters();
+    if (button.id === "search-submit") {
+      event.preventDefault();
+      if (typeof runSearchWindow === "function") {
+        void runSearchWindow(1, {});
+        return;
+      }
+      if (typeof submitSearch === "function") {
+        void submitSearch();
+        return;
+      }
+    }
 
     const menu = button.getAttribute("data-open-menu");
     if (menu) {
@@ -3311,7 +3338,7 @@ highlight = function (text) {
             <input id="search-page-size-custom" class="${pageInfo.mode === "custom" ? "" : "is-hidden"} ${!pageInfo.valid ? "field-error" : ""}" type="number" min="50" max="${MAX_UI_PAGE_SIZE}" step="50" value="${pageInfo.mode === "custom" ? esc(String(pageInfo.raw)) : ""}" placeholder="Custom" />
           </label>
           <button class="button button-small button-muted" type="button" id="search-clear-filters">${esc(s("\u6e05\u7a7a", "Clear"))}</button>
-          <button class="button button-small button-primary" type="submit" id="search-submit">${esc(s("\u6267\u884c\u67e5\u8be2", "Run Query"))}</button>
+          <button class="button button-small button-primary" type="button" id="search-submit">${esc(s("\u6267\u884c\u67e5\u8be2", "Run Query"))}</button>
           <button class="button button-small ${autoEnabled ? "button-primary" : "button-ghost"}" type="button" id="search-auto-toggle">${esc(s("auto查询", "Auto Query"))}</button>
           <label class="toolbar-inline-field toolbar-inline-field-auto">
             <span>${esc(s("\u5468\u671f", "Every"))}</span>
