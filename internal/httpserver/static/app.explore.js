@@ -376,6 +376,56 @@
     };
   }
 
+  function buildPendingSources(payload) {
+    const selected = safeList(payload && payload.datasource_ids);
+    const universe = selected.length
+      ? selected
+      : safeList(state.datasources).map((item) => item && item.id).filter(Boolean);
+    return universe.map((id) => {
+      const match = safeList(state.datasources).find((item) => item && item.id === id);
+      return {
+        datasource: (match && match.name) || id || "-",
+        status: "pending",
+        hits: 0,
+        error: "",
+      };
+    });
+  }
+
+  function commitPendingResponse(payload, sources, job) {
+    const response = {
+      keyword: String(payload && payload.keyword || ""),
+      start: String(payload && payload.start || ""),
+      end: String(payload && payload.end || ""),
+      results: [],
+      total: Math.max(
+        Number(job && job.progress && job.progress.rows_matched || 0),
+        Number(job && job.totals && job.totals.rows_matched || 0),
+        0
+      ),
+      page: 1,
+      page_size: Number(payload && payload.page_size || state.search.pageSize || 500),
+      has_more: false,
+      next_page: 0,
+      partial: true,
+      cache_hit: false,
+      took_ms: 0,
+      sources: safeList(sources),
+    };
+    if (isFn(window.commitSearchResponse)) {
+      window.commitSearchResponse(response, {
+        preserveSelection: false,
+        preserveDetail: true,
+        silentSuccess: true,
+      }, state.search.selectedResultKey);
+    } else {
+      state.search.response = response;
+      call(window.renderSearchToolbar);
+      call(window.renderSearchResults);
+    }
+    return response;
+  }
+
   function visibleResults() {
     return safeList(state.search.response && state.search.response.results);
   }
@@ -410,8 +460,6 @@
       Number(job && job.progress && job.progress.rows_matched || 0),
       loaded
     );
-    const desiredVisible = Math.max(100, Number(state.search.pageSize || 500) || 500);
-
     if (status === "failed") {
       setRuntime("error", String(job.last_error || "查询任务失败，当前结果已保留。"));
       return;
@@ -419,11 +467,7 @@
 
     if (!page.completed) {
       if (loaded > 0) {
-        if (loaded >= desiredVisible) {
-          setRuntime("partial", `Loaded preview ${desiredVisible}. Counting remaining matches in background.`);
-        } else {
-          setRuntime("partial", progressMessage(loaded, Math.max(loaded, matched)));
-        }
+        setRuntime("partial", `Preview loaded ${loaded} rows. Remaining datasource/service buckets are still running.`);
       } else {
         setRuntime("loading", "查询已开始，正在等待首批结果。");
       }
@@ -454,7 +498,6 @@
       return false;
     }
     controller.fetching = true;
-    const desiredVisible = Math.max(100, Number(state.search.pageSize || 500) || 500);
     const fetchAll = !!(options && options.fetchAll);
     const reset = !!(options && options.reset);
     const preserveVisible = !!controller.keepVisibleUntilSettled;
@@ -467,17 +510,14 @@
       controller.hasPromotedResults = false;
     }
 
-    if (!reset && !fetchAll && loaded >= desiredVisible) {
-      return false;
-    }
-
     try {
       while (controller.activeJobID === job.id) {
-        const params = new URLSearchParams({ page_size: String(Math.min(STREAM_PAGE_SIZE, desiredVisible)) });
+        const params = new URLSearchParams({ page_size: String(STREAM_PAGE_SIZE) });
         if (cursor) {
           params.set("cursor", cursor);
         }
-        const page = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(job.id)}/results?${params.toString()}`));
+        const route = fetchAll ? "results/all" : "results";
+        const page = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(job.id)}/${route}?${params.toString()}`));
         const incoming = safeList(page.results);
         const staged = isFn(window.mergeSearchResultPages)
           ? window.mergeSearchResultPages(safeList(controller.stagedResults), incoming)
@@ -502,15 +542,12 @@
         if (shouldPromote) {
           commitVisibleResponse(job, page, staged);
           controller.keepVisibleUntilSettled = false;
-          controller.hasPromotedResults = true;
+          controller.hasPromotedResults = loaded > 0 || promoteEmptyTerminal;
         }
 
         syncStatus(job, page, loaded);
 
         if (!(page.has_more && page.next_cursor)) {
-          break;
-        }
-        if (!fetchAll && loaded >= desiredVisible) {
           break;
         }
         cursor = String(page.next_cursor || "");
@@ -532,6 +569,10 @@
       const job = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(controller.activeJobID)}`));
       if (!job.id || controller.runID !== currentRun || controller.activeJobID !== job.id) {
         return false;
+      }
+
+      if (!controller.hasPromotedResults && !controller.keepVisibleUntilSettled) {
+        commitPendingResponse(controller.lastPayload, mapSources(job, null), job);
       }
 
       await drainResults(job, { reset: !!reset });
@@ -682,10 +723,13 @@
     controller.stagedResults = [];
     controller.stagedCursor = "";
     controller.hasPromotedResults = false;
-    controller.keepVisibleUntilSettled = visibleResults().length > 0;
+    controller.keepVisibleUntilSettled = background && visibleResults().length > 0;
 
     state.search.page = 1;
     state.search.useCache = false;
+    if (!controller.keepVisibleUntilSettled) {
+      commitPendingResponse(payloadInfo.payload, buildPendingSources(payloadInfo.payload), null);
+    }
     if (!background) {
       setLoading(true);
     } else {
@@ -864,20 +908,39 @@
       if (!controller.activeJobID) {
         return legacyFetchAllResultsForExport();
       }
+      const mergePages = isFn(window.mergeSearchResultPages)
+        ? window.mergeSearchResultPages
+        : (current, incoming) => safeList(current).concat(safeList(incoming));
       let job = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(controller.activeJobID)}`));
       if (!job.id) {
         return safeList(controller.stagedResults);
       }
-      await drainResults(job, { reset: false, fetchAll: true });
+      let collected = [];
+      const loadAllPages = async function () {
+        let cursor = "";
+        while (true) {
+          const params = new URLSearchParams({ page_size: String(STREAM_PAGE_SIZE) });
+          if (cursor) {
+            params.set("cursor", cursor);
+          }
+          const page = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(controller.activeJobID)}/results/all?${params.toString()}`));
+          collected = mergePages(collected, safeList(page.results));
+          if (!(page.has_more && page.next_cursor)) {
+            break;
+          }
+          cursor = String(page.next_cursor || "");
+        }
+      };
+      await loadAllPages();
       while (controller.activeJobID && !TERMINAL_JOB_STATUSES.has(String(job.status || ""))) {
         await new Promise((resolve) => setTimeout(resolve, 250));
         job = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(controller.activeJobID)}`));
         if (!job.id) {
           break;
         }
-        await drainResults(job, { reset: false, fetchAll: true });
+        await loadAllPages();
       }
-      return safeList(controller.stagedResults);
+      return safeList(collected);
     };
   }
 

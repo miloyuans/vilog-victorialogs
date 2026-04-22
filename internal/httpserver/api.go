@@ -29,6 +29,7 @@ func (s *Server) registerQueryRoutes(api *gin.RouterGroup) {
 	group.POST("/search", s.searchLogs)
 	group.POST("/jobs", s.createQueryJob)
 	group.GET("/jobs/:id/stream", s.streamQueryJob)
+	group.GET("/jobs/:id/results/all", s.getQueryJobAllResults)
 	group.GET("/jobs/:id/results", s.getQueryJobResults)
 	group.GET("/jobs/:id", s.getQueryJob)
 	group.GET("/services", s.listServices)
@@ -184,6 +185,21 @@ func (s *Server) getQueryJobResults(c *gin.Context) {
 
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "100"))
 	page, err := s.deps.QueryJobs.Results(c.Request.Context(), c.Param("id"), c.Query("cursor"), pageSize)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "query_job_results_failed", err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, page)
+}
+
+func (s *Server) getQueryJobAllResults(c *gin.Context) {
+	if s.deps.QueryJobs == nil || !s.cfg.QueryJobs.Enabled {
+		writeError(c, http.StatusServiceUnavailable, "query_jobs_disabled", "query jobs are not enabled")
+		return
+	}
+
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "100"))
+	page, err := s.deps.QueryJobs.AllResults(c.Request.Context(), c.Param("id"), c.Query("cursor"), pageSize)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "query_job_results_failed", err.Error())
 		return
