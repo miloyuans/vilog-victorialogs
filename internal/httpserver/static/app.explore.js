@@ -7,6 +7,10 @@
   const JOB_STORAGE_KEY = "vilog.search.activeJobId";
   const STREAM_PAGE_SIZE = 200;
   const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "partial", "cancelled"]);
+  const DEFAULT_PAGE_SIZE = 500;
+  const MIN_PAGE_SIZE = 50;
+  const MAX_PAGE_SIZE = 10000;
+  const PAGE_SIZE_PRESETS = [100, 200, 500, 1000, 5000, 10000];
 
   let autoTimer = null;
   let refreshTimer = null;
@@ -130,11 +134,141 @@
     }
   }
 
-  function pageInfo() {
-    if (isFn(window.getSearchPageSizeFromState)) {
-      return window.getSearchPageSizeFromState();
+  function pageNode(id) {
+    return document.getElementById(id);
+  }
+
+  function normalizePageSizeValue(value, fallback) {
+    const candidate = Number(value);
+    const resolvedFallback = Number(fallback || DEFAULT_PAGE_SIZE);
+    if (!Number.isFinite(candidate)) {
+      return Math.min(MAX_PAGE_SIZE, Math.max(MIN_PAGE_SIZE, Math.floor(resolvedFallback)));
     }
-    return { valid: true, value: Number(state.search.pageSize || 500), mode: "500", raw: String(state.search.pageSize || 500) };
+    return Math.min(MAX_PAGE_SIZE, Math.max(MIN_PAGE_SIZE, Math.floor(candidate)));
+  }
+
+  function pageInfoFromDOM() {
+    const select = pageNode("search-page-size");
+    if (!select) {
+      return null;
+    }
+
+    const mode = String(select.value || DEFAULT_PAGE_SIZE);
+    if (mode === "custom") {
+      const custom = pageNode("search-page-size-custom");
+      const raw = String(custom && custom.value || "").trim();
+      if (!raw) {
+        const fallback = normalizePageSizeValue(
+          state.search.pageSizeCustom || state.search.pageSize || DEFAULT_PAGE_SIZE,
+          DEFAULT_PAGE_SIZE,
+        );
+        return { valid: true, value: fallback, mode: "custom", raw: String(fallback) };
+      }
+
+      const candidate = Number(raw);
+      if (!Number.isFinite(candidate) || candidate <= 0 || candidate > MAX_PAGE_SIZE) {
+        return { valid: false, value: DEFAULT_PAGE_SIZE, mode: "custom", raw };
+      }
+
+      return {
+        valid: true,
+        value: normalizePageSizeValue(candidate, DEFAULT_PAGE_SIZE),
+        mode: "custom",
+        raw,
+      };
+    }
+
+    const value = normalizePageSizeValue(mode, DEFAULT_PAGE_SIZE);
+    return {
+      valid: true,
+      value,
+      mode: PAGE_SIZE_PRESETS.indexOf(value) >= 0 ? String(value) : "custom",
+      raw: String(value),
+    };
+  }
+
+  function pageInfoFromState() {
+    if (isFn(window.getSearchPageSizeFromState)) {
+      const info = window.getSearchPageSizeFromState();
+      if (info && typeof info === "object") {
+        return {
+          valid: !!info.valid,
+          value: normalizePageSizeValue(info.value, DEFAULT_PAGE_SIZE),
+          mode: String(info.mode || DEFAULT_PAGE_SIZE),
+          raw: String(info.raw || info.value || DEFAULT_PAGE_SIZE),
+        };
+      }
+    }
+    const fallback = normalizePageSizeValue(state.search.pageSize || DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE);
+    return { valid: true, value: fallback, mode: String(fallback), raw: String(fallback) };
+  }
+
+  function pageInfo() {
+    return pageInfoFromDOM() || pageInfoFromState();
+  }
+
+  function primaryLayer() {
+    if (isFn(window.getPrimaryLayer)) {
+      return window.getPrimaryLayer();
+    }
+    return safeList(state.search.queryLayers)[0] || {};
+  }
+
+  function backendKeyword(layer) {
+    if (isFn(window.getBackendPrimaryQuery)) {
+      return String(window.getBackendPrimaryQuery(layer) || "");
+    }
+    return String(layer && layer.value || "").trim() === "*" ? "" : String(layer && layer.value || "").trim();
+  }
+
+  function backendKeywordMode(layer) {
+    if (isFn(window.getBackendPrimaryKeywordMode)) {
+      return String(window.getBackendPrimaryKeywordMode(layer) || "and");
+    }
+    return "and";
+  }
+
+  function selectedDatasourceIDs() {
+    const selected = safeList(state.search.selectedDatasourceIDs).filter(Boolean);
+    if (selected.length) {
+      return selected.slice();
+    }
+    return safeList(state.datasources).map((item) => item && item.id).filter(Boolean);
+  }
+
+  function selectedServiceNames() {
+    return safeList(state.search.serviceNames).filter(Boolean).slice();
+  }
+
+  function normalizedTags() {
+    if (isFn(window.normalizeFilters)) {
+      return window.normalizeFilters(state.search.activeFilters);
+    }
+    return safeMap(state.search.activeFilters);
+  }
+
+  function toRFC3339(value) {
+    if (isFn(window.localToRFC3339)) {
+      return window.localToRFC3339(value || "");
+    }
+    return value || "";
+  }
+
+  function buildJobPayload(pageSize) {
+    const layer = primaryLayer();
+    const keyword = backendKeyword(layer);
+    return {
+      keyword: String(keyword || "").trim() === "*" ? "" : String(keyword || "").trim(),
+      keyword_mode: backendKeywordMode(layer),
+      start: toRFC3339(pageNode("search-start") && pageNode("search-start").value),
+      end: toRFC3339(pageNode("search-end") && pageNode("search-end").value),
+      datasource_ids: selectedDatasourceIDs(),
+      service_names: selectedServiceNames(),
+      tags: normalizedTags(),
+      page: 1,
+      page_size: normalizePageSizeValue(pageSize || DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE),
+      use_cache: false,
+    };
   }
 
   function normalizePayload() {
@@ -150,15 +284,7 @@
       throw new Error("invalid page size");
     }
 
-    const payload = isFn(window.buildCurrentSearchPayload)
-      ? window.buildCurrentSearchPayload(1, info.value)
-      : {};
-    payload.page = 1;
-    payload.page_size = info.value;
-    payload.use_cache = false;
-    if (String(payload.keyword || "").trim() === "*") {
-      payload.keyword = "";
-    }
+    const payload = buildJobPayload(info.value);
 
     state.search.page = 1;
     state.search.pageSize = info.value;
@@ -591,12 +717,31 @@
     return startSearch(options || {});
   };
 
+  window.startStreamingSearch = async function (options) {
+    return startSearch(options || {});
+  };
+
   window.submitSearch = async function (event) {
     if (event) {
       consume(event);
     }
     return startSearch({ background: false });
   };
+
+  if (isFn(window.fetchAllResultsForExport)) {
+    const legacyFetchAllResultsForExport = window.fetchAllResultsForExport;
+    window.fetchAllResultsForExport = async function () {
+      const controller = ensureState();
+      if (!controller.activeJobID) {
+        return legacyFetchAllResultsForExport();
+      }
+      await refreshJob(false);
+      while (controller.activeJobID && !controller.completed && controller.cursor) {
+        await refreshJob(false);
+      }
+      return safeList(state.search.response && state.search.response.results);
+    };
+  }
 
   window.syncSearchAutoRefresh = function () {
     restartAutoTimer();
