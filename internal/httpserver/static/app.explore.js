@@ -42,6 +42,10 @@
       eventSource: null,
       lastPayload: null,
       lastStartedAt: 0,
+      stagedResults: [],
+      stagedCursor: "",
+      keepVisibleUntilSettled: false,
+      hasPromotedResults: false,
     };
     return state.search.exploreController;
   }
@@ -372,15 +376,15 @@
     };
   }
 
-  function commitJobPage(job, page, incoming, replace) {
-    const existing = replace ? [] : safeList(state.search.response && state.search.response.results);
-    const merged = isFn(window.mergeSearchResultPages)
-      ? window.mergeSearchResultPages(existing, incoming)
-      : existing.concat(incoming);
-    const response = buildResponse(job, page, merged);
+  function visibleResults() {
+    return safeList(state.search.response && state.search.response.results);
+  }
+
+  function commitVisibleResponse(job, page, results) {
+    const response = buildResponse(job, page, results);
     if (isFn(window.commitSearchResponse)) {
       window.commitSearchResponse(response, {
-        preserveSelection: !replace,
+        preserveSelection: false,
         preserveDetail: true,
         silentSuccess: true,
       }, state.search.selectedResultKey);
@@ -389,7 +393,7 @@
       call(window.renderSearchToolbar);
       call(window.renderSearchResults);
     }
-    return merged;
+    return response;
   }
 
   function progressMessage(loaded, matched) {
@@ -446,9 +450,16 @@
     }
     controller.fetching = true;
     const desiredVisible = Math.max(100, Number(state.search.pageSize || 500) || 500);
-    let replace = !!(options && options.reset);
-    let cursor = replace ? "" : String(controller.cursor || "");
-    let loaded = replace ? 0 : safeList(state.search.response && state.search.response.results).length;
+    const reset = !!(options && options.reset);
+    const preserveVisible = !!controller.keepVisibleUntilSettled;
+    let cursor = reset ? "" : String(controller.stagedCursor || controller.cursor || "");
+    let loaded = reset ? 0 : safeList(controller.stagedResults).length;
+
+    if (reset) {
+      controller.stagedResults = [];
+      controller.stagedCursor = "";
+      controller.hasPromotedResults = false;
+    }
 
     try {
       while (controller.activeJobID === job.id) {
@@ -458,12 +469,30 @@
         }
         const page = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(job.id)}/results?${params.toString()}`));
         const incoming = safeList(page.results);
-        const merged = commitJobPage(job, page, incoming, replace);
-        loaded = merged.length;
-        replace = false;
+        const staged = isFn(window.mergeSearchResultPages)
+          ? window.mergeSearchResultPages(safeList(controller.stagedResults), incoming)
+          : safeList(controller.stagedResults).concat(incoming);
+        controller.stagedResults = staged;
+        loaded = staged.length;
         controller.cursor = String(page.next_cursor || "");
+        controller.stagedCursor = controller.cursor;
         controller.completed = !!page.completed;
         controller.partial = !!page.partial || String(job.status || "") === "partial" || String(job.status || "") === "failed";
+
+        // Keep the previous visible result set until the new run yields rows
+        // or conclusively finishes with an empty result.
+        const promoteEmptyTerminal = !!page.completed && String(job.status || "") === "completed";
+        const shouldPromote =
+          loaded > 0
+          || promoteEmptyTerminal
+          || (!preserveVisible && !controller.hasPromotedResults);
+
+        if (shouldPromote) {
+          commitVisibleResponse(job, page, staged);
+          controller.keepVisibleUntilSettled = false;
+          controller.hasPromotedResults = true;
+        }
+
         syncStatus(job, page, loaded);
 
         if (!(page.has_more && page.next_cursor)) {
@@ -502,11 +531,27 @@
         closeStream();
         writeStorage(JOB_STORAGE_KEY, "");
         restartAutoTimer();
+      } else {
+        scheduleRefresh(loadedPollDelay(job), false);
       }
       return true;
     } finally {
       controller.refreshing = false;
     }
+  }
+
+  function loadedPollDelay(job) {
+    const matched = Math.max(
+      Number(job && job.progress && job.progress.rows_matched || 0),
+      safeList(ensureState().stagedResults).length,
+    );
+    if (matched <= 0) {
+      return 250;
+    }
+    if (matched < Math.max(100, Number(state.search.pageSize || 500) || 500)) {
+      return 400;
+    }
+    return 800;
   }
 
   function scheduleRefresh(delayMs, reset) {
@@ -520,6 +565,12 @@
 
   function openStream(jobID, runID) {
     closeStream();
+    if (!jobID || ensureState().runID !== runID) {
+      scheduleRefresh(250, false);
+      return;
+    }
+    scheduleRefresh(250, false);
+    return;
     if (!window.EventSource || !jobID) {
       scheduleRefresh(250, false);
       return;
@@ -616,6 +667,10 @@
     controller.partial = false;
     controller.lastPayload = payloadInfo.payload;
     controller.lastStartedAt = now;
+    controller.stagedResults = [];
+    controller.stagedCursor = "";
+    controller.hasPromotedResults = false;
+    controller.keepVisibleUntilSettled = visibleResults().length > 0;
 
     state.search.page = 1;
     state.search.useCache = false;
