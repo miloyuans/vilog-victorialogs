@@ -188,23 +188,43 @@
   }
 
   function pageInfoFromState() {
-    if (isFn(window.getSearchPageSizeFromState)) {
-      const info = window.getSearchPageSizeFromState();
-      if (info && typeof info === "object") {
-        return {
-          valid: !!info.valid,
-          value: normalizePageSizeValue(info.value, DEFAULT_PAGE_SIZE),
-          mode: String(info.mode || DEFAULT_PAGE_SIZE),
-          raw: String(info.raw || info.value || DEFAULT_PAGE_SIZE),
-        };
-      }
-    }
-    const fallback = normalizePageSizeValue(state.search.pageSize || DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE);
-    return { valid: true, value: fallback, mode: String(fallback), raw: String(fallback) };
+    return {
+      valid: true,
+      value: DEFAULT_PAGE_SIZE,
+      mode: String(DEFAULT_PAGE_SIZE),
+      raw: String(DEFAULT_PAGE_SIZE),
+    };
   }
 
   function pageInfo() {
     return pageInfoFromDOM() || pageInfoFromState();
+  }
+
+  function normalizeInitialPageSizeState() {
+    const select = pageNode("search-page-size");
+    const custom = pageNode("search-page-size-custom");
+    const info = pageInfoFromDOM();
+    if (info && info.valid) {
+      state.search.pageSize = info.value;
+      state.search.pageSizeMode = info.mode;
+      state.search.pageSizeCustomRaw = info.mode === "custom" ? info.raw : "";
+      state.search.pageSizeCustom = info.mode === "custom" ? info.value : normalizePageSizeValue(state.search.pageSizeCustom || DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE);
+      state.search.pageSizeError = false;
+      return;
+    }
+
+    if (select) {
+      select.value = String(DEFAULT_PAGE_SIZE);
+    }
+    if (custom) {
+      custom.value = "";
+      custom.classList.remove("field-error");
+    }
+    state.search.pageSize = DEFAULT_PAGE_SIZE;
+    state.search.pageSizeMode = String(DEFAULT_PAGE_SIZE);
+    state.search.pageSizeCustomRaw = "";
+    state.search.pageSizeCustom = normalizePageSizeValue(state.search.pageSizeCustom || DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE);
+    state.search.pageSizeError = false;
   }
 
   function primaryLayer() {
@@ -277,11 +297,23 @@
     normalizePrimaryLayer();
     refreshRelativeRange();
 
-    const info = pageInfo();
+    let info = pageInfo();
     if (!info.valid) {
-      state.search.pageSizeError = true;
-      call(window.renderSearchToolbar);
-      throw new Error("invalid page size");
+      const select = pageNode("search-page-size");
+      const custom = pageNode("search-page-size-custom");
+      if (select) {
+        select.value = String(DEFAULT_PAGE_SIZE);
+      }
+      if (custom) {
+        custom.value = "";
+        custom.classList.remove("field-error");
+      }
+      info = {
+        valid: true,
+        value: DEFAULT_PAGE_SIZE,
+        mode: String(DEFAULT_PAGE_SIZE),
+        raw: String(DEFAULT_PAGE_SIZE),
+      };
     }
 
     const payload = buildJobPayload(info.value);
@@ -292,6 +324,7 @@
     state.search.pageSizeCustomRaw = info.raw;
     state.search.pageSizeError = false;
     state.search.useCache = false;
+    call(window.renderSearchToolbar);
     return { info, payload };
   }
 
@@ -528,9 +561,12 @@
     let payloadInfo;
     try {
       payloadInfo = normalizePayload();
-    } catch (_error) {
+    } catch (error) {
       if (!background) {
-        call(window.toast, "自定义条数无效。", "error");
+        const message = error && error.message === "invalid page size"
+          ? "自定义条数无效。"
+          : String(error && error.message || error || "查询参数无效。");
+        call(window.toast, message, "error");
       }
       return false;
     }
@@ -748,6 +784,7 @@
   };
 
   bindEvents();
+  normalizeInitialPageSizeState();
   closeStream();
   writeStorage(JOB_STORAGE_KEY, "");
   restartAutoTimer();
