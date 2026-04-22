@@ -67,7 +67,11 @@ function ensureEnhancedState() {
 ensureEnhancedState();
 
 function ensureSearchJobState() {
-  normalizeFrontendCollections();
+  if (typeof window.normalizeFrontendCollections === "function") {
+    window.normalizeFrontendCollections();
+  } else {
+    ensureEnhancedState();
+  }
   state.search.job = state.search.job || {
     id: "",
     requestKey: "",
@@ -3989,6 +3993,21 @@ highlight = function (text) {
     state.search.tagValues = {};
     await loadSearchCatalogs();
   };
+
+  window.normalizeFrontendCollections = normalizeFrontendCollections;
+  window.normalizeDatasourceState = normalizeDatasourceState;
+  window.syncHiddenQueryInput = syncHiddenQueryInput;
+  window.getPrimaryLayer = getPrimaryLayer;
+  window.getBackendPrimaryQuery = getBackendPrimaryQuery;
+  window.getBackendPrimaryKeywordMode = getBackendPrimaryKeywordMode;
+  window.setSearchRuntimeStatus = setSearchRuntimeStatus;
+  window.setSearchLoading = setSearchLoading;
+  window.commitSearchResponse = commitSearchResponse;
+  window.mergeSearchResultPages = mergeSearchResultPages;
+  window.normalizeSearchRequestErrorMessage = normalizeSearchRequestErrorMessage;
+  window.autoRefreshIntervalMs = autoRefreshIntervalMs;
+  window.clearSearchAutoRefresh = clearSearchAutoRefresh;
+  window.buildCurrentSearchPayload = buildCurrentSearchPayload;
 })();
 
 bootstrap();
