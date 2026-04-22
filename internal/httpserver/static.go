@@ -48,6 +48,7 @@ func injectStaticVersion(indexHTML, version string) string {
 		`href="/assets/styles.overrides.css"`, `href="/assets/styles.overrides.css?v=`+version+`"`,
 		`src="/assets/app.js"`, `src="/assets/app.js?v=`+version+`"`,
 		`src="/assets/app.overrides.js"`, `src="/assets/app.overrides.js?v=`+version+`"`,
+		`src="/assets/app.explore.js"`, `src="/assets/app.explore.js?v=`+version+`"`,
 	)
 	return replacer.Replace(indexHTML)
 }
