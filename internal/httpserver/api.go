@@ -183,7 +183,7 @@ func (s *Server) getQueryJobResults(c *gin.Context) {
 		return
 	}
 
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "100"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "500"))
 	page, err := s.deps.QueryJobs.Results(c.Request.Context(), c.Param("id"), c.Query("cursor"), pageSize)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "query_job_results_failed", err.Error())
@@ -198,7 +198,7 @@ func (s *Server) getQueryJobAllResults(c *gin.Context) {
 		return
 	}
 
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "100"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "500"))
 	page, err := s.deps.QueryJobs.AllResults(c.Request.Context(), c.Param("id"), c.Query("cursor"), pageSize)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "query_job_results_failed", err.Error())
@@ -245,11 +245,13 @@ func (s *Server) streamQueryJob(c *gin.Context) {
 		JobID:     job.ID,
 		Status:    job.Status,
 		Progress:  job.Progress,
+		Sources:   apiJobSourceStatuses(job),
 		LastError: job.LastError,
 	}
 	if !writeEvent(initial.Type, initial) {
 		return
 	}
+	currentStatus := job.Status
 
 	events, cancel := s.deps.QueryJobs.Subscribe(job.ID)
 	defer cancel()
@@ -269,6 +271,9 @@ func (s *Server) streamQueryJob(c *gin.Context) {
 			if !ok {
 				return
 			}
+			if event.Status != "" {
+				currentStatus = event.Status
+			}
 			eventType := strings.TrimSpace(event.Type)
 			if eventType == "" {
 				eventType = "message"
@@ -280,7 +285,7 @@ func (s *Server) streamQueryJob(c *gin.Context) {
 			if !writeEvent("heartbeat", model.QueryJobEvent{
 				Type:   "heartbeat",
 				JobID:  job.ID,
-				Status: job.Status,
+				Status: currentStatus,
 			}) {
 				return
 			}
@@ -520,4 +525,30 @@ func actorFromRequest(c *gin.Context, trustProxyHeaders bool) string {
 		return "unknown"
 	}
 	return ip.String()
+}
+
+func apiJobSourceStatuses(job model.QueryJob) []model.QuerySourceStatus {
+	out := make([]model.QuerySourceStatus, 0, len(job.SourceStates))
+	for _, state := range job.SourceStates {
+		status := state.Status
+		if strings.TrimSpace(status) == "" {
+			status = string(model.QueryJobPending)
+		}
+		out = append(out, model.QuerySourceStatus{
+			Datasource: apiFirstNonEmpty(state.DatasourceName, state.DatasourceID),
+			Status:     status,
+			Hits:       int(state.RowsMatched),
+			Error:      state.Error,
+		})
+	}
+	return out
+}
+
+func apiFirstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }

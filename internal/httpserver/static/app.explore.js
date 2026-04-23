@@ -1,22 +1,20 @@
 (() => {
-  if (window.__vilogExploreQueryControllerPatched) {
+  if (window.__vilogExploreStreamRunnerV2) {
     return;
   }
-  window.__vilogExploreQueryControllerPatched = true;
+  window.__vilogExploreStreamRunnerV2 = true;
 
   const JOB_STORAGE_KEY = "vilog.search.activeJobId";
-  const STREAM_PAGE_SIZE = 100;
-  const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "partial", "cancelled"]);
+  const SNAPSHOT_PAGE_SIZE = 500;
   const DEFAULT_PAGE_SIZE = 500;
   const MIN_PAGE_SIZE = 50;
   const MAX_PAGE_SIZE = 10000;
   const PAGE_SIZE_PRESETS = [100, 200, 500, 1000, 5000, 10000];
+  const AUTO_INTERVAL_PRESETS = ["30s", "1m", "3m", "5m", "10m"];
+  const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "partial", "cancelled"]);
 
   let autoTimer = null;
-  let refreshTimer = null;
   let runSequence = 0;
-
-  function noop() {}
 
   function isFn(value) {
     return typeof value === "function";
@@ -26,36 +24,16 @@
     return isFn(fn) ? fn(...args) : undefined;
   }
 
-  function ensureState() {
-    window.state = window.state || {};
-    state.search = state.search || {};
-    state.ui = state.ui || {};
-    state.search.exploreController = state.search.exploreController || {
-      activeJobID: "",
-      requestKey: "",
-      cursor: "",
-      loading: false,
-      fetching: false,
-      refreshing: false,
-      completed: false,
-      partial: false,
-      eventSource: null,
-      lastPayload: null,
-      lastStartedAt: 0,
-      stagedResults: [],
-      stagedCursor: "",
-      keepVisibleUntilSettled: false,
-      hasPromotedResults: false,
-    };
-    return state.search.exploreController;
-  }
-
   function safeList(value) {
     return isFn(window.safeArray) ? window.safeArray(value) : Array.isArray(value) ? value : [];
   }
 
   function safeMap(value) {
     return isFn(window.safeObject) ? window.safeObject(value) : (value && typeof value === "object" ? value : {});
+  }
+
+  function requestJSON(url, options) {
+    return window.request(url, options);
   }
 
   function readStorage(key) {
@@ -77,19 +55,45 @@
     }
   }
 
+  function ensureState() {
+    window.state = window.state || {};
+    state.search = state.search || {};
+    state.ui = state.ui || {};
+    state.search.exploreController = state.search.exploreController || {
+      activeJobID: "",
+      runID: 0,
+      loading: false,
+      completed: true,
+      partial: false,
+      eventSource: null,
+      lastPayload: null,
+      rows: [],
+      sources: [],
+    };
+    state.search.job = state.search.job || {
+      id: "",
+      requestKey: "",
+      cursor: "",
+      loading: false,
+      fetching: false,
+      completed: true,
+      partial: false,
+      eventSource: null,
+    };
+    return state.search.exploreController;
+  }
+
   function closeStream() {
     const controller = ensureState();
-    const legacyJob = state.search && state.search.job;
-    const stream = controller.eventSource || (legacyJob && legacyJob.eventSource);
-    if (stream && typeof stream.close === "function") {
+    if (controller.eventSource && typeof controller.eventSource.close === "function") {
       try {
-        stream.close();
+        controller.eventSource.close();
       } catch (_error) {
       }
     }
     controller.eventSource = null;
-    if (legacyJob) {
-      legacyJob.eventSource = null;
+    if (state.search.job) {
+      state.search.job.eventSource = null;
     }
   }
 
@@ -103,13 +107,6 @@
     }
   }
 
-  function clearRefreshTimer() {
-    if (refreshTimer) {
-      clearTimeout(refreshTimer);
-      refreshTimer = null;
-    }
-  }
-
   function setRuntime(status, message) {
     call(window.setSearchRuntimeStatus, status, message);
   }
@@ -119,29 +116,75 @@
     call(window.setSearchLoading, loading);
   }
 
+  function isTerminalStatus(status) {
+    return TERMINAL_JOB_STATUSES.has(String(status || ""));
+  }
+
   function normalizePrimaryLayer() {
     call(window.normalizeFrontendCollections);
-    if (!Array.isArray(state.search.queryLayers) || !state.search.queryLayers.length) {
-      if (isFn(window.createDefaultQueryLayers)) {
-        state.search.queryLayers = window.createDefaultQueryLayers();
-      } else {
-        state.search.queryLayers = [];
+    let primary = safeList(state.search.queryLayers)[0];
+    if (!primary) {
+      primary = isFn(window.createQueryLayer)
+        ? window.createQueryLayer("keyword", "")
+        : { id: "layer_primary", mode: "keyword", operator: "and", value: "" };
+    }
+    state.search.queryLayers = [{
+      id: String(primary.id || "layer_primary"),
+      mode: "keyword",
+      operator: "and",
+      value: String(primary.value || "").trim() === "*" ? "" : String(primary.value || ""),
+    }];
+    call(window.syncHiddenQueryInput);
+  }
+
+  function primaryLayer() {
+    normalizePrimaryLayer();
+    return safeList(state.search.queryLayers)[0] || {};
+  }
+
+  function primaryLayerInputElement(layerID) {
+    const resolvedLayerID = String(layerID || primaryLayer().id || "layer_primary");
+    const inputs = document.querySelectorAll(".query-layer-input");
+    for (const input of inputs) {
+      if (input && input.getAttribute("data-query-layer-input") === resolvedLayerID) {
+        return input;
       }
     }
-    if (state.search.queryLayers[0] && String(state.search.queryLayers[0].value || "").trim() === "*") {
-      state.search.queryLayers[0].value = "";
+    return null;
+  }
+
+  function syncPrimaryLayerFromDOM() {
+    const layer = primaryLayer();
+    const input = primaryLayerInputElement(layer.id);
+    if (!input) {
+      return layer;
     }
+    const nextValue = String(input.value || "");
+    state.search.queryLayers = [{
+      id: String(layer.id || "layer_primary"),
+      mode: "keyword",
+      operator: "and",
+      value: nextValue,
+    }];
     call(window.syncHiddenQueryInput);
+    return state.search.queryLayers[0];
+  }
+
+  function syncToolbarInputsFromDOM() {
+    syncPrimaryLayerFromDOM();
+
+    const autoInterval = document.getElementById("search-auto-interval");
+    if (autoInterval) {
+      state.search.autoRefreshInterval = isFn(window.normalizeAutoRefreshInterval)
+        ? window.normalizeAutoRefreshInterval(autoInterval.value || "1m")
+        : String(autoInterval.value || "1m");
+    }
   }
 
   function refreshRelativeRange() {
     if (state.search.timePreset !== "custom") {
       call(window.refreshSearchTimeRangeIfNeeded);
     }
-  }
-
-  function pageNode(id) {
-    return document.getElementById(id);
   }
 
   function normalizePageSizeValue(value, fallback) {
@@ -154,14 +197,14 @@
   }
 
   function pageInfoFromDOM() {
-    const select = pageNode("search-page-size");
+    const select = document.getElementById("search-page-size");
     if (!select) {
       return null;
     }
 
     const mode = String(select.value || DEFAULT_PAGE_SIZE);
     if (mode === "custom") {
-      const custom = pageNode("search-page-size-custom");
+      const custom = document.getElementById("search-page-size-custom");
       const raw = String(custom && custom.value || "").trim();
       if (!raw) {
         const fallback = normalizePageSizeValue(
@@ -175,7 +218,6 @@
       if (!Number.isFinite(candidate) || candidate <= 0 || candidate > MAX_PAGE_SIZE) {
         return { valid: false, value: DEFAULT_PAGE_SIZE, mode: "custom", raw };
       }
-
       return {
         valid: true,
         value: normalizePageSizeValue(candidate, DEFAULT_PAGE_SIZE),
@@ -196,9 +238,9 @@
   function pageInfoFromState() {
     return {
       valid: true,
-      value: DEFAULT_PAGE_SIZE,
-      mode: String(DEFAULT_PAGE_SIZE),
-      raw: String(DEFAULT_PAGE_SIZE),
+      value: normalizePageSizeValue(state.search.pageSize || DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE),
+      mode: String(normalizePageSizeValue(state.search.pageSize || DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE)),
+      raw: String(normalizePageSizeValue(state.search.pageSize || DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE)),
     };
   }
 
@@ -206,60 +248,12 @@
     return pageInfoFromDOM() || pageInfoFromState();
   }
 
-  function normalizeInitialPageSizeState() {
-    const select = pageNode("search-page-size");
-    const custom = pageNode("search-page-size-custom");
-    const info = pageInfoFromDOM();
-    if (info && info.valid) {
-      state.search.pageSize = info.value;
-      state.search.pageSizeMode = info.mode;
-      state.search.pageSizeCustomRaw = info.mode === "custom" ? info.raw : "";
-      state.search.pageSizeCustom = info.mode === "custom" ? info.value : normalizePageSizeValue(state.search.pageSizeCustom || DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE);
-      state.search.pageSizeError = false;
-      return;
-    }
-
-    if (select) {
-      select.value = String(DEFAULT_PAGE_SIZE);
-    }
-    if (custom) {
-      custom.value = "";
-      custom.classList.remove("field-error");
-    }
-    state.search.pageSize = DEFAULT_PAGE_SIZE;
-    state.search.pageSizeMode = String(DEFAULT_PAGE_SIZE);
-    state.search.pageSizeCustomRaw = "";
-    state.search.pageSizeCustom = normalizePageSizeValue(state.search.pageSizeCustom || DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE);
-    state.search.pageSizeError = false;
-  }
-
-  function primaryLayer() {
-    if (isFn(window.getPrimaryLayer)) {
-      return window.getPrimaryLayer();
-    }
-    return safeList(state.search.queryLayers)[0] || {};
-  }
-
-  function backendKeyword(layer) {
-    if (isFn(window.getBackendPrimaryQuery)) {
-      return String(window.getBackendPrimaryQuery(layer) || "");
-    }
-    return String(layer && layer.value || "").trim() === "*" ? "" : String(layer && layer.value || "").trim();
-  }
-
-  function backendKeywordMode(layer) {
-    if (isFn(window.getBackendPrimaryKeywordMode)) {
-      return String(window.getBackendPrimaryKeywordMode(layer) || "and");
-    }
-    return "and";
-  }
-
   function selectedDatasourceIDs() {
     const selected = safeList(state.search.selectedDatasourceIDs).filter(Boolean);
     if (selected.length) {
       return selected.slice();
     }
-    return safeList(state.datasources).map((item) => item && item.id).filter(Boolean);
+    return safeList(state.datasources).filter((item) => item && item.enabled !== false).map((item) => item.id).filter(Boolean);
   }
 
   function selectedServiceNames() {
@@ -267,27 +261,34 @@
   }
 
   function normalizedTags() {
-    if (isFn(window.normalizeFilters)) {
-      return window.normalizeFilters(state.search.activeFilters);
-    }
-    return safeMap(state.search.activeFilters);
+    return isFn(window.normalizeFilters)
+      ? window.normalizeFilters(state.search.activeFilters)
+      : safeMap(state.search.activeFilters);
   }
 
   function toRFC3339(value) {
-    if (isFn(window.localToRFC3339)) {
-      return window.localToRFC3339(value || "");
-    }
-    return value || "";
+    return isFn(window.localToRFC3339) ? window.localToRFC3339(value || "") : (value || "");
+  }
+
+  function backendKeyword(layer) {
+    return isFn(window.getBackendPrimaryQuery)
+      ? String(window.getBackendPrimaryQuery(layer) || "")
+      : String(layer && layer.value || "");
+  }
+
+  function backendKeywordMode(layer) {
+    return isFn(window.getBackendPrimaryKeywordMode)
+      ? String(window.getBackendPrimaryKeywordMode(layer) || "and")
+      : "and";
   }
 
   function buildJobPayload(pageSize) {
-    const layer = primaryLayer();
-    const keyword = backendKeyword(layer);
+    const layer = syncPrimaryLayerFromDOM();
     return {
-      keyword: String(keyword || "").trim() === "*" ? "" : String(keyword || "").trim(),
+      keyword: String(backendKeyword(layer) || "").trim(),
       keyword_mode: backendKeywordMode(layer),
-      start: toRFC3339(pageNode("search-start") && pageNode("search-start").value),
-      end: toRFC3339(pageNode("search-end") && pageNode("search-end").value),
+      start: toRFC3339(document.getElementById("search-start") && document.getElementById("search-start").value),
+      end: toRFC3339(document.getElementById("search-end") && document.getElementById("search-end").value),
       datasource_ids: selectedDatasourceIDs(),
       service_names: selectedServiceNames(),
       tags: normalizedTags(),
@@ -301,12 +302,13 @@
     call(window.normalizeFrontendCollections);
     call(window.normalizeDatasourceState);
     normalizePrimaryLayer();
+    syncToolbarInputsFromDOM();
     refreshRelativeRange();
 
     let info = pageInfo();
     if (!info.valid) {
-      const select = pageNode("search-page-size");
-      const custom = pageNode("search-page-size-custom");
+      const select = document.getElementById("search-page-size");
+      const custom = document.getElementById("search-page-size-custom");
       if (select) {
         select.value = String(DEFAULT_PAGE_SIZE);
       }
@@ -322,20 +324,60 @@
       };
     }
 
-    const payload = buildJobPayload(info.value);
-
     state.search.page = 1;
     state.search.pageSize = info.value;
     state.search.pageSizeMode = info.mode;
-    state.search.pageSizeCustomRaw = info.raw;
+    state.search.pageSizeCustomRaw = info.mode === "custom" ? info.raw : "";
+    state.search.pageSizeCustom = info.mode === "custom"
+      ? info.value
+      : normalizePageSizeValue(state.search.pageSizeCustom || DEFAULT_PAGE_SIZE, DEFAULT_PAGE_SIZE);
     state.search.pageSizeError = false;
-    state.search.useCache = false;
+
     call(window.renderSearchToolbar);
-    return { info, payload };
+    return { info, payload: buildJobPayload(info.value) };
   }
 
-  function requestJSON(url, options) {
-    return window.request(url, options);
+  function searchResultKey(item) {
+    const row = safeMap(item);
+    return [
+      row.timestamp || "",
+      row.datasource || "",
+      row.service || "",
+      row.pod || "",
+      row.message || "",
+    ].join("\u0000");
+  }
+
+  function mergeRows(current, incoming) {
+    const seen = new Set();
+    const merged = [];
+    safeList(current).concat(safeList(incoming)).forEach((item) => {
+      const key = searchResultKey(item);
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      merged.push(item);
+    });
+    merged.sort((left, right) => {
+      const leftTimestamp = String(left && left.timestamp || "");
+      const rightTimestamp = String(right && right.timestamp || "");
+      if (leftTimestamp === rightTimestamp) {
+        const leftDatasource = String(left && left.datasource || "");
+        const rightDatasource = String(right && right.datasource || "");
+        if (leftDatasource === rightDatasource) {
+          const leftService = String(left && left.service || "");
+          const rightService = String(right && right.service || "");
+          if (leftService === rightService) {
+            return String(right && right.message || "").localeCompare(String(left && left.message || ""));
+          }
+          return leftService.localeCompare(rightService);
+        }
+        return leftDatasource.localeCompare(rightDatasource);
+      }
+      return rightTimestamp.localeCompare(leftTimestamp);
+    });
+    return merged;
   }
 
   function mapSources(job, page) {
@@ -343,8 +385,7 @@
     if (direct.length) {
       return direct;
     }
-    const sourceStates = safeList(job && job.source_states);
-    return sourceStates.map((item) => ({
+    return safeList(job && job.source_states).map((item) => ({
       datasource: item.datasource_name || item.datasource_id || "-",
       status: item.status || "pending",
       hits: Number(item.rows_matched || 0),
@@ -352,94 +393,15 @@
     }));
   }
 
-  function isTerminalJobStatus(status) {
-    return TERMINAL_JOB_STATUSES.has(String(status || ""));
-  }
-
-  function previewHitsByDatasource(results) {
-    const counts = Object.create(null);
-    safeList(results).forEach((item) => {
-      const datasource = String(item && item.datasource || "-");
-      counts[datasource] = Number(counts[datasource] || 0) + 1;
-    });
-    return counts;
-  }
-
-  function mapVisibleSources(job, page, results) {
-    const base = mapSources(job, page);
-    const status = String((page && page.status) || (job && job.status) || "");
-    if (isTerminalJobStatus(status)) {
-      return base;
-    }
-
-    const previewHits = previewHitsByDatasource(results);
-    if (!Object.keys(previewHits).length) {
-      return base;
-    }
-
-    const seen = new Set();
-    const mapped = base.map((item) => {
-      const datasource = String(item && item.datasource || "-");
-      seen.add(datasource);
-      return {
-        datasource,
-        status: item.status || "pending",
-        hits: Number(previewHits[datasource] || 0),
-        error: item.error || "",
-      };
-    });
-
-    Object.keys(previewHits).forEach((datasource) => {
-      if (seen.has(datasource)) {
-        return;
-      }
-      mapped.push({
-        datasource,
-        status: "running",
-        hits: Number(previewHits[datasource] || 0),
-        error: "",
-      });
-    });
-
-    return mapped;
-  }
-
-  function buildResponse(job, page, results) {
-    const controller = ensureState();
-    const payload = safeMap(controller.lastPayload);
-    const terminal = isTerminalJobStatus((page && page.status) || (job && job.status));
-    return {
-      keyword: payload.keyword || "",
-      start: payload.start || "",
-      end: payload.end || "",
-      results: results,
-      total: terminal
-        ? Math.max(
-          Number(page && page.matched_total_so_far || 0),
-          Number(job && job.progress && job.progress.rows_matched || 0),
-          safeList(results).length
-        )
-        : safeList(results).length,
-      page: 1,
-      page_size: Number(payload.page_size || state.search.pageSize || 500),
-      has_more: !!(page && page.has_more),
-      next_page: 0,
-      partial: !!(page && page.partial) || !page.completed,
-      cache_hit: false,
-      took_ms: Number((state.search.response && state.search.response.took_ms) || 0),
-      sources: mapVisibleSources(job, page, results),
-    };
-  }
-
-  function buildPendingSources(payload) {
+  function pendingSources(payload) {
     const selected = safeList(payload && payload.datasource_ids);
-    const universe = selected.length
+    const datasourceIDs = selected.length
       ? selected
       : safeList(state.datasources).map((item) => item && item.id).filter(Boolean);
-    return universe.map((id) => {
+    return datasourceIDs.map((id) => {
       const match = safeList(state.datasources).find((item) => item && item.id === id);
       return {
-        datasource: (match && match.name) || id || "-",
+        datasource: match && match.name ? match.name : id || "-",
         status: "pending",
         hits: 0,
         error: "",
@@ -447,329 +409,254 @@
     });
   }
 
-  function commitPendingResponse(payload, sources, job) {
-    const response = {
-      keyword: String(payload && payload.keyword || ""),
-      start: String(payload && payload.start || ""),
-      end: String(payload && payload.end || ""),
-      results: [],
-      total: 0,
+  function buildResponse(results, sources) {
+    const controller = ensureState();
+    const payload = safeMap(controller.lastPayload);
+    return {
+      keyword: String(payload.keyword || ""),
+      start: String(payload.start || ""),
+      end: String(payload.end || ""),
+      results: safeList(results),
+      total: safeList(results).length,
       page: 1,
-      page_size: Number(payload && payload.page_size || state.search.pageSize || 500),
+      page_size: Number(payload.page_size || state.search.pageSize || DEFAULT_PAGE_SIZE),
       has_more: false,
       next_page: 0,
-      partial: true,
+      partial: !controller.completed || controller.partial,
       cache_hit: false,
       took_ms: 0,
-      sources: safeList(sources).map((item) => ({
-        datasource: String(item && item.datasource || "-"),
-        status: String(item && item.status || "pending"),
-        hits: 0,
-        error: String(item && item.error || ""),
-      })),
+      sources: safeList(sources),
     };
+  }
+
+  function commitVisibleResponse(results, sources, options) {
+    const response = buildResponse(results, sources);
     if (isFn(window.commitSearchResponse)) {
       window.commitSearchResponse(response, {
-        preserveSelection: false,
+        preserveSelection: !!(options && options.preserveSelection),
         preserveDetail: true,
         silentSuccess: true,
       }, state.search.selectedResultKey);
     } else {
       state.search.response = response;
-      call(window.renderSearchToolbar);
       call(window.renderSearchResults);
     }
     return response;
   }
 
-  function visibleResults() {
-    return safeList(state.search.response && state.search.response.results);
+  function commitPendingResponse(payload, sources) {
+    const controller = ensureState();
+    controller.lastPayload = safeMap(payload);
+    controller.rows = [];
+    controller.sources = safeList(sources);
+    controller.loading = true;
+    controller.completed = false;
+    controller.partial = true;
+    return commitVisibleResponse([], controller.sources, { preserveSelection: false });
   }
 
-  function commitVisibleResponse(job, page, results) {
-    const response = buildResponse(job, page, results);
-    if (isFn(window.commitSearchResponse)) {
-      window.commitSearchResponse(response, {
-        preserveSelection: false,
-        preserveDetail: true,
-        silentSuccess: true,
-      }, state.search.selectedResultKey);
-    } else {
-      state.search.response = response;
-      call(window.renderSearchToolbar);
-      call(window.renderSearchResults);
-    }
-    return response;
+  function activeRunningSources() {
+    return safeList(ensureState().sources).filter((item) => {
+      const status = String(item && item.status || "");
+      return status === "running" || status === "pending";
+    }).length;
   }
 
-  function progressMessage(loaded, matched) {
-    if (isFn(window.searchProgressMessage)) {
-      return window.searchProgressMessage(loaded, matched);
-    }
-    return `已加载 ${loaded} / ${matched}`;
-  }
-
-  function syncStatus(job, page, loaded) {
-    const status = String(job && job.status || "");
-    const matched = Math.max(
-      Number(page && page.matched_total_so_far || 0),
-      Number(job && job.progress && job.progress.rows_matched || 0),
-      loaded
-    );
+  function syncRuntime(status, lastError) {
+    const controller = ensureState();
+    const loaded = safeList(controller.rows).length;
     if (status === "failed") {
-      setRuntime("error", String(job.last_error || "查询任务失败，当前结果已保留。"));
+      setRuntime("error", String(lastError || "Query failed."));
       return;
     }
-
-    if (!page.completed) {
+    if (status === "cancelled") {
+      setRuntime("partial", "Previous query was cancelled.");
+      return;
+    }
+    if (!isTerminalStatus(status)) {
       if (loaded > 0) {
-        setRuntime("partial", `Preview loaded ${loaded} rows. Remaining datasource/service buckets are still running.`);
+        setRuntime("partial", `Streaming ${loaded} rows. ${activeRunningSources()} datasource views still running.`);
       } else {
-        setRuntime("loading", "查询已开始，正在等待首批结果。");
+        setRuntime("loading", "Query is running. Waiting for the first rows.");
       }
       return;
     }
-
-    if (page.partial || status === "partial") {
-      setRuntime("partial", loaded > 0 ? "查询完成，但部分数据源返回了部分结果。" : "查询完成，但当前条件没有命中任何结果。");
+    if (status === "partial") {
+      setRuntime("partial", loaded > 0 ? `Loaded ${loaded} rows with partial datasource coverage.` : "Query finished with partial coverage and no visible rows.");
       return;
     }
+    setRuntime("ok", loaded > 0 ? `Loaded ${loaded} rows.` : "Query finished with no matching logs.");
+  }
 
-    if (loaded > 0) {
-      setRuntime("ok", "结果已更新。");
-      return;
+  async function fetchJob(jobID) {
+    return safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(jobID)}`));
+  }
+
+  async function fetchAllResults(jobID) {
+    let cursor = "";
+    let results = [];
+    let lastPage = null;
+    for (;;) {
+      const params = new URLSearchParams({ page_size: String(SNAPSHOT_PAGE_SIZE) });
+      if (cursor) {
+        params.set("cursor", cursor);
+      }
+      const page = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(jobID)}/results/all?${params.toString()}`));
+      lastPage = page;
+      results = mergeRows(results, safeList(page.results));
+      if (!(page.has_more && page.next_cursor)) {
+        break;
+      }
+      cursor = String(page.next_cursor || "");
     }
-
-    setRuntime("ok", "查询完成，没有匹配当前条件的日志。");
+    return { results, lastPage: safeMap(lastPage) };
   }
 
-  function isJobActive() {
+  async function syncSnapshot(jobID, runID) {
     const controller = ensureState();
-    return controller.loading || controller.fetching || controller.refreshing || (!!controller.activeJobID && !controller.completed);
-  }
-
-  async function drainResults(job, options) {
-    const controller = ensureState();
-    if (!job || !job.id || controller.fetching) {
+    const job = await fetchJob(jobID);
+    if (!job.id || controller.runID !== runID || controller.activeJobID !== jobID) {
       return false;
     }
-    controller.fetching = true;
-    const fetchAll = !!(options && options.fetchAll);
-    const reset = !!(options && options.reset);
-    const preserveVisible = !!controller.keepVisibleUntilSettled;
-    let cursor = reset ? "" : String(controller.stagedCursor || controller.cursor || "");
-    let loaded = reset ? 0 : safeList(controller.stagedResults).length;
-    let finalPage = null;
 
-    if (reset) {
-      controller.stagedResults = [];
-      controller.stagedCursor = "";
-      controller.hasPromotedResults = false;
-    }
-
-    try {
-      while (controller.activeJobID === job.id) {
-        const params = new URLSearchParams({ page_size: String(STREAM_PAGE_SIZE) });
-        if (cursor) {
-          params.set("cursor", cursor);
-        }
-        const route = fetchAll ? "results/all" : "results";
-        const page = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(job.id)}/${route}?${params.toString()}`));
-        finalPage = page;
-        const incoming = safeList(page.results);
-        const staged = isFn(window.mergeSearchResultPages)
-          ? window.mergeSearchResultPages(safeList(controller.stagedResults), incoming)
-          : safeList(controller.stagedResults).concat(incoming);
-        controller.stagedResults = staged;
-        loaded = staged.length;
-        controller.cursor = String(page.next_cursor || "");
-        controller.stagedCursor = controller.cursor;
-        controller.completed = !!page.completed;
-        controller.partial = !!page.partial || String(job.status || "") === "partial" || String(job.status || "") === "failed";
-
-        if (!(page.has_more && page.next_cursor)) {
-          break;
-        }
-        cursor = String(page.next_cursor || "");
-      }
-
-      if (!fetchAll && finalPage) {
-        const promoteEmptyTerminal = !!finalPage.completed && String(job.status || "") === "completed";
-        const shouldPromote =
-          loaded > 0
-          || promoteEmptyTerminal
-          || (!preserveVisible && !controller.hasPromotedResults);
-        if (shouldPromote) {
-          commitVisibleResponse(job, finalPage, safeList(controller.stagedResults));
-          controller.keepVisibleUntilSettled = false;
-          controller.hasPromotedResults = loaded > 0 || promoteEmptyTerminal;
-        }
-        syncStatus(job, finalPage, loaded);
-      }
-      return true;
-    } finally {
-      controller.fetching = false;
-    }
-  }
-
-  async function refreshJob(reset) {
-    const controller = ensureState();
-    if (!controller.activeJobID || controller.refreshing) {
+    const snapshot = await fetchAllResults(jobID);
+    if (controller.runID !== runID || controller.activeJobID !== jobID) {
       return false;
     }
-    controller.refreshing = true;
-    try {
-      const currentRun = controller.runID;
-      const job = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(controller.activeJobID)}`));
-      if (!job.id || controller.runID !== currentRun || controller.activeJobID !== job.id) {
-        return false;
-      }
 
-      if (!controller.hasPromotedResults && !controller.keepVisibleUntilSettled) {
-        commitPendingResponse(controller.lastPayload, mapSources(job, null), job);
-      }
+    controller.lastPayload = safeMap(controller.lastPayload && Object.keys(controller.lastPayload).length ? controller.lastPayload : job.request);
+    controller.rows = mergeRows([], snapshot.results);
+    controller.sources = mapSources(job, snapshot.lastPage);
+    controller.loading = !isTerminalStatus(job.status);
+    controller.completed = isTerminalStatus(job.status);
+    controller.partial = String(job.status || "") === "partial" || String(job.status || "") === "failed";
 
-      controller.loading = !TERMINAL_JOB_STATUSES.has(String(job.status || ""));
-      controller.completed = !controller.loading;
-      controller.partial = String(job.status || "") === "partial" || String(job.status || "") === "failed";
+    if (state.search.job) {
+      state.search.job.id = jobID;
+      state.search.job.loading = controller.loading;
+      state.search.job.completed = controller.completed;
+      state.search.job.partial = controller.partial;
+      state.search.job.cursor = "";
+    }
 
-      const shouldRefreshPreview = !!reset || !controller.hasPromotedResults || controller.completed;
-      if (shouldRefreshPreview) {
-        await drainResults(job, { reset: !!reset || controller.completed });
-      } else {
-        syncStatus(job, {
-          status: job.status,
-          completed: false,
-          partial: controller.partial,
-          matched_total_so_far: Number(job && job.progress && job.progress.rows_matched || 0),
-        }, safeList(controller.stagedResults).length);
-      }
+    commitVisibleResponse(controller.rows, controller.sources, { preserveSelection: true });
+    syncRuntime(String(job.status || ""), job.last_error || "");
 
-      if (controller.completed) {
-        closeStream();
-        writeStorage(JOB_STORAGE_KEY, "");
-        restartAutoTimer();
-      } else {
-        scheduleRefresh(loadedPollDelay(job), false);
-      }
-      return true;
-    } finally {
-      controller.refreshing = false;
+    if (controller.completed) {
+      closeStream();
+      writeStorage(JOB_STORAGE_KEY, "");
+      restartAutoTimer();
+    }
+    return true;
+  }
+
+  function applyEventPayload(payload) {
+    const controller = ensureState();
+    if (safeList(payload.sources).length) {
+      controller.sources = safeList(payload.sources);
+    }
+    if (String(payload.status || "").trim()) {
+      controller.loading = !isTerminalStatus(payload.status);
+      controller.completed = isTerminalStatus(payload.status);
+      controller.partial = String(payload.status) === "partial" || String(payload.status) === "failed";
     }
   }
 
-  function loadedPollDelay(job) {
-    const matched = Math.max(
-      Number(job && job.progress && job.progress.rows_matched || 0),
-      safeList(ensureState().stagedResults).length,
-    );
-    if (matched <= 0) {
-      return 250;
+  function handleStatusEvent(payload, runID) {
+    const controller = ensureState();
+    if (controller.runID !== runID) {
+      return;
     }
-    if (matched < Math.max(100, Number(state.search.pageSize || 500) || 500)) {
-      return 400;
+    applyEventPayload(payload);
+    if (!controller.rows.length) {
+      commitPendingResponse(controller.lastPayload, controller.sources.length ? controller.sources : pendingSources(controller.lastPayload));
+    } else {
+      commitVisibleResponse(controller.rows, controller.sources, { preserveSelection: true });
     }
-    return 800;
+    syncRuntime(String(payload.status || ""), payload.error || "");
   }
 
-  function scheduleRefresh(delayMs, reset) {
-    clearRefreshTimer();
-    refreshTimer = setTimeout(() => {
-      void refreshJob(reset).catch((error) => {
-        setRuntime("error", call(window.normalizeSearchRequestErrorMessage, error) || String(error));
-      });
-    }, Math.max(0, Number(delayMs || 0)));
+  function handleRowsEvent(payload, runID) {
+    const controller = ensureState();
+    if (controller.runID !== runID) {
+      return;
+    }
+    applyEventPayload(payload);
+    controller.rows = mergeRows(controller.rows, safeList(payload.rows));
+    commitVisibleResponse(controller.rows, controller.sources, { preserveSelection: true });
+    syncRuntime(String(payload.status || "running"), payload.error || "");
+  }
+
+  async function handleTerminalEvent(payload, runID) {
+    const controller = ensureState();
+    if (controller.runID !== runID) {
+      return;
+    }
+    applyEventPayload(payload);
+    await syncSnapshot(controller.activeJobID, runID);
   }
 
   function openStream(jobID, runID) {
     closeStream();
-    if (!jobID || ensureState().runID !== runID) {
-      scheduleRefresh(250, false);
+    if (!jobID) {
       return;
     }
-    scheduleRefresh(250, false);
-    return;
-    if (!window.EventSource || !jobID) {
-      scheduleRefresh(250, false);
-      return;
-    }
+
     const controller = ensureState();
+    if (!window.EventSource) {
+      void syncSnapshot(jobID, runID);
+      return;
+    }
+
     const source = new EventSource(`/api/query/jobs/${encodeURIComponent(jobID)}/stream`);
     controller.eventSource = source;
     if (state.search.job) {
       state.search.job.eventSource = source;
     }
-    const onSignal = () => {
-      if (ensureState().runID !== runID) {
-        return;
+
+    function parseEvent(event) {
+      try {
+        return safeMap(JSON.parse(String(event && event.data || "{}")));
+      } catch (_error) {
+        return {};
       }
-      scheduleRefresh(350, false);
-    };
-    source.onmessage = onSignal;
-    ["status", "progress", "segment_ready", "completed", "partial", "failed"].forEach((eventName) => {
-      source.addEventListener(eventName, onSignal);
+    }
+
+    source.addEventListener("status", (event) => {
+      handleStatusEvent(parseEvent(event), runID);
+    });
+    source.addEventListener("progress", (event) => {
+      handleStatusEvent(parseEvent(event), runID);
+    });
+    source.addEventListener("rows", (event) => {
+      handleRowsEvent(parseEvent(event), runID);
+    });
+    source.addEventListener("completed", (event) => {
+      void handleTerminalEvent(parseEvent(event), runID);
+    });
+    source.addEventListener("partial", (event) => {
+      void handleTerminalEvent(parseEvent(event), runID);
+    });
+    source.addEventListener("failed", (event) => {
+      void handleTerminalEvent(parseEvent(event), runID);
+    });
+    source.addEventListener("cancelled", (event) => {
+      void handleTerminalEvent(parseEvent(event), runID);
     });
     source.onerror = function () {
       const active = ensureState();
       if (active.runID === runID && !active.completed) {
-        setRuntime("partial", "查询连接正在重试，当前结果已保留。");
+        setRuntime("partial", "Query stream reconnecting. Syncing current snapshot.");
+        void syncSnapshot(jobID, runID);
       }
     };
+
+    void syncSnapshot(jobID, runID);
   }
 
-  async function restoreActiveJob() {
-    const restoredJobID = String(readStorage(JOB_STORAGE_KEY) || "").trim();
-    if (!restoredJobID) {
-      return false;
-    }
-
+  function isJobActive() {
     const controller = ensureState();
-    const runID = ++runSequence;
-    controller.runID = runID;
-    controller.activeJobID = restoredJobID;
-    controller.requestKey = "";
-    controller.cursor = "";
-    controller.loading = true;
-    controller.fetching = false;
-    controller.refreshing = false;
-    controller.completed = false;
-    controller.partial = false;
-    controller.lastPayload = null;
-    controller.lastStartedAt = Date.now();
-    controller.stagedResults = [];
-    controller.stagedCursor = "";
-    controller.keepVisibleUntilSettled = false;
-    controller.hasPromotedResults = false;
-
-    if (state.search.job) {
-      state.search.job.id = restoredJobID;
-      state.search.job.requestKey = "";
-      state.search.job.cursor = "";
-      state.search.job.loading = true;
-      state.search.job.fetching = false;
-      state.search.job.completed = false;
-      state.search.job.partial = false;
-    }
-
-    try {
-      const job = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(restoredJobID)}`));
-      if (!job.id) {
-        throw new Error("active query job not found");
-      }
-      controller.lastPayload = safeMap(job.request);
-      commitPendingResponse(controller.lastPayload, mapSources(job, null), job);
-      openStream(restoredJobID, runID);
-      await refreshJob(true);
-      return true;
-    } catch (_error) {
-      closeStream();
-      writeStorage(JOB_STORAGE_KEY, "");
-      controller.activeJobID = "";
-      controller.loading = false;
-      controller.completed = true;
-      controller.partial = false;
-      return false;
-    }
+    return !!controller.activeJobID && !controller.completed;
   }
 
   async function startSearch(options) {
@@ -782,80 +669,48 @@
     try {
       payloadInfo = normalizePayload();
     } catch (error) {
+      const message = error && error.message ? error.message : "Query parameters are invalid.";
       if (!background) {
-        const message = error && error.message === "invalid page size"
-          ? "自定义条数无效。"
-          : String(error && error.message || error || "查询参数无效。");
         call(window.toast, message, "error");
       }
+      setRuntime("error", message);
       return false;
     }
 
-    const selectedDatasourceIDs = safeList(state.search.selectedDatasourceIDs);
-    if (!selectedDatasourceIDs.length) {
+    if (!safeList(payloadInfo.payload.datasource_ids).length) {
       if (!background) {
-        call(window.toast, "请先选择至少一个查询数据源。", "error");
+        call(window.toast, "Select at least one datasource before running a query.", "error");
       }
       return false;
     }
 
-    const nextRequestKey = JSON.stringify(payloadInfo.payload);
-    const activeSameRequest = controller.activeJobID
-      && !controller.completed
-      && controller.requestKey === nextRequestKey;
-    if (activeSameRequest) {
-      if (!background) {
-        setRuntime("loading", "当前查询仍在执行，继续等待结果补齐。");
-      }
-      scheduleRefresh(0, false);
-      return true;
-    }
-
-    const now = Date.now();
-    if (controller.loading && (now - Number(controller.lastStartedAt || 0)) < 800) {
-      return false;
-    }
-
-    clearRefreshTimer();
+    writeStorage(JOB_STORAGE_KEY, "");
+    const runID = ++runSequence;
     closeStream();
 
-    if (state.search.job) {
-      state.search.job.id = "";
-      state.search.job.cursor = "";
-      state.search.job.loading = false;
-      state.search.job.fetching = false;
-      state.search.job.completed = true;
-      state.search.job.partial = false;
-    }
-
-    const runID = ++runSequence;
     controller.runID = runID;
     controller.activeJobID = "";
-    controller.requestKey = nextRequestKey;
-    controller.cursor = "";
     controller.loading = true;
-    controller.fetching = false;
-    controller.refreshing = false;
     controller.completed = false;
     controller.partial = false;
     controller.lastPayload = payloadInfo.payload;
-    controller.lastStartedAt = now;
-    controller.stagedResults = [];
-    controller.stagedCursor = "";
-    controller.hasPromotedResults = false;
-    controller.keepVisibleUntilSettled = background && visibleResults().length > 0;
+    controller.rows = [];
+    controller.sources = pendingSources(payloadInfo.payload);
 
-    state.search.page = 1;
-    state.search.useCache = false;
-    if (!controller.keepVisibleUntilSettled) {
-      commitPendingResponse(payloadInfo.payload, buildPendingSources(payloadInfo.payload), null);
+    if (state.search.job) {
+      state.search.job.id = "";
+      state.search.job.loading = true;
+      state.search.job.completed = false;
+      state.search.job.partial = false;
+      state.search.job.cursor = "";
     }
+
+    commitPendingResponse(payloadInfo.payload, controller.sources);
+    setRuntime("loading", background ? "Auto query started." : "Query started.");
+
     if (!background) {
       setLoading(true);
-    } else {
-      setRuntime("loading", "正在静默刷新最新日志。");
     }
-    setRuntime("loading", "查询进行中，当前结果保持可读。");
 
     try {
       const created = safeMap(await requestJSON("/api/query/jobs", {
@@ -863,7 +718,7 @@
         body: JSON.stringify(payloadInfo.payload),
       }));
       if (!created.job_id) {
-        throw new Error("查询任务创建失败。");
+        throw new Error("The query job could not be created.");
       }
       if (controller.runID !== runID) {
         return false;
@@ -874,16 +729,12 @@
 
       if (state.search.job) {
         state.search.job.id = controller.activeJobID;
-        state.search.job.requestKey = controller.requestKey;
-        state.search.job.cursor = "";
         state.search.job.loading = true;
-        state.search.job.fetching = false;
         state.search.job.completed = false;
         state.search.job.partial = false;
       }
 
       openStream(controller.activeJobID, runID);
-      await refreshJob(true);
       return true;
     } catch (error) {
       if (controller.runID === runID) {
@@ -891,10 +742,13 @@
         controller.completed = false;
         controller.partial = false;
         controller.activeJobID = "";
+        controller.rows = [];
+        controller.sources = [];
         writeStorage(JOB_STORAGE_KEY, "");
-        setRuntime("error", call(window.normalizeSearchRequestErrorMessage, error) || String(error));
+        const message = call(window.normalizeSearchRequestErrorMessage, error) || String(error);
+        setRuntime("error", message);
         if (!background) {
-          call(window.toast, call(window.normalizeSearchRequestErrorMessage, error) || String(error), "error");
+          call(window.toast, message, "error");
         }
       }
       return false;
@@ -903,6 +757,68 @@
         setLoading(false);
       }
       restartAutoTimer();
+    }
+  }
+
+  async function restoreActiveJob() {
+    const restoredJobID = String(readStorage(JOB_STORAGE_KEY) || "").trim();
+    if (!restoredJobID) {
+      return false;
+    }
+
+    const controller = ensureState();
+    const runID = ++runSequence;
+    controller.runID = runID;
+    controller.activeJobID = restoredJobID;
+    controller.loading = true;
+    controller.completed = false;
+    controller.partial = false;
+    controller.rows = [];
+    controller.sources = [];
+
+    if (state.search.job) {
+      state.search.job.id = restoredJobID;
+      state.search.job.loading = true;
+      state.search.job.completed = false;
+      state.search.job.partial = false;
+      state.search.job.cursor = "";
+    }
+
+    try {
+      const job = await fetchJob(restoredJobID);
+      if (!job.id) {
+        throw new Error("active query job not found");
+      }
+
+      controller.lastPayload = safeMap(job.request);
+      controller.sources = mapSources(job, null);
+      commitPendingResponse(controller.lastPayload, controller.sources);
+
+      if (isTerminalStatus(job.status)) {
+        await syncSnapshot(restoredJobID, runID);
+        writeStorage(JOB_STORAGE_KEY, "");
+        return true;
+      }
+
+      openStream(restoredJobID, runID);
+      return true;
+    } catch (_error) {
+      closeStream();
+      writeStorage(JOB_STORAGE_KEY, "");
+      controller.activeJobID = "";
+      controller.loading = false;
+      controller.completed = true;
+      controller.partial = false;
+      controller.rows = [];
+      controller.sources = [];
+      if (state.search.job) {
+        state.search.job.id = "";
+        state.search.job.loading = false;
+        state.search.job.completed = true;
+        state.search.job.partial = false;
+        state.search.job.cursor = "";
+      }
+      return false;
     }
   }
 
@@ -923,18 +839,12 @@
       return;
     }
 
+    const interval = String(state.search.autoRefreshInterval || "1m");
     const delay = isFn(window.autoRefreshIntervalMs)
-      ? window.autoRefreshIntervalMs(state.search.autoRefreshInterval)
+      ? window.autoRefreshIntervalMs(interval)
       : 60000;
     autoTimer = setTimeout(() => {
-      if (state.activePanel !== "search") {
-        restartAutoTimer();
-        return;
-      }
-      if (state.search.autoRefreshEnabled === false) {
-        return;
-      }
-      if (document.hidden || isJobActive()) {
+      if (state.activePanel !== "search" || state.search.autoRefreshEnabled === false || document.hidden || isJobActive()) {
         restartAutoTimer();
         return;
       }
@@ -943,6 +853,9 @@
   }
 
   function consume(event) {
+    if (!event) {
+      return;
+    }
     event.preventDefault();
     event.stopPropagation();
     if (typeof event.stopImmediatePropagation === "function") {
@@ -950,11 +863,93 @@
     }
   }
 
-  function bindEvents() {
-    if (window.__vilogExploreQueryControllerBound) {
+  function halt(event) {
+    if (!event) {
       return;
     }
-    window.__vilogExploreQueryControllerBound = true;
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === "function") {
+      event.stopImmediatePropagation();
+    }
+  }
+
+  async function clearSearchFiltersNow() {
+    call(window.normalizeFrontendCollections);
+    closeStream();
+    writeStorage(JOB_STORAGE_KEY, "");
+
+    const controller = ensureState();
+    controller.activeJobID = "";
+    controller.loading = false;
+    controller.completed = true;
+    controller.partial = false;
+    controller.rows = [];
+    controller.sources = [];
+    controller.lastPayload = {};
+
+    if (state.search.job) {
+      state.search.job.id = "";
+      state.search.job.loading = false;
+      state.search.job.fetching = false;
+      state.search.job.completed = true;
+      state.search.job.partial = false;
+      state.search.job.cursor = "";
+      state.search.job.eventSource = null;
+    }
+
+    state.search.page = 1;
+    state.search.pageSize = DEFAULT_PAGE_SIZE;
+    state.search.pageSizeMode = String(DEFAULT_PAGE_SIZE);
+    state.search.pageSizeCustomRaw = "";
+    state.search.pageSizeCustom = DEFAULT_PAGE_SIZE;
+    state.search.pageSizeError = false;
+    state.search.autoRefreshEnabled = true;
+    state.search.autoRefreshInterval = "1m";
+    state.search.selectedDatasourceIDs = [];
+    state.search.serviceNames = [];
+    state.search.activeFilters = {};
+    state.search.tagValues = {};
+    state.search.levelFilter = "all";
+    state.search.highlightTone = "yellow";
+    state.ui.detailOpen = false;
+
+    const primary = primaryLayer();
+    state.search.queryLayers = [{
+      id: String(primary.id || "layer_primary"),
+      mode: "keyword",
+      operator: "and",
+      value: "",
+    }];
+    call(window.syncHiddenQueryInput);
+
+    const pageSizeSelect = document.getElementById("search-page-size");
+    const pageSizeCustom = document.getElementById("search-page-size-custom");
+    if (pageSizeSelect) {
+      pageSizeSelect.value = String(DEFAULT_PAGE_SIZE);
+    }
+    if (pageSizeCustom) {
+      pageSizeCustom.value = "";
+      pageSizeCustom.classList.remove("field-error");
+    }
+
+    call(window.normalizeDatasourceState);
+    if (state.search.catalogDatasourceID && isFn(window.loadSearchCatalogs)) {
+      await window.loadSearchCatalogs();
+    } else {
+      call(window.renderSearchControls);
+    }
+
+    state.search.response = null;
+    call(window.renderSearchResults);
+    setRuntime("idle", "");
+    restartAutoTimer();
+  }
+
+  function bindEvents() {
+    if (window.__vilogExploreStreamRunnerBound) {
+      return;
+    }
+    window.__vilogExploreStreamRunnerBound = true;
 
     document.addEventListener("click", (event) => {
       const button = event.target && event.target.closest ? event.target.closest("button") : null;
@@ -970,6 +965,104 @@
         consume(event);
         state.search.autoRefreshEnabled = !(state.search.autoRefreshEnabled !== false);
         call(window.renderSearchToolbar);
+        restartAutoTimer();
+        return;
+      }
+      if (button.id === "search-clear-filters") {
+        consume(event);
+        void clearSearchFiltersNow();
+      }
+    }, true);
+
+    document.addEventListener("input", (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) {
+        return;
+      }
+
+      const layerID = target.getAttribute("data-query-layer-input");
+      if (layerID) {
+        halt(event);
+        state.search.queryLayers = [{
+          id: String(layerID || "layer_primary"),
+          mode: "keyword",
+          operator: "and",
+          value: String(target.value || ""),
+        }];
+        call(window.syncHiddenQueryInput);
+        return;
+      }
+
+      if (target.id === "search-page-size-custom") {
+        halt(event);
+        const raw = String(target.value || "").trim();
+        state.search.pageSizeMode = "custom";
+        state.search.pageSizeCustomRaw = raw;
+        if (!raw) {
+          state.search.pageSizeError = false;
+          target.classList.remove("field-error");
+          return;
+        }
+
+        const candidate = Number(raw);
+        if (!Number.isFinite(candidate) || candidate < MIN_PAGE_SIZE || candidate > MAX_PAGE_SIZE) {
+          state.search.pageSizeError = true;
+          target.classList.add("field-error");
+          return;
+        }
+
+        const resolved = normalizePageSizeValue(candidate, DEFAULT_PAGE_SIZE);
+        state.search.pageSizeError = false;
+        state.search.pageSizeCustom = resolved;
+        state.search.pageSize = resolved;
+        target.classList.remove("field-error");
+      }
+    }, true);
+
+    document.addEventListener("change", (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) {
+        return;
+      }
+
+      if (target.id === "search-page-size") {
+        halt(event);
+        const mode = String(target.value || DEFAULT_PAGE_SIZE);
+        state.search.pageSizeMode = mode;
+        if (mode === "custom") {
+          const raw = String(state.search.pageSizeCustomRaw || state.search.pageSizeCustom || DEFAULT_PAGE_SIZE);
+          const candidate = Number(raw);
+          if (Number.isFinite(candidate) && candidate >= MIN_PAGE_SIZE && candidate <= MAX_PAGE_SIZE) {
+            state.search.pageSizeCustom = normalizePageSizeValue(candidate, DEFAULT_PAGE_SIZE);
+            state.search.pageSize = state.search.pageSizeCustom;
+            state.search.pageSizeError = false;
+          }
+        } else {
+          state.search.pageSizeError = false;
+          state.search.pageSize = normalizePageSizeValue(mode, DEFAULT_PAGE_SIZE);
+        }
+        call(window.renderSearchControls);
+        return;
+      }
+
+      if (target.id === "search-page-size-custom") {
+        halt(event);
+        const raw = String(target.value || "").trim();
+        const candidate = Number(raw);
+        if (raw && Number.isFinite(candidate) && candidate >= MIN_PAGE_SIZE && candidate <= MAX_PAGE_SIZE) {
+          state.search.pageSizeError = false;
+          state.search.pageSizeCustom = normalizePageSizeValue(candidate, DEFAULT_PAGE_SIZE);
+          state.search.pageSize = state.search.pageSizeCustom;
+          target.classList.remove("field-error");
+        }
+        return;
+      }
+
+      if (target.id === "search-auto-interval") {
+        halt(event);
+        state.search.autoRefreshInterval = isFn(window.normalizeAutoRefreshInterval)
+          ? window.normalizeAutoRefreshInterval(target.value || "1m")
+          : String(target.value || "1m");
         restartAutoTimer();
       }
     }, true);
@@ -998,79 +1091,194 @@
     }, true);
 
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) {
-        restartAutoTimer();
-      } else {
+      if (document.hidden) {
         clearAutoTimer();
+      } else {
+        restartAutoTimer();
       }
     });
   }
 
-  window.runSearchWindow = async function (_pageOverride, options) {
-    return startSearch(options || {});
+  getDecoratedResults = window.getDecoratedResults = function () {
+    return isFn(window.getRawDecoratedResults) ? window.getRawDecoratedResults() : [];
   };
 
-  window.startStreamingSearch = async function (options) {
-    return startSearch(options || {});
+  getVisibleResults = window.getVisibleResults = function () {
+    const items = isFn(window.getDecoratedResults) ? window.getDecoratedResults() : [];
+    return state.search.levelFilter === "all"
+      ? items
+      : items.filter((item) => item._level === state.search.levelFilter);
   };
 
-  window.submitSearch = async function (event) {
-    if (event) {
-      consume(event);
+  renderSearchContext = window.renderSearchContext = function () {
+    call(window.normalizeFrontendCollections);
+    const catalog = safeList(state.datasources).find((item) => item && item.id === state.search.catalogDatasourceID);
+    const serviceCount = safeList(state.search.serviceNames).length;
+    const datasourceCount = safeList(state.search.selectedDatasourceIDs).length || safeList(state.datasources).length;
+    const filters = Object.keys(normalizedTags()).length;
+    const node = document.getElementById("search-context-note");
+    if (!node) {
+      return;
     }
-    return startSearch({ background: false });
+    node.textContent =
+      `Datasources: ${datasourceCount} / Catalog: ${(catalog && catalog.name) || "ALL"} / ` +
+      `Services: ${serviceCount || "ALL"} / Tag filters: ${filters} / ` +
+      `Per-service limit: ${Number(state.search.pageSize || DEFAULT_PAGE_SIZE)}`;
   };
 
-  if (isFn(window.fetchAllResultsForExport)) {
-    const legacyFetchAllResultsForExport = window.fetchAllResultsForExport;
-    window.fetchAllResultsForExport = async function () {
-      const controller = ensureState();
-      if (!controller.activeJobID) {
-        return legacyFetchAllResultsForExport();
-      }
-      const mergePages = isFn(window.mergeSearchResultPages)
-        ? window.mergeSearchResultPages
-        : (current, incoming) => safeList(current).concat(safeList(incoming));
-      let job = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(controller.activeJobID)}`));
-      if (!job.id) {
-        return safeList(controller.stagedResults);
-      }
-      let collected = [];
-      const loadAllPages = async function () {
-        let cursor = "";
-        while (true) {
-          const params = new URLSearchParams({ page_size: String(STREAM_PAGE_SIZE) });
-          if (cursor) {
-            params.set("cursor", cursor);
-          }
-          const page = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(controller.activeJobID)}/results/all?${params.toString()}`));
-          collected = mergePages(collected, safeList(page.results));
-          if (!(page.has_more && page.next_cursor)) {
-            break;
-          }
-          cursor = String(page.next_cursor || "");
-        }
-      };
-      await loadAllPages();
-      while (controller.activeJobID && !TERMINAL_JOB_STATUSES.has(String(job.status || ""))) {
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        job = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(controller.activeJobID)}`));
-        if (!job.id) {
-          break;
-        }
-        await loadAllPages();
-      }
-      return safeList(collected);
-    };
+  function renderPrimaryQueryCard() {
+    const layer = primaryLayer();
+    const placeholder = "Enter one keyword phrase per line. The backend will build LogSQL and stream the matched logs.";
+    return `
+      <div class="query-layer-card query-layer-card-primary" data-query-layer-card="${esc(layer.id)}">
+        <div class="query-layer-head">
+          <div class="query-layer-copy">
+            <strong>${esc(s("主查询", "Primary Query"))}</strong>
+            <span>${esc(s("主查询会把关键字直接下推到 VictoriaLogs，并按数据源与服务并发流式返回结果。", "The primary query is pushed down into VictoriaLogs and streamed back by datasource/service buckets."))}</span>
+          </div>
+        </div>
+        <textarea class="query-layer-input" data-query-layer-input="${esc(layer.id)}" rows="3" placeholder="${esc(placeholder)}">${esc(layer.value || "")}</textarea>
+        <div class="query-layer-foot">
+          <span>${esc(s("Enter 直接执行查询，Shift+Enter 换行。每个服务默认返回最近时间窗口内最多 N 条命中日志。", "Press Enter to run and Shift+Enter for a line break. Each service returns up to N rows from the frozen query window."))}</span>
+        </div>
+      </div>
+    `;
   }
 
-  window.syncSearchAutoRefresh = function () {
+  renderSearchToolbar = window.renderSearchToolbar = function () {
+    call(window.normalizeFrontendCollections);
+    normalizePrimaryLayer();
+
+    const selectedCount = safeList(state.search.selectedDatasourceIDs).length;
+    const serviceCount = safeList(state.search.serviceNames).length;
+    const resultCount = safeList(call(window.getVisibleResults) || []).length;
+    const exportBusy = !!state.search.exporting;
+    const exportTone = state.search.exportStatusTone === "error"
+      ? "tone-warn"
+      : state.search.exportStatusTone === "ok"
+        ? "tone-ok"
+        : "tone-soft";
+    const exportStatusText = state.search.exportStatusText || s("就绪", "Ready");
+    const resolvedPageInfo = isFn(window.getSearchPageSizeFromState)
+      ? window.getSearchPageSizeFromState()
+      : pageInfo();
+    const autoEnabled = state.search.autoRefreshEnabled !== false;
+    const runtimeStatus = isFn(window.getSearchRuntimeStatus)
+      ? window.getSearchRuntimeStatus()
+      : { tone: "tone-soft", text: "Ready" };
+    const autoInterval = isFn(window.normalizeAutoRefreshInterval)
+      ? window.normalizeAutoRefreshInterval(state.search.autoRefreshInterval)
+      : String(state.search.autoRefreshInterval || "1m");
+    const target = document.getElementById("search-toolbar-controls");
+    if (!target) {
+      return;
+    }
+
+    call(window.syncHiddenQueryInput);
+    target.innerHTML = `
+      <div class="search-toolbar-row search-toolbar-row-primary">
+        <div class="toolbar-cluster toolbar-cluster-left">
+          <button class="toolbar-trigger toolbar-trigger-select" type="button" data-open-menu="datasource">
+            <span class="toolbar-trigger-label">${esc(s("数据源", "Datasource"))}</span>
+            <strong id="search-datasource-trigger">${esc(isFn(window.getSearchDatasourceLabel) ? window.getSearchDatasourceLabel() : "ALL")}</strong>
+          </button>
+          <button class="toolbar-trigger toolbar-trigger-select" type="button" data-open-menu="service">
+            <span class="toolbar-trigger-label">${esc(s("服务目录", "Service Catalog"))}</span>
+            <strong id="search-service-trigger">${esc(isFn(window.getSearchServiceLabel) ? window.getSearchServiceLabel() : "ALL")}</strong>
+          </button>
+        </div>
+        <div class="toolbar-cluster toolbar-cluster-right">
+          <button class="toolbar-trigger toolbar-trigger-time" type="button" data-open-menu="time">
+            <span class="toolbar-trigger-label">${esc(s("时间范围", "Time Range"))}</span>
+            <strong id="search-time-trigger">${esc(isFn(window.getSearchTimeLabel) ? window.getSearchTimeLabel() : "Last 1h")}</strong>
+          </button>
+          <label class="toolbar-inline-field">
+            <span>${esc(s("每服务条数", "Rows / Service"))}</span>
+            <select id="search-page-size">
+              <option value="100" ${resolvedPageInfo.mode === "100" ? "selected" : ""}>100</option>
+              <option value="200" ${resolvedPageInfo.mode === "200" ? "selected" : ""}>200</option>
+              <option value="500" ${resolvedPageInfo.mode === "500" ? "selected" : ""}>500</option>
+              <option value="1000" ${resolvedPageInfo.mode === "1000" ? "selected" : ""}>1000</option>
+              <option value="5000" ${resolvedPageInfo.mode === "5000" ? "selected" : ""}>5000</option>
+              <option value="10000" ${resolvedPageInfo.mode === "10000" ? "selected" : ""}>10000</option>
+              <option value="custom" ${resolvedPageInfo.mode === "custom" ? "selected" : ""}>Custom</option>
+            </select>
+            <input id="search-page-size-custom" class="${resolvedPageInfo.mode === "custom" ? "" : "is-hidden"} ${!resolvedPageInfo.valid ? "field-error" : ""}" type="number" min="50" max="${MAX_PAGE_SIZE}" step="50" value="${resolvedPageInfo.mode === "custom" ? esc(String(resolvedPageInfo.raw)) : ""}" placeholder="Custom" />
+          </label>
+          <button class="button button-small button-muted" type="button" id="search-clear-filters">${esc(s("清空", "Clear"))}</button>
+          <button class="button button-small button-primary" type="button" id="search-submit">${esc(s("执行查询", "Run Query"))}</button>
+          <button class="button button-small ${autoEnabled ? "button-primary" : "button-ghost"}" type="button" id="search-auto-toggle">${esc(s("auto查询", "Auto Query"))}</button>
+          <label class="toolbar-inline-field toolbar-inline-field-auto">
+            <span>${esc(s("周期", "Every"))}</span>
+            <select id="search-auto-interval" ${autoEnabled ? "" : "disabled"}>
+              ${AUTO_INTERVAL_PRESETS.map((item) => `<option value="${esc(item)}" ${autoInterval === item ? "selected" : ""}>${esc(item)}</option>`).join("")}
+            </select>
+          </label>
+        </div>
+      </div>
+      <div class="search-toolbar-row search-toolbar-row-query">
+        <div class="query-composer">
+          <div class="query-composer-head">
+            <div class="query-composer-copy">
+              <strong>${esc(s("日志查询", "Log Query"))}</strong>
+              <span class="query-composer-hint">${esc(s("只保留一个主查询输入框。后端会根据关键字、时间窗口、数据源和服务自动拼接 LogSQL，并以流式结果覆盖当前视图。", "Only the primary query box is shown. The backend builds LogSQL from the keyword, frozen time window, datasource, and service filters, then streams the latest result set over the current view."))}</span>
+            </div>
+            <div class="query-composer-toolbar">
+              <div id="search-level-filters" class="inline-dock-block"></div>
+              <div id="search-highlight-palette" class="inline-dock-block"></div>
+            </div>
+          </div>
+          <div class="query-layer-stack">${renderPrimaryQueryCard()}</div>
+        </div>
+      </div>
+      <div class="search-toolbar-row search-toolbar-row-context">
+        <div class="search-context-line" id="search-context-note"></div>
+      </div>
+      <div class="search-toolbar-row search-toolbar-row-mini-meta">
+        <div class="toolbar-mini-meta">${esc(s("查询数据源", "Query datasources"))}: ${esc(String(selectedCount || "ALL"))}</div>
+        <div class="toolbar-mini-meta">${esc(s("服务目录", "Services"))}: ${esc(String(serviceCount || "ALL"))}</div>
+        <div class="toolbar-mini-meta">${esc(s("当前可见", "Visible"))}: ${esc(String(resultCount))}</div>
+        <div class="toolbar-mini-meta toolbar-mini-search-status ${runtimeStatus.tone}" id="search-live-status">${esc(s("查询状态", "Search"))}: ${esc(runtimeStatus.text)}</div>
+        <div class="toolbar-export-inline">
+          <button class="button button-small button-primary toolbar-export-inline-button" type="button" data-action="export-search-all" ${exportBusy || !resultCount ? "disabled" : ""}>${esc(s("全部下载", "Download All"))}</button>
+          <div class="toolbar-mini-meta toolbar-mini-export-status ${exportTone}">${esc(s("导出状态", "Export"))}: ${esc(exportBusy ? s("导出中", "Exporting") : exportStatusText)}</div>
+        </div>
+      </div>
+    `;
+  };
+
+  clearSearchFilters = window.clearSearchFilters = clearSearchFiltersNow;
+  runSearchWindow = window.runSearchWindow = async function (_pageOverride, options) {
+    return startSearch(options || {});
+  };
+  startStreamingSearch = window.startStreamingSearch = async function (options) {
+    return startSearch(options || {});
+  };
+  submitSearch = window.submitSearch = async function (event) {
+    consume(event);
+    return startSearch({ background: false });
+  };
+  syncSearchAutoRefresh = window.syncSearchAutoRefresh = function () {
     restartAutoTimer();
   };
 
+  if (isFn(window.fetchAllResultsForExport)) {
+    window.fetchAllResultsForExport = async function () {
+      const controller = ensureState();
+      if (!controller.activeJobID) {
+        return safeList(controller.rows);
+      }
+      const snapshot = await fetchAllResults(controller.activeJobID);
+      return safeList(snapshot.results);
+    };
+  }
+
   bindEvents();
-  normalizeInitialPageSizeState();
+  normalizePrimaryLayer();
   closeStream();
+  if (document.getElementById("search-toolbar-controls")) {
+    call(window.renderSearchControls);
+  }
   void restoreActiveJob().finally(() => {
     restartAutoTimer();
   });

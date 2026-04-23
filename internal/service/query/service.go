@@ -1726,11 +1726,10 @@ func normalizeSearchKeyword(raw string) string {
 	return trimmed
 }
 
-func buildLogsQL(datasource model.Datasource, snapshot model.DatasourceTagSnapshot, tags []model.TagDefinition, keyword string, serviceNames []string, tagFilters map[string][]string) string {
+func buildLogsQL(datasource model.Datasource, snapshot model.DatasourceTagSnapshot, tags []model.TagDefinition, keyword string, keywordMode string, serviceNames []string, tagFilters map[string][]string) string {
 	parts := make([]string, 0)
-	keyword = normalizeSearchKeyword(keyword)
-	if strings.TrimSpace(keyword) != "" {
-		parts = append(parts, quotePhrase(keyword))
+	if filter := buildKeywordLogsQL(keyword, keywordMode); filter != "" {
+		parts = append(parts, filter)
 	}
 
 	serviceField := firstNonEmpty(datasource.FieldMapping.ServiceField, snapshot.ServiceField)
@@ -1754,6 +1753,45 @@ func buildLogsQL(datasource model.Datasource, snapshot model.DatasourceTagSnapsh
 		return "*"
 	}
 	return strings.Join(parts, " ")
+}
+
+func buildKeywordLogsQL(raw string, mode string) string {
+	phrases := splitLogSQLKeywordPhrases(raw)
+	if len(phrases) == 0 {
+		return ""
+	}
+
+	quoted := make([]string, 0, len(phrases))
+	for _, phrase := range phrases {
+		quoted = append(quoted, quotePhrase(phrase))
+	}
+	if len(quoted) == 1 {
+		return quoted[0]
+	}
+	if strings.ToLower(strings.TrimSpace(mode)) == "or" {
+		return "(" + strings.Join(quoted, " OR ") + ")"
+	}
+	return "(" + strings.Join(quoted, " ") + ")"
+}
+
+func splitLogSQLKeywordPhrases(raw string) []string {
+	lines := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == '\n' || r == '\r'
+	})
+	filtered := make([]string, 0, len(lines))
+	seen := make(map[string]struct{}, len(lines))
+	for _, line := range lines {
+		trimmed := normalizeSearchKeyword(line)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		filtered = append(filtered, trimmed)
+	}
+	return filtered
 }
 
 func buildSourceLogsQL(datasource model.Datasource, snapshot model.DatasourceTagSnapshot, serviceName string) string {

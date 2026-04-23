@@ -63,13 +63,14 @@ type QueryJobCreateResponse struct {
 }
 
 type QueryJobEvent struct {
-	Type         string           `json:"type"`
-	JobID        string           `json:"job_id"`
-	Status       QueryJobStatus   `json:"status,omitempty"`
-	Sequence     int64            `json:"sequence,omitempty"`
-	RowCount     int64            `json:"row_count,omitempty"`
-	DatasourceID string           `json:"datasource_id,omitempty"`
-	Progress     QueryJobProgress `json:"progress,omitempty"`
-	LastError    string           `json:"error,omitempty"`
+	Type         string              `json:"type"`
+	JobID        string              `json:"job_id"`
+	Status       QueryJobStatus      `json:"status,omitempty"`
+	Sequence     int64               `json:"sequence,omitempty"`
+	RowCount     int64               `json:"row_count,omitempty"`
+	DatasourceID string              `json:"datasource_id,omitempty"`
+	Progress     QueryJobProgress    `json:"progress,omitempty"`
+	Sources      []QuerySourceStatus `json:"sources,omitempty"`
+	Rows         []SearchResult      `json:"rows,omitempty"`
+	LastError    string              `json:"error,omitempty"`
 }
-
