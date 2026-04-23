@@ -744,6 +744,22 @@ func (s *JobService) clearActiveRun(jobID string) {
 	}
 }
 
+func (s *JobService) updateSourceStateLocked(job *model.QueryJob, datasourceID string, mutate func(*model.QuerySourceState)) {
+	if job == nil || mutate == nil {
+		return
+	}
+
+	targetID := strings.TrimSpace(datasourceID)
+	for index := range job.SourceStates {
+		if strings.TrimSpace(job.SourceStates[index].DatasourceID) != targetID {
+			continue
+		}
+		mutate(&job.SourceStates[index])
+		recomputeJobSourceProgress(job)
+		return
+	}
+}
+
 func jobSourceStatuses(job model.QueryJob) []model.QuerySourceStatus {
 	out := make([]model.QuerySourceStatus, 0, len(job.SourceStates))
 	for _, state := range job.SourceStates {
