@@ -1761,17 +1761,16 @@ func buildKeywordLogsQL(raw string, mode string) string {
 		return ""
 	}
 
-	filters := make([]string, 0, len(phrases))
+	args := make([]string, 0, len(phrases))
 	for _, phrase := range phrases {
-		filters = append(filters, buildAnyFieldPhraseFilter(phrase))
+		args = append(args, quotePhrase(phrase))
 	}
-	if len(filters) == 1 {
-		return filters[0]
-	}
+
+	filterName := "contains_all"
 	if strings.ToLower(strings.TrimSpace(mode)) == "or" {
-		return "(" + strings.Join(filters, " OR ") + ")"
+		filterName = "contains_any"
 	}
-	return "(" + strings.Join(filters, " ") + ")"
+	return "*:" + filterName + "(" + strings.Join(args, ", ") + ")"
 }
 
 func splitLogSQLKeywordPhrases(raw string) []string {
@@ -1834,9 +1833,6 @@ func quotePhrase(value string) string {
 	return strconv.Quote(strings.TrimSpace(value))
 }
 
-func buildAnyFieldPhraseFilter(value string) string {
-	return "*:" + quotePhrase(value)
-}
 
 func normalizeRow(datasource model.Datasource, snapshot model.DatasourceTagSnapshot, tags []model.TagDefinition, row map[string]any) model.SearchResult {
 	timestampField := firstNonEmpty(datasource.FieldMapping.TimeField, snapshot.TimeField, "_time")

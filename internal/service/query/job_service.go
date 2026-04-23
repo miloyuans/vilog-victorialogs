@@ -294,7 +294,7 @@ func (s *JobService) run(ctx context.Context, jobID string, req model.SearchRequ
 		return
 	}
 
-	buckets, datasourceMeta, err := s.buildJobBuckets(storeCtx, datasources, req.ServiceNames)
+	buckets, datasourceMeta, err := s.buildJobBuckets(storeCtx, datasources, req.ServiceNames, start, end)
 	if err != nil {
 		s.failJob(storeCtx, jobID, err)
 		return
@@ -594,6 +594,9 @@ func (s *JobService) runBucket(
 		Offset: 0,
 	}, func(raw map[string]any) error {
 		row := compactSearchResult(normalizeRow(bucket.datasource, bucket.snapshot, tagDefinitions, raw))
+		if strings.TrimSpace(row.Service) == "" && strings.TrimSpace(bucket.serviceName) != "" {
+			row.Service = strings.TrimSpace(bucket.serviceName)
+		}
 		batch = append(batch, row)
 		if len(batch) >= defaultJobBatchRows {
 			return flush()
@@ -623,13 +626,13 @@ func (s *JobService) runBucket(
 	return ctx.Err()
 }
 
-func (s *JobService) buildJobBuckets(ctx context.Context, datasources []model.Datasource, requestedServices []string) ([]queryBucket, map[string]*datasourceRunMeta, error) {
+func (s *JobService) buildJobBuckets(ctx context.Context, datasources []model.Datasource, requestedServices []string, start, end time.Time) ([]queryBucket, map[string]*datasourceRunMeta, error) {
 	buckets := make([]queryBucket, 0, len(datasources))
 	meta := make(map[string]*datasourceRunMeta, len(datasources))
 
 	for _, datasource := range datasources {
 		snapshot, _ := s.search.store.GetSnapshot(ctx, datasource.ID)
-		serviceNames, _, err := s.resolveJobServiceTargets(ctx, datasource.ID, requestedServices)
+		serviceNames, _, err := s.resolveJobServiceTargets(ctx, datasource, snapshot, requestedServices, start, end)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -656,23 +659,76 @@ func (s *JobService) buildJobBuckets(ctx context.Context, datasources []model.Da
 	return buckets, meta, nil
 }
 
-func (s *JobService) resolveJobServiceTargets(ctx context.Context, datasourceID string, requested []string) ([]string, bool, error) {
+func (s *JobService) resolveJobServiceTargets(ctx context.Context, datasource model.Datasource, snapshot model.DatasourceTagSnapshot, requested []string, start, end time.Time) ([]string, bool, error) {
 	if items := uniqueStrings(requested); len(items) > 0 {
 		sort.Strings(items)
 		return items, false, nil
 	}
 
-	entries, err := s.search.store.ListServiceCatalog(ctx, datasourceID)
-	if err != nil {
-		return []string{""}, false, nil
+	entries, err := s.search.store.ListServiceCatalog(ctx, datasource.ID)
+	if err == nil {
+		items := uniqueServiceNames(entries)
+		if len(items) > 0 {
+			sort.Strings(items)
+			return items, true, nil
+		}
 	}
 
-	items := uniqueServiceNames(entries)
+	items, discoverErr := s.discoverJobServiceTargets(ctx, datasource, snapshot, start, end)
+	if discoverErr != nil {
+		return []string{""}, false, nil
+	}
 	if len(items) == 0 {
 		return []string{""}, false, nil
 	}
-	sort.Strings(items)
 	return items, true, nil
+}
+
+func (s *JobService) discoverJobServiceTargets(ctx context.Context, datasource model.Datasource, snapshot model.DatasourceTagSnapshot, start, end time.Time) ([]string, error) {
+	serviceField := strings.TrimSpace(firstNonEmpty(snapshot.ServiceField, datasource.FieldMapping.ServiceField, model.DefaultDatasourceFieldMapping().ServiceField))
+	if serviceField == "" {
+		return nil, nil
+	}
+
+	limit := s.search.cfg.SourceRequestLimit
+	switch {
+	case limit <= 0:
+		limit = 2000
+	case limit > 2000:
+		limit = 2000
+	}
+
+	req := victorialogs.FieldValuesRequest{
+		Query:       "*",
+		Field:       serviceField,
+		Start:       start,
+		End:         end,
+		Limit:       limit,
+		IgnorePipes: true,
+	}
+
+	values, err := s.search.client.StreamFieldValues(ctx, datasource, req)
+	if err != nil {
+		values, err = s.search.client.FieldValues(ctx, datasource, req)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	services := make([]string, 0, len(values))
+	for _, item := range values {
+		if trimmed := strings.TrimSpace(item.Value); trimmed != "" {
+			services = append(services, trimmed)
+		}
+	}
+	services = uniqueStrings(services)
+	sort.Strings(services)
+
+	if len(services) > 0 && s.search.cache != nil {
+		_ = s.search.store.ReplaceServiceCatalog(ctx, datasource.ID, serviceField, services, s.search.cache.ServiceListTTL())
+	}
+
+	return services, nil
 }
 
 func (s *JobService) failJob(ctx context.Context, jobID string, err error) {

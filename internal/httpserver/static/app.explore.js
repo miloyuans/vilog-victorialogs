@@ -62,6 +62,7 @@
     state.search.exploreController = state.search.exploreController || {
       activeJobID: "",
       runID: 0,
+      starting: false,
       loading: false,
       completed: true,
       partial: false,
@@ -656,7 +657,7 @@
 
   function isJobActive() {
     const controller = ensureState();
-    return !!controller.activeJobID && !controller.completed;
+    return !!controller.starting || (!!controller.activeJobID && !controller.completed);
   }
 
   async function startSearch(options) {
@@ -674,6 +675,7 @@
         call(window.toast, message, "error");
       }
       setRuntime("error", message);
+      restartAutoTimer();
       return false;
     }
 
@@ -681,6 +683,7 @@
       if (!background) {
         call(window.toast, "Select at least one datasource before running a query.", "error");
       }
+      restartAutoTimer();
       return false;
     }
 
@@ -690,6 +693,7 @@
 
     controller.runID = runID;
     controller.activeJobID = "";
+    controller.starting = true;
     controller.loading = true;
     controller.completed = false;
     controller.partial = false;
@@ -721,10 +725,15 @@
         throw new Error("The query job could not be created.");
       }
       if (controller.runID !== runID) {
+        controller.starting = false;
+        if (!background) {
+          setLoading(false);
+        }
         return false;
       }
 
       controller.activeJobID = String(created.job_id);
+      controller.starting = false;
       writeStorage(JOB_STORAGE_KEY, controller.activeJobID);
 
       if (state.search.job) {
@@ -735,6 +744,9 @@
       }
 
       openStream(controller.activeJobID, runID);
+      if (!background) {
+        setLoading(false);
+      }
       return true;
     } catch (error) {
       if (controller.runID === runID) {
@@ -742,6 +754,7 @@
         controller.completed = false;
         controller.partial = false;
         controller.activeJobID = "";
+        controller.starting = false;
         controller.rows = [];
         controller.sources = [];
         writeStorage(JOB_STORAGE_KEY, "");
@@ -750,13 +763,9 @@
         if (!background) {
           call(window.toast, message, "error");
         }
+        restartAutoTimer();
       }
       return false;
-    } finally {
-      if (!background) {
-        setLoading(false);
-      }
-      restartAutoTimer();
     }
   }
 
@@ -770,6 +779,7 @@
     const runID = ++runSequence;
     controller.runID = runID;
     controller.activeJobID = restoredJobID;
+    controller.starting = false;
     controller.loading = true;
     controller.completed = false;
     controller.partial = false;
@@ -806,6 +816,7 @@
       closeStream();
       writeStorage(JOB_STORAGE_KEY, "");
       controller.activeJobID = "";
+      controller.starting = false;
       controller.loading = false;
       controller.completed = true;
       controller.partial = false;
@@ -880,6 +891,7 @@
 
     const controller = ensureState();
     controller.activeJobID = "";
+    controller.starting = false;
     controller.loading = false;
     controller.completed = true;
     controller.partial = false;
