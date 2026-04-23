@@ -338,28 +338,8 @@
     return { info, payload: buildJobPayload(info.value) };
   }
 
-  function searchResultKey(item) {
-    const row = safeMap(item);
-    return [
-      row.timestamp || "",
-      row.datasource || "",
-      row.service || "",
-      row.pod || "",
-      row.message || "",
-    ].join("\u0000");
-  }
-
   function mergeRows(current, incoming) {
-    const seen = new Set();
-    const merged = [];
-    safeList(current).concat(safeList(incoming)).forEach((item) => {
-      const key = searchResultKey(item);
-      if (seen.has(key)) {
-        return;
-      }
-      seen.add(key);
-      merged.push(item);
-    });
+    const merged = safeList(current).concat(safeList(incoming));
     merged.sort((left, right) => {
       const leftTimestamp = String(left && left.timestamp || "");
       const rightTimestamp = String(right && right.timestamp || "");
@@ -410,15 +390,57 @@
     });
   }
 
+  function normalizeDatasourceKey(value) {
+    return String(value || "-").trim() || "-";
+  }
+
+  function mergeVisibleSourceHits(results, sources) {
+    const visibleHits = new Map();
+    safeList(results).forEach((item) => {
+      const key = normalizeDatasourceKey(item && item.datasource);
+      visibleHits.set(key, (visibleHits.get(key) || 0) + 1);
+    });
+
+    const merged = [];
+    const seen = new Set();
+    safeList(sources).forEach((item) => {
+      const source = safeMap(item);
+      const key = normalizeDatasourceKey(source.datasource);
+      seen.add(key);
+      merged.push({
+        datasource: key,
+        status: String(source.status || "pending"),
+        hits: Number(visibleHits.get(key) || 0),
+        error: String(source.error || ""),
+      });
+      visibleHits.delete(key);
+    });
+
+    visibleHits.forEach((hits, key) => {
+      if (seen.has(key)) {
+        return;
+      }
+      merged.push({
+        datasource: key,
+        status: "completed",
+        hits: Number(hits || 0),
+        error: "",
+      });
+    });
+
+    return merged;
+  }
+
   function buildResponse(results, sources) {
     const controller = ensureState();
     const payload = safeMap(controller.lastPayload);
+    const visibleResults = safeList(results);
     return {
       keyword: String(payload.keyword || ""),
       start: String(payload.start || ""),
       end: String(payload.end || ""),
-      results: safeList(results),
-      total: safeList(results).length,
+      results: visibleResults,
+      total: visibleResults.length,
       page: 1,
       page_size: Number(payload.page_size || state.search.pageSize || DEFAULT_PAGE_SIZE),
       has_more: false,
@@ -426,7 +448,7 @@
       partial: !controller.completed || controller.partial,
       cache_hit: false,
       took_ms: 0,
-      sources: safeList(sources),
+      sources: mergeVisibleSourceHits(visibleResults, sources),
     };
   }
 
