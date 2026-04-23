@@ -1728,7 +1728,8 @@ func normalizeSearchKeyword(raw string) string {
 
 func buildLogsQL(datasource model.Datasource, snapshot model.DatasourceTagSnapshot, tags []model.TagDefinition, keyword string, keywordMode string, serviceNames []string, tagFilters map[string][]string) string {
 	parts := make([]string, 0)
-	if filter := buildKeywordLogsQL(keyword, keywordMode); filter != "" {
+	messageField := firstNonEmpty(datasource.FieldMapping.MessageField, snapshot.MessageField, model.DefaultDatasourceFieldMapping().MessageField)
+	if filter := buildKeywordLogsQL(keyword, keywordMode, messageField); filter != "" {
 		parts = append(parts, filter)
 	}
 
@@ -1755,22 +1756,23 @@ func buildLogsQL(datasource model.Datasource, snapshot model.DatasourceTagSnapsh
 	return strings.Join(parts, " ")
 }
 
-func buildKeywordLogsQL(raw string, mode string) string {
+func buildKeywordLogsQL(raw string, mode string, messageField string) string {
 	phrases := splitLogSQLKeywordPhrases(raw)
 	if len(phrases) == 0 {
 		return ""
 	}
 
-	args := make([]string, 0, len(phrases))
+	filters := make([]string, 0, len(phrases))
 	for _, phrase := range phrases {
-		args = append(args, quotePhrase(phrase))
+		filters = append(filters, buildMessageSubstringFilter(messageField, phrase))
 	}
-
-	filterName := "contains_all"
 	if strings.ToLower(strings.TrimSpace(mode)) == "or" {
-		filterName = "contains_any"
+		return "(" + strings.Join(filters, " OR ") + ")"
 	}
-	return "*:" + filterName + "(" + strings.Join(args, ", ") + ")"
+	if len(filters) == 1 {
+		return filters[0]
+	}
+	return "(" + strings.Join(filters, " AND ") + ")"
 }
 
 func splitLogSQLKeywordPhrases(raw string) []string {
@@ -1831,6 +1833,14 @@ func buildExactFieldFilter(field string, values []string) string {
 
 func quotePhrase(value string) string {
 	return strconv.Quote(strings.TrimSpace(value))
+}
+
+func buildMessageSubstringFilter(field string, value string) string {
+	field = strings.TrimSpace(field)
+	if field == "" {
+		field = model.DefaultDatasourceFieldMapping().MessageField
+	}
+	return field + ":*" + quotePhrase(value) + "*"
 }
 
 
