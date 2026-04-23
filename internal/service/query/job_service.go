@@ -124,7 +124,7 @@ func (s *JobService) Create(ctx context.Context, req model.SearchRequest) (model
 	if err := s.search.store.CreateQueryJob(ctx, job); err != nil {
 		return model.QueryJobCreateResponse{}, err
 	}
-	s.initPreviewState(job.ID, 0)
+	s.initPreviewState(job.ID, normalized.PageSize)
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	if previous := s.replaceActiveRun(job.ID, cancel); previous != nil {
@@ -137,7 +137,7 @@ func (s *JobService) Create(ctx context.Context, req model.SearchRequest) (model
 		zap.Int("service_count", len(normalized.ServiceNames)),
 		zap.Time("start", start),
 		zap.Time("end", end),
-		zap.Int("chunk_size", clampJobResultsPageSize(normalized.PageSize)),
+		zap.Int("per_bucket_limit", clampJobResultsPageSize(normalized.PageSize)),
 	)
 
 	go s.run(runCtx, job.ID, normalized, start, end, datasources)
@@ -575,7 +575,7 @@ func (s *JobService) runBucket(
 		serviceFilter,
 		req.Tags,
 	)
-	chunkSize := clampJobResultsPageSize(req.PageSize)
+	perBucketLimit := clampJobResultsPageSize(req.PageSize)
 
 	batch := make([]model.SearchResult, 0, defaultJobBatchRows)
 	flush := func() error {
@@ -587,50 +587,42 @@ func (s *JobService) runBucket(
 		return recordBatch(bucket.datasource, rows)
 	}
 
-	for offset := 0; ; {
-		pageRows := 0
-		err := s.search.client.QueryStream(ctx, bucket.datasource, victorialogs.QueryChunkRequest{
-			Query:  logsql,
-			Start:  start,
-			End:    end,
-			Limit:  chunkSize,
-			Offset: offset,
-		}, func(raw map[string]any) error {
-			row := compactSearchResult(normalizeRow(bucket.datasource, bucket.snapshot, tagDefinitions, raw))
-			if strings.TrimSpace(row.Service) == "" && strings.TrimSpace(bucket.serviceName) != "" {
-				row.Service = strings.TrimSpace(bucket.serviceName)
-			}
-			pageRows++
-			batch = append(batch, row)
-			if len(batch) >= defaultJobBatchRows {
-				return flush()
-			}
-			return nil
-		})
-		if err != nil {
-			if flushErr := flush(); flushErr != nil && !errors.Is(flushErr, context.Canceled) {
-				s.logger.Warn("flush query batch after stream failure failed",
-					zap.String("job_id", jobID),
-					zap.String("datasource", bucket.datasource.Name),
-					zap.String("service", bucket.serviceName),
-					zap.Error(flushErr),
-				)
-			}
-			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
-				return context.Canceled
-			}
-			return err
+	err := s.search.client.QueryStream(ctx, bucket.datasource, victorialogs.QueryChunkRequest{
+		Query:  logsql,
+		Start:  start,
+		End:    end,
+		Limit:  perBucketLimit,
+		Offset: 0,
+	}, func(raw map[string]any) error {
+		row := compactSearchResult(normalizeRow(bucket.datasource, bucket.snapshot, tagDefinitions, raw))
+		if strings.TrimSpace(row.Service) == "" && strings.TrimSpace(bucket.serviceName) != "" {
+			row.Service = strings.TrimSpace(bucket.serviceName)
 		}
-		if err := flush(); err != nil {
-			if errors.Is(err, context.Canceled) {
-				return context.Canceled
-			}
-			return err
+		batch = append(batch, row)
+		if len(batch) >= defaultJobBatchRows {
+			return flush()
 		}
-		if pageRows < chunkSize {
-			break
+		return nil
+	})
+	if err != nil {
+		if flushErr := flush(); flushErr != nil && !errors.Is(flushErr, context.Canceled) {
+			s.logger.Warn("flush query batch after stream failure failed",
+				zap.String("job_id", jobID),
+				zap.String("datasource", bucket.datasource.Name),
+				zap.String("service", bucket.serviceName),
+				zap.Error(flushErr),
+			)
 		}
-		offset += pageRows
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			return context.Canceled
+		}
+		return err
+	}
+	if err := flush(); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return context.Canceled
+		}
+		return err
 	}
 	return ctx.Err()
 }
@@ -909,10 +901,10 @@ func (s *JobService) initPreviewState(jobID string, perBucketLimit int) {
 	if strings.TrimSpace(jobID) == "" {
 		return
 	}
-	initialCapacity := defaultJobResultsPageSize
-	if perBucketLimit > 0 && perBucketLimit > initialCapacity {
-		initialCapacity = perBucketLimit
+	if perBucketLimit <= 0 {
+		perBucketLimit = defaultJobResultsPageSize
 	}
+	initialCapacity := perBucketLimit
 	s.previewMu.Lock()
 	s.previews[jobID] = &jobPreviewState{
 		perBucketLimit: perBucketLimit,
@@ -949,7 +941,7 @@ func (s *JobService) appendPreviewRows(jobID string, rows []model.SearchResult) 
 	defer state.mu.Unlock()
 	for _, row := range rows {
 		key := bucketPreviewKey(row)
-		if state.perBucketLimit > 0 && state.bucketCounts[key] >= state.perBucketLimit {
+		if state.bucketCounts[key] >= state.perBucketLimit {
 			continue
 		}
 		state.bucketCounts[key]++

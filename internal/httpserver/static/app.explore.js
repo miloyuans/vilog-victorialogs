@@ -1233,7 +1233,7 @@
     node.textContent =
       `Datasources: ${datasourceCount} / Catalog: ${(catalog && catalog.name) || "ALL"} / ` +
       `Services: ${serviceCount || "ALL"} / Tag filters: ${filters} / ` +
-      `Fetch chunk: ${Number(state.search.pageSize || DEFAULT_PAGE_SIZE)}`;
+      `Per-service limit: ${Number(state.search.pageSize || DEFAULT_PAGE_SIZE)}`;
   };
 
   function renderPrimaryQueryCard() {
