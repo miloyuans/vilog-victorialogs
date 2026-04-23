@@ -63,6 +63,9 @@
       activeJobID: "",
       runID: 0,
       starting: false,
+      syncingSnapshot: false,
+      snapshotJobID: "",
+      snapshotToken: 0,
       loading: false,
       completed: true,
       partial: false,
@@ -394,41 +397,16 @@
     return String(value || "-").trim() || "-";
   }
 
-  function mergeVisibleSourceHits(results, sources) {
-    const visibleHits = new Map();
-    safeList(results).forEach((item) => {
-      const key = normalizeDatasourceKey(item && item.datasource);
-      visibleHits.set(key, (visibleHits.get(key) || 0) + 1);
-    });
-
-    const merged = [];
-    const seen = new Set();
-    safeList(sources).forEach((item) => {
+  function normalizeSourceStatuses(sources) {
+    return safeList(sources).map((item) => {
       const source = safeMap(item);
-      const key = normalizeDatasourceKey(source.datasource);
-      seen.add(key);
-      merged.push({
-        datasource: key,
+      return {
+        datasource: normalizeDatasourceKey(source.datasource),
         status: String(source.status || "pending"),
-        hits: Number(visibleHits.get(key) || 0),
+        hits: Number(source.hits || 0),
         error: String(source.error || ""),
-      });
-      visibleHits.delete(key);
+      };
     });
-
-    visibleHits.forEach((hits, key) => {
-      if (seen.has(key)) {
-        return;
-      }
-      merged.push({
-        datasource: key,
-        status: "completed",
-        hits: Number(hits || 0),
-        error: "",
-      });
-    });
-
-    return merged;
   }
 
   function buildResponse(results, sources) {
@@ -448,7 +426,7 @@
       partial: !controller.completed || controller.partial,
       cache_hit: false,
       took_ms: 0,
-      sources: mergeVisibleSourceHits(visibleResults, sources),
+      sources: normalizeSourceStatuses(sources),
     };
   }
 
@@ -485,6 +463,31 @@
     }).length;
   }
 
+  function cancelSnapshotSync(controller) {
+    const target = controller || ensureState();
+    target.syncingSnapshot = false;
+    target.snapshotJobID = "";
+    target.snapshotToken = Number(target.snapshotToken || 0) + 1;
+  }
+
+  function beginSnapshotSync(jobID, runID) {
+    const controller = ensureState();
+    controller.syncingSnapshot = true;
+    controller.snapshotJobID = String(jobID || "");
+    controller.snapshotToken = Number(controller.snapshotToken || 0) + 1;
+    return controller.snapshotToken;
+  }
+
+  function isSnapshotCurrent(jobID, runID, snapshotToken) {
+    const controller = ensureState();
+    return !!jobID &&
+      controller.runID === runID &&
+      controller.activeJobID === String(jobID || "") &&
+      controller.syncingSnapshot &&
+      controller.snapshotJobID === String(jobID || "") &&
+      controller.snapshotToken === snapshotToken;
+  }
+
   function syncRuntime(status, lastError) {
     const controller = ensureState();
     const loaded = safeList(controller.rows).length;
@@ -494,6 +497,14 @@
     }
     if (status === "cancelled") {
       setRuntime("partial", "Previous query was cancelled.");
+      return;
+    }
+    if (controller.syncingSnapshot && isTerminalStatus(status)) {
+      if (loaded > 0) {
+        setRuntime("partial", `Query finished. Finalizing ${loaded} rows from the completed snapshot.`);
+      } else {
+        setRuntime("loading", "Query finished. Synchronizing the final snapshot.");
+      }
       return;
     }
     if (!isTerminalStatus(status)) {
@@ -515,16 +526,22 @@
     return safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(jobID)}`));
   }
 
-  async function fetchAllResults(jobID) {
+  async function fetchAllResults(jobID, runID, snapshotToken) {
     let cursor = "";
     let results = [];
     let lastPage = null;
     for (;;) {
+      if (Number.isFinite(runID) && Number.isFinite(snapshotToken) && !isSnapshotCurrent(jobID, runID, snapshotToken)) {
+        return { results: [], lastPage: null, aborted: true };
+      }
       const params = new URLSearchParams({ page_size: String(SNAPSHOT_PAGE_SIZE) });
       if (cursor) {
         params.set("cursor", cursor);
       }
       const page = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(jobID)}/results/all?${params.toString()}`));
+      if (Number.isFinite(runID) && Number.isFinite(snapshotToken) && !isSnapshotCurrent(jobID, runID, snapshotToken)) {
+        return { results: [], lastPage: null, aborted: true };
+      }
       lastPage = page;
       results = mergeRows(results, safeList(page.results));
       if (!(page.has_more && page.next_cursor)) {
@@ -532,45 +549,93 @@
       }
       cursor = String(page.next_cursor || "");
     }
-    return { results, lastPage: safeMap(lastPage) };
+    return { results, lastPage: safeMap(lastPage), aborted: false };
   }
 
   async function syncSnapshot(jobID, runID) {
     const controller = ensureState();
-    const job = await fetchJob(jobID);
-    if (!job.id || controller.runID !== runID || controller.activeJobID !== jobID) {
+    if (!jobID || controller.runID !== runID || controller.activeJobID !== jobID) {
       return false;
     }
-
-    const snapshot = await fetchAllResults(jobID);
-    if (controller.runID !== runID || controller.activeJobID !== jobID) {
+    if (controller.syncingSnapshot && controller.snapshotJobID === String(jobID || "")) {
       return false;
     }
+    const snapshotToken = beginSnapshotSync(jobID, runID);
+    try {
+      const job = await fetchJob(jobID);
+      if (!job.id || !isSnapshotCurrent(jobID, runID, snapshotToken)) {
+        return false;
+      }
 
-    controller.lastPayload = safeMap(controller.lastPayload && Object.keys(controller.lastPayload).length ? controller.lastPayload : job.request);
-    controller.rows = mergeRows([], snapshot.results);
-    controller.sources = mapSources(job, snapshot.lastPage);
-    controller.loading = !isTerminalStatus(job.status);
-    controller.completed = isTerminalStatus(job.status);
-    controller.partial = String(job.status || "") === "partial" || String(job.status || "") === "failed";
+      controller.lastPayload = safeMap(controller.lastPayload && Object.keys(controller.lastPayload).length ? controller.lastPayload : job.request);
+      controller.sources = mapSources(job, null);
+      controller.loading = !isTerminalStatus(job.status);
+      controller.completed = isTerminalStatus(job.status);
+      controller.partial = String(job.status || "") === "partial" || String(job.status || "") === "failed";
 
-    if (state.search.job) {
-      state.search.job.id = jobID;
-      state.search.job.loading = controller.loading;
-      state.search.job.completed = controller.completed;
-      state.search.job.partial = controller.partial;
-      state.search.job.cursor = "";
+      if (state.search.job) {
+        state.search.job.id = jobID;
+        state.search.job.loading = controller.loading;
+        state.search.job.completed = controller.completed;
+        state.search.job.partial = controller.partial;
+        state.search.job.cursor = "";
+      }
+
+      if (controller.rows.length) {
+        commitVisibleResponse(controller.rows, controller.sources, { preserveSelection: true });
+      } else {
+        commitPendingResponse(controller.lastPayload, controller.sources.length ? controller.sources : pendingSources(controller.lastPayload));
+      }
+      syncRuntime(String(job.status || ""), job.last_error || "");
+
+      const snapshot = await fetchAllResults(jobID, runID, snapshotToken);
+      if (snapshot.aborted || !isSnapshotCurrent(jobID, runID, snapshotToken)) {
+        return false;
+      }
+
+      controller.lastPayload = safeMap(controller.lastPayload && Object.keys(controller.lastPayload).length ? controller.lastPayload : job.request);
+      controller.rows = mergeRows([], snapshot.results);
+      controller.sources = mapSources(job, snapshot.lastPage);
+      controller.loading = !isTerminalStatus(job.status);
+      controller.completed = isTerminalStatus(job.status);
+      controller.partial = String(job.status || "") === "partial" || String(job.status || "") === "failed";
+
+      if (state.search.job) {
+        state.search.job.id = jobID;
+        state.search.job.loading = controller.loading;
+        state.search.job.completed = controller.completed;
+        state.search.job.partial = controller.partial;
+        state.search.job.cursor = "";
+      }
+
+      commitVisibleResponse(controller.rows, controller.sources, { preserveSelection: true });
+      syncRuntime(String(job.status || ""), job.last_error || "");
+
+      if (controller.completed) {
+        closeStream();
+        writeStorage(JOB_STORAGE_KEY, "");
+      }
+      return true;
+    } catch (error) {
+      if (isSnapshotCurrent(jobID, runID, snapshotToken)) {
+        const message = error && error.message ? error.message : "Snapshot synchronization failed.";
+        if (controller.rows.length) {
+          setRuntime("partial", `${message} Keeping streamed rows on screen.`);
+        } else {
+          setRuntime("error", message);
+        }
+      }
+      return false;
+    } finally {
+      if (isSnapshotCurrent(jobID, runID, snapshotToken)) {
+        const shouldRestartAuto = !!controller.completed;
+        controller.syncingSnapshot = false;
+        controller.snapshotJobID = "";
+        if (shouldRestartAuto) {
+          restartAutoTimer();
+        }
+      }
     }
-
-    commitVisibleResponse(controller.rows, controller.sources, { preserveSelection: true });
-    syncRuntime(String(job.status || ""), job.last_error || "");
-
-    if (controller.completed) {
-      closeStream();
-      writeStorage(JOB_STORAGE_KEY, "");
-      restartAutoTimer();
-    }
-    return true;
   }
 
   function applyEventPayload(payload) {
@@ -616,6 +681,12 @@
       return;
     }
     applyEventPayload(payload);
+    if (controller.rows.length) {
+      commitVisibleResponse(controller.rows, controller.sources, { preserveSelection: true });
+    } else {
+      commitPendingResponse(controller.lastPayload, controller.sources.length ? controller.sources : pendingSources(controller.lastPayload));
+    }
+    syncRuntime(String(payload.status || ""), payload.error || "");
     await syncSnapshot(controller.activeJobID, runID);
   }
 
@@ -668,18 +739,15 @@
     });
     source.onerror = function () {
       const active = ensureState();
-      if (active.runID === runID && !active.completed) {
-        setRuntime("partial", "Query stream reconnecting. Syncing current snapshot.");
-        void syncSnapshot(jobID, runID);
+      if (active.runID === runID && !active.completed && !active.syncingSnapshot) {
+        setRuntime("partial", "Query stream reconnecting. Waiting for the live stream to recover.");
       }
     };
-
-    void syncSnapshot(jobID, runID);
   }
 
   function isJobActive() {
     const controller = ensureState();
-    return !!controller.starting || (!!controller.activeJobID && !controller.completed);
+    return !!controller.starting || !!controller.syncingSnapshot || (!!controller.activeJobID && !controller.completed);
   }
 
   async function startSearch(options) {
@@ -712,6 +780,7 @@
     writeStorage(JOB_STORAGE_KEY, "");
     const runID = ++runSequence;
     closeStream();
+    cancelSnapshotSync(controller);
 
     controller.runID = runID;
     controller.activeJobID = "";
@@ -799,6 +868,7 @@
 
     const controller = ensureState();
     const runID = ++runSequence;
+    cancelSnapshotSync(controller);
     controller.runID = runID;
     controller.activeJobID = restoredJobID;
     controller.starting = false;
@@ -912,6 +982,7 @@
     writeStorage(JOB_STORAGE_KEY, "");
 
     const controller = ensureState();
+    cancelSnapshotSync(controller);
     controller.activeJobID = "";
     controller.starting = false;
     controller.loading = false;
