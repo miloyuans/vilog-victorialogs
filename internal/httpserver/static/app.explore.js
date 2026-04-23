@@ -1045,6 +1045,7 @@
     }
 
     state.search.response = null;
+    state.search.selectedDatasourceView = "";
     call(window.renderSearchResults);
     setRuntime("idle", "");
     restartAutoTimer();
@@ -1209,7 +1210,11 @@
   };
 
   getVisibleResults = window.getVisibleResults = function () {
-    const items = isFn(window.getDecoratedResults) ? window.getDecoratedResults() : [];
+    const items = isFn(window.getDatasourceDecoratedResults)
+      ? window.getDatasourceDecoratedResults()
+      : isFn(window.getDecoratedResults)
+        ? window.getDecoratedResults()
+        : [];
     return state.search.levelFilter === "all"
       ? items
       : items.filter((item) => item._level === state.search.levelFilter);
@@ -1228,7 +1233,7 @@
     node.textContent =
       `Datasources: ${datasourceCount} / Catalog: ${(catalog && catalog.name) || "ALL"} / ` +
       `Services: ${serviceCount || "ALL"} / Tag filters: ${filters} / ` +
-      `Per-service limit: ${Number(state.search.pageSize || DEFAULT_PAGE_SIZE)}`;
+      `Fetch chunk: ${Number(state.search.pageSize || DEFAULT_PAGE_SIZE)}`;
   };
 
   function renderPrimaryQueryCard() {

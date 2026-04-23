@@ -3073,6 +3073,9 @@ highlight = function (text) {
     response.sources = safeArray(response.sources);
     response.total = Math.max(Number(response.total || 0), response.results.length);
     state.search.response = response;
+    if (!(options && options.preserveSelection)) {
+      state.search.selectedDatasourceView = "";
+    }
     state.search.levelFilter = state.search.levelFilter || "all";
     state.search.exportStatusTone = "idle";
     state.search.exportStatusText = s("\u5c31\u7eea", "Ready");

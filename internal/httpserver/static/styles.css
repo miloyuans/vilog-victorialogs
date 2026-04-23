@@ -985,6 +985,25 @@ kbd {
   gap: 10px;
 }
 
+.source-card-button {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
+}
+
+.source-card-button:hover:not(:disabled),
+.source-card-button.active {
+  border-color: rgba(87, 148, 242, 0.32);
+  background: linear-gradient(180deg, rgba(87, 148, 242, 0.12), rgba(255, 255, 255, 0.02));
+  box-shadow: 0 10px 22px rgba(87, 148, 242, 0.12);
+}
+
+.source-card-button:disabled {
+  cursor: not-allowed;
+  opacity: .72;
+}
+
 .logs-toolbar {
   display: flex;
   flex-wrap: wrap;

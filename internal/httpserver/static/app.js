@@ -57,6 +57,7 @@ const state = {
     tagValues: {},
     activeFilters: {},
     response: null,
+    selectedDatasourceView: "",
     selectedResultKey: "",
     view: localStorage.getItem(storageKeys.view) || "table",
     wrap: localStorage.getItem(storageKeys.wrap) !== "false",
@@ -450,6 +451,7 @@ function renderSearchMarkup() {
                 </div>
                 <div class="chip-row" id="search-level-filters"></div>
               </div>
+              <div class="tiny" id="search-results-scope"></div>
               <div id="search-results-body"></div>
             </div>
           </div>
@@ -835,6 +837,13 @@ function handleClick(event) {
     return renderSearchInspector();
   }
 
+  const resultDatasource = button.getAttribute("data-select-result-datasource");
+  if (resultDatasource != null) {
+    state.search.selectedDatasourceView = resultDatasource;
+    state.search.selectedResultKey = "";
+    return renderSearchResults();
+  }
+
   const addTag = button.getAttribute("data-add-tag");
   if (addTag) return addSearchTag(addTag);
 
@@ -1064,10 +1073,12 @@ function renderSearchCatalogs() {
 }
 
 function renderSearchResults() {
+  ensureSelectedDatasourceView();
   renderSearchSummary();
   renderSearchHistogramPanel();
   renderSearchSources();
   renderSearchLevelFilters();
+  renderSearchResultsScope();
   renderSearchResultsBody();
   renderSearchInspector();
   const wrapButton = byId("search-wrap-toggle");
@@ -1103,14 +1114,74 @@ function renderSearchHistogramPanel() {
 
 function renderSearchSources() {
   const items = (state.search.response && state.search.response.sources) || [];
+  const selectedDatasource = ensureSelectedDatasourceView();
   byId("search-source-grid").innerHTML = items.length
-    ? items.map((item) => `<div class="source-card"><div class="section-head"><div><h4 class="card-title">${esc(item.datasource || "-")}</h4><div class="tiny">${esc(item.error || s("无错误信息", "No error message"))}</div></div>${pill(localizeStatus(item.status).label, localizeStatus(item.status).tone)}</div><div class="chip-row">${pill(`${s("命中", "Hits")}: ${item.hits || 0}`, "tone-soft")}</div></div>`).join("")
+    ? items.map((item) => {
+      const datasource = String(item && item.datasource || "").trim();
+      const active = datasource && datasource === selectedDatasource;
+      const actionHint = datasource ? s("点击查看该数据源结果", "Click to inspect this datasource") : s("无可用数据源标识", "No datasource identifier");
+      return `<button class="source-card source-card-button ${active ? "active" : ""}" type="button" data-select-result-datasource="${esc(datasource)}" ${datasource ? "" : "disabled"}><div class="section-head"><div><h4 class="card-title">${esc(item.datasource || "-")}</h4><div class="tiny">${esc(item.error || s("无错误信息", "No error message"))}</div></div>${pill(localizeStatus(item.status).label, localizeStatus(item.status).tone)}</div><div class="chip-row">${pill(`${s("命中", "Hits")}: ${item.hits || 0}`, "tone-soft")}</div><div class="tiny">${esc(actionHint)}</div></button>`;
+    }).join("")
     : empty(s("查询后这里会展示各数据源状态。", "Per-source states appear after a query."));
 }
 
+function listSearchResultDatasources() {
+  const fromSources = ((state.search.response && state.search.response.sources) || [])
+    .map((item) => String(item && item.datasource || "").trim())
+    .filter(Boolean);
+  const sourceOrder = Array.from(new Set(fromSources));
+  if (sourceOrder.length) return sourceOrder;
+  const fromResults = getDecoratedResults()
+    .map((item) => String(item && item.datasource || "").trim())
+    .filter(Boolean);
+  return Array.from(new Set(fromResults));
+}
+
+function ensureSelectedDatasourceView() {
+  const datasources = listSearchResultDatasources();
+  if (!datasources.length) {
+    state.search.selectedDatasourceView = "";
+    return "";
+  }
+  const current = String(state.search.selectedDatasourceView || "").trim();
+  if (current && datasources.indexOf(current) >= 0) {
+    return current;
+  }
+  state.search.selectedDatasourceView = datasources[0];
+  return state.search.selectedDatasourceView;
+}
+
+function getDatasourceDecoratedResults() {
+  const all = getDecoratedResults();
+  const datasource = ensureSelectedDatasourceView();
+  if (!datasource) return all;
+  return all.filter((item) => String(item && item.datasource || "").trim() === datasource);
+}
+
+function renderSearchResultsScope() {
+  const node = byId("search-results-scope");
+  if (!node) return;
+  if (!state.search.response) {
+    node.textContent = "";
+    return;
+  }
+  const datasource = ensureSelectedDatasourceView();
+  const items = getDatasourceDecoratedResults();
+  const totalDatasources = listSearchResultDatasources().length;
+  if (!datasource) {
+    node.textContent = s("当前无可切换的数据源结果。", "No datasource result scope is available.");
+    return;
+  }
+  node.textContent = s(
+    `当前结果窗口正在查看 ${datasource}，共 ${items.length} 条日志，可切换 ${totalDatasources} 个数据源。`,
+    `Result window is showing ${datasource} with ${items.length} rows across ${totalDatasources} datasource views.`,
+  );
+}
+
 function renderSearchLevelFilters() {
-  const counts = countLevels(getDecoratedResults());
-  const buttons = [`<button class="chip-button ${state.search.levelFilter === "all" ? "active" : ""}" type="button" data-level-filter="all">${esc(s("全部级别", "All Levels"))} · ${esc(String(getDecoratedResults().length))}</button>`];
+  const scoped = getDatasourceDecoratedResults();
+  const counts = countLevels(scoped);
+  const buttons = [`<button class="chip-button ${state.search.levelFilter === "all" ? "active" : ""}" type="button" data-level-filter="all">${esc(s("全部级别", "All Levels"))} · ${esc(String(scoped.length))}</button>`];
   Object.keys(counts).forEach((level) => {
     buttons.push(`<button class="chip-button ${state.search.levelFilter === level ? "active" : ""}" type="button" data-level-filter="${esc(level)}">${esc(level.toUpperCase())} · ${esc(String(counts[level]))}</button>`);
   });
@@ -1123,7 +1194,14 @@ function renderSearchResultsBody() {
   const results = getVisibleResults();
   ensureSelectedResult(results);
   if (!results.length) return void (node.innerHTML = empty(s("当前条件下没有日志结果。", "No logs matched the current query.")));
-  if (state.search.view === "json") return void (node.innerHTML = `<div class="raw-view"><pre>${esc(JSON.stringify(state.search.response, null, 2))}</pre></div>`);
+  if (state.search.view === "json") {
+    const datasource = ensureSelectedDatasourceView();
+    return void (node.innerHTML = `<div class="raw-view"><pre>${esc(JSON.stringify({
+      datasource,
+      total_datasources: listSearchResultDatasources().length,
+      visible_results: results,
+    }, null, 2))}</pre></div>`);
+  }
   if (state.search.view === "table") {
     node.innerHTML = `<div class="table-wrap"><table><thead><tr><th>${esc(s("时间", "Timestamp"))}</th><th>${esc(s("数据源", "Datasource"))}</th><th>${esc(s("服务", "Service"))}</th><th>Pod</th><th>${esc(s("级别", "Level"))}</th><th>${esc(s("消息", "Message"))}</th><th>${esc(s("操作", "Action"))}</th></tr></thead><tbody>${results.map((item) => `<tr><td>${esc(formatDate(item.timestamp))}</td><td>${esc(item.datasource || "-")}</td><td>${esc(item.service || "-")}</td><td>${esc(item.pod || "-")}</td><td>${esc(item._level.toUpperCase())}</td><td>${highlight(item.message || "", byId("search-keyword").value.trim())}</td><td><button class="button button-small" type="button" data-select-result="${esc(String(item._index))}">${esc(s("查看", "Inspect"))}</button></td></tr>`).join("")}</tbody></table></div>`;
     return;
@@ -1470,6 +1548,7 @@ async function submitSearch(event) {
   const payload = { keyword: byId("search-keyword").value.trim(), start: localToRFC3339(byId("search-start").value), end: localToRFC3339(byId("search-end").value), datasource_ids: state.search.selectedDatasourceIDs.slice(), service_names: state.search.service ? [state.search.service] : [], tags: normalizeFilters(state.search.activeFilters), page: Number(byId("search-page").value || 1), page_size: Number(byId("search-page-size").value || 200), use_cache: byId("search-use-cache").checked };
   await busy(byId("search-submit"), async () => {
     state.search.response = await request("/api/query/search", { method: "POST", body: JSON.stringify(payload) });
+    state.search.selectedDatasourceView = "";
     const first = getDecoratedResults()[0];
     state.search.selectedResultKey = first ? String(first._index) : "";
     state.search.levelFilter = "all";
@@ -1612,8 +1691,8 @@ async function request(url, options) {
 async function busy(button, fn) { const original = button.textContent; button.disabled = true; button.textContent = s("处理中...", "Working..."); try { await fn(); } catch (error) { toast(error.message, "error"); } finally { button.disabled = false; button.textContent = original; } }
 
 function getDecoratedResults() { return ((state.search.response && state.search.response.results) || []).map((item, index) => ({ ...item, _index: index, _level: inferLevel(item) })); }
-function getVisibleResults() { const all = getDecoratedResults(); return state.search.levelFilter === "all" ? all : all.filter((item) => item._level === state.search.levelFilter); }
-function getSelectedResult() { const all = getDecoratedResults(); return all.find((item) => String(item._index) === state.search.selectedResultKey) || all[0] || null; }
+function getVisibleResults() { const all = getDatasourceDecoratedResults(); return state.search.levelFilter === "all" ? all : all.filter((item) => item._level === state.search.levelFilter); }
+function getSelectedResult() { const all = getVisibleResults(); return all.find((item) => String(item._index) === state.search.selectedResultKey) || all[0] || null; }
 function ensureSelectedResult(items) { if (!items.length) return void (state.search.selectedResultKey = ""); if (!items.some((item) => String(item._index) === state.search.selectedResultKey)) state.search.selectedResultKey = String(items[0]._index); }
 function inferLevel(item) { const labels = item && item.labels ? item.labels : {}; const direct = String(labels.level || labels.severity || labels.lvl || "").trim().toLowerCase(); if (direct) return direct; const text = String(item && item.message ? item.message : "").toLowerCase(); if (/\bfatal\b/.test(text)) return "fatal"; if (/\berror\b/.test(text)) return "error"; if (/\bwarn(ing)?\b/.test(text)) return "warn"; if (/\bdebug\b/.test(text)) return "debug"; if (/\btrace\b/.test(text)) return "trace"; return "info"; }
 function countLevels(items) { const out = {}; items.forEach((item) => { out[item._level] = (out[item._level] || 0) + 1; }); return out; }
