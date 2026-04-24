@@ -409,6 +409,44 @@
     });
   }
 
+  function reconcileSourceStatuses(sources, results) {
+    const normalized = normalizeSourceStatuses(sources);
+    const counts = new Map();
+
+    safeList(results).forEach((item) => {
+      const key = normalizeDatasourceKey(item && item.datasource);
+      counts.set(key, Number(counts.get(key) || 0) + 1);
+    });
+
+    const orderedKeys = [];
+    const seen = new Set();
+
+    normalized.forEach((item) => {
+      const key = normalizeDatasourceKey(item.datasource);
+      if (!seen.has(key)) {
+        seen.add(key);
+        orderedKeys.push(key);
+      }
+    });
+
+    counts.forEach((_value, key) => {
+      if (!seen.has(key)) {
+        seen.add(key);
+        orderedKeys.push(key);
+      }
+    });
+
+    return orderedKeys.map((key) => {
+      const existing = normalized.find((item) => normalizeDatasourceKey(item.datasource) === key) || {};
+      return {
+        datasource: key,
+        status: String(existing.status || (counts.get(key) > 0 ? "completed" : "pending")),
+        hits: Number(counts.get(key) || 0),
+        error: String(existing.error || ""),
+      };
+    });
+  }
+
   function buildResponse(results, sources) {
     const controller = ensureState();
     const payload = safeMap(controller.lastPayload);
@@ -426,7 +464,7 @@
       partial: !controller.completed || controller.partial,
       cache_hit: false,
       took_ms: 0,
-      sources: normalizeSourceStatuses(sources),
+      sources: reconcileSourceStatuses(sources, visibleResults),
     };
   }
 
@@ -662,6 +700,9 @@
       commitVisibleResponse(controller.rows, controller.sources, { preserveSelection: true });
     }
     syncRuntime(String(payload.status || ""), payload.error || "");
+    if (isTerminalStatus(String(payload.status || ""))) {
+      void syncSnapshot(controller.activeJobID, runID);
+    }
   }
 
   function handleRowsEvent(payload, runID) {
@@ -722,6 +763,12 @@
     source.addEventListener("progress", (event) => {
       handleStatusEvent(parseEvent(event), runID);
     });
+    source.addEventListener("heartbeat", (event) => {
+      const payload = parseEvent(event);
+      if (isTerminalStatus(String(payload.status || ""))) {
+        void syncSnapshot(jobID, runID);
+      }
+    });
     source.addEventListener("rows", (event) => {
       handleRowsEvent(parseEvent(event), runID);
     });
@@ -742,6 +789,14 @@
       if (active.runID === runID && !active.completed && !active.syncingSnapshot) {
         setRuntime("partial", "Query stream reconnecting. Waiting for the live stream to recover.");
       }
+      void fetchJob(jobID).then((job) => {
+        if (ensureState().runID !== runID || !job || !job.id) {
+          return;
+        }
+        if (isTerminalStatus(String(job.status || ""))) {
+          void syncSnapshot(jobID, runID);
+        }
+      }).catch(() => {});
     };
   }
 

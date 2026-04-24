@@ -4396,4 +4396,62 @@ bootstrap();
     }
   } catch (_error) {
   }
+
+  renderSearchSources = function () {
+    const items = (state.search.response && state.search.response.sources) || [];
+    const node = byId("search-source-grid");
+    if (!node) return;
+    const selectedDatasource = typeof ensureSelectedDatasourceView === "function"
+      ? ensureSelectedDatasourceView()
+      : "";
+    node.innerHTML = items.length ? items.map((item) => {
+      const datasource = String(item && item.datasource || "").trim();
+      const active = datasource && datasource === selectedDatasource;
+      const actionHint = datasource
+        ? s("点击查看该数据源结果", "Click to inspect this datasource")
+        : s("无可用数据源标识", "No datasource identifier");
+      return `<button class="source-card compact-source-card source-card-button ${active ? "active" : ""}" type="button" data-select-result-datasource="${esc(datasource)}" ${datasource ? "" : "disabled"}><div class="section-head"><div><h4 class="card-title">${esc(item.datasource || "-")}</h4><div class="tiny">${esc(item.error || s("无错误信息", "No error message"))}</div></div>${pill(localizeStatus(item.status).label, localizeStatus(item.status).tone)}</div><div class="chip-row">${pill(`${s("命中", "Hits")}: ${item.hits || 0}`, "tone-soft")}</div><div class="tiny">${esc(actionHint)}</div></button>`;
+    }).join("") : empty(s("查询后这里会展示各数据源状态。", "Per-source states appear after a query."));
+  };
+
+  renderSearchLevelFilters = function () {
+    const scoped = typeof getDatasourceDecoratedResults === "function"
+      ? getDatasourceDecoratedResults()
+      : getDecoratedResults();
+    const counts = countLevels(scoped);
+    const target = byId("search-level-filters");
+    if (!target) return;
+    const buttons = [`<button class="chip-button ${state.search.levelFilter === "all" ? "active" : ""}" type="button" data-level-filter="all">${esc(s("全部级别", "All Levels"))} · ${esc(String(scoped.length))}</button>`];
+    Object.keys(counts).forEach((level) => {
+      buttons.push(`<button class="chip-button ${state.search.levelFilter === level ? "active" : ""}" type="button" data-level-filter="${esc(level)}">${esc(level.toUpperCase())} · ${esc(String(counts[level]))}</button>`);
+    });
+    target.innerHTML = `<div class="floating-dock-title">${esc(s("日志级别", "Log Levels"))}</div><div class="chip-row">${buttons.join("")}</div>`;
+  };
+
+  renderSearchResults = function () {
+    renderSearchSummary();
+    renderSearchHistogramPanel();
+    renderSearchSources();
+    renderSearchLevelFilters();
+    if (typeof renderSearchResultsScope === "function") renderSearchResultsScope();
+    renderSearchHighlightPalette();
+    renderSearchResultsBody();
+    renderSearchInspector();
+    renderSearchLoadingState();
+    renderSearchFloatingExportDock();
+    const wrapButton = byId("search-wrap-toggle");
+    if (wrapButton) wrapButton.classList.toggle("active", state.search.wrap);
+  };
+
+  getVisibleResults = function () {
+    const all = typeof getDatasourceDecoratedResults === "function"
+      ? getDatasourceDecoratedResults()
+      : getDecoratedResults();
+    return state.search.levelFilter === "all" ? all : safeArray(all).filter((item) => item._level === state.search.levelFilter);
+  };
+
+  getSelectedResult = function () {
+    const items = getVisibleResults();
+    return safeArray(items).find((item) => String(item._index) === state.search.selectedResultKey) || items[0] || null;
+  };
 })();
