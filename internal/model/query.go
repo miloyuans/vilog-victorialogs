@@ -28,6 +28,7 @@ type QuerySourceStatus struct {
 	Datasource string `json:"datasource"`
 	Status     string `json:"status"`
 	Hits       int    `json:"hits"`
+	LoadedHits int    `json:"loaded_hits,omitempty"`
 	Error      string `json:"error,omitempty"`
 }
 

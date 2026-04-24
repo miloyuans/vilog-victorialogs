@@ -184,7 +184,7 @@ func (s *Server) getQueryJobResults(c *gin.Context) {
 	}
 
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "500"))
-	page, err := s.deps.QueryJobs.Results(c.Request.Context(), c.Param("id"), c.Query("cursor"), pageSize)
+	page, err := s.deps.QueryJobs.Results(c.Request.Context(), c.Param("id"), c.Query("datasource"), c.Query("cursor"), pageSize)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "query_job_results_failed", err.Error())
 		return
@@ -199,7 +199,7 @@ func (s *Server) getQueryJobAllResults(c *gin.Context) {
 	}
 
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "500"))
-	page, err := s.deps.QueryJobs.AllResults(c.Request.Context(), c.Param("id"), c.Query("cursor"), pageSize)
+	page, err := s.deps.QueryJobs.AllResults(c.Request.Context(), c.Param("id"), c.Query("datasource"), c.Query("cursor"), pageSize)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, "query_job_results_failed", err.Error())
 		return
@@ -225,10 +225,21 @@ func (s *Server) streamQueryJob(c *gin.Context) {
 	c.Writer.Header().Set("X-Accel-Buffering", "no")
 	c.Status(http.StatusOK)
 
+	lastEventID, _ := strconv.ParseInt(strings.TrimSpace(c.GetHeader("Last-Event-ID")), 10, 64)
+
 	writeEvent := func(eventType string, payload any) bool {
 		data, marshalErr := json.Marshal(payload)
 		if marshalErr != nil {
 			return false
+		}
+		sequence := int64(0)
+		if event, ok := payload.(model.QueryJobEvent); ok {
+			sequence = event.Sequence
+		}
+		if sequence > 0 {
+			if _, writeErr := c.Writer.Write([]byte("id: " + strconv.FormatInt(sequence, 10) + "\n")); writeErr != nil {
+				return false
+			}
 		}
 		if _, writeErr := c.Writer.Write([]byte("event: " + eventType + "\n")); writeErr != nil {
 			return false
@@ -244,16 +255,17 @@ func (s *Server) streamQueryJob(c *gin.Context) {
 		Type:      "status",
 		JobID:     job.ID,
 		Status:    job.Status,
+		Sequence:  s.deps.QueryJobs.CurrentSequence(job.ID),
 		Progress:  job.Progress,
 		Sources:   apiJobSourceStatuses(job),
 		LastError: job.LastError,
 	}
-	if !writeEvent(initial.Type, initial) {
+	if lastEventID <= 0 && !writeEvent(initial.Type, initial) {
 		return
 	}
 	currentStatus := job.Status
 
-	events, cancel := s.deps.QueryJobs.Subscribe(job.ID)
+	events, cancel := s.deps.QueryJobs.Subscribe(job.ID, lastEventID)
 	defer cancel()
 
 	heartbeatEvery := time.Duration(s.cfg.QueryJobs.SSEHeartbeatSeconds) * time.Second
@@ -538,6 +550,7 @@ func apiJobSourceStatuses(job model.QueryJob) []model.QuerySourceStatus {
 			Datasource: apiFirstNonEmpty(state.DatasourceName, state.DatasourceID),
 			Status:     status,
 			Hits:       int(state.RowsMatched),
+			LoadedHits: int(state.RowsFetched),
 			Error:      state.Error,
 		})
 	}

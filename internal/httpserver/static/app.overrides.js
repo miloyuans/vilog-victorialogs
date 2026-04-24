@@ -4454,4 +4454,23 @@ bootstrap();
     const items = getVisibleResults();
     return safeArray(items).find((item) => String(item._index) === state.search.selectedResultKey) || items[0] || null;
   };
+
+  renderSearchSources = function () {
+    const items = (state.search.response && state.search.response.sources) || [];
+    const node = byId("search-source-grid");
+    if (!node) return;
+    const selectedDatasource = typeof ensureSelectedDatasourceView === "function"
+      ? ensureSelectedDatasourceView()
+      : "";
+    node.innerHTML = items.length ? items.map((item) => {
+      const datasource = String(item && item.datasource || "").trim();
+      const active = datasource && datasource === selectedDatasource;
+      const actionHint = datasource
+        ? s("点击查看该数据源结果", "Click to inspect this datasource")
+        : s("无可用数据源标识", "No datasource identifier");
+      const loadedHits = Number(item && item.loaded_hits || 0);
+      const matchedHits = Number(item && item.hits || 0);
+      return `<button class="source-card compact-source-card source-card-button ${active ? "active" : ""}" type="button" data-select-result-datasource="${esc(datasource)}" ${datasource ? "" : "disabled"}><div class="section-head"><div><h4 class="card-title">${esc(item.datasource || "-")}</h4><div class="tiny">${esc(item.error || s("无错误信息", "No error message"))}</div></div>${pill(localizeStatus(item.status).label, localizeStatus(item.status).tone)}</div><div class="chip-row">${pill(`${s("已加载", "Loaded")}: ${loadedHits}`, "tone-soft")}${pill(`${s("匹配", "Matched")}: ${matchedHits}`, "tone-neutral")}</div><div class="tiny">${esc(actionHint)}</div></button>`;
+    }).join("") : empty(s("查询后这里会展示各数据源状态。", "Per-source states appear after a query."));
+  };
 })();

@@ -17,26 +17,36 @@ import (
 	"vilog-victorialogs/internal/client/victorialogs"
 	"vilog-victorialogs/internal/config"
 	"vilog-victorialogs/internal/model"
+	localstore "vilog-victorialogs/internal/store/local"
 	"vilog-victorialogs/internal/util"
 )
 
 const (
 	defaultJobResultsPageSize = 500
-	maxJobResultsPageSize     = 1000
+	maxJobResultsPageSize     = 5000
 	defaultJobWorkerCount     = 10
 	defaultJobBatchRows       = 25
+	defaultJobSubscriberBuffer = 4096
+	maxJobEventHistory         = 4096
+	publishEventTimeout        = 2 * time.Second
 )
 
 type JobService struct {
 	search *Service
 	cfg    config.QueryJobsConfig
 	logger *zap.Logger
+	segments *localstore.QuerySegmentStore
 
 	subMu       sync.Mutex
 	subscribers map[string]map[chan model.QueryJobEvent]struct{}
+	eventHistory map[string][]model.QueryJobEvent
 
 	previewMu sync.RWMutex
 	previews  map[string]*jobPreviewState
+
+	runtimeMu           sync.Mutex
+	eventSequences   map[string]int64
+	segmentSequences map[string]int64
 
 	activeMu sync.Mutex
 	active   *activeQueryRun
@@ -78,8 +88,12 @@ func NewJobService(search *Service, cfg config.QueryJobsConfig, logger *zap.Logg
 		search:      search,
 		cfg:         cfg,
 		logger:      logger,
+		segments:    localstore.NewQuerySegmentStore(cfg.BaseDir),
 		subscribers: make(map[string]map[chan model.QueryJobEvent]struct{}),
+		eventHistory: make(map[string][]model.QueryJobEvent),
 		previews:    make(map[string]*jobPreviewState),
+		eventSequences:   make(map[string]int64),
+		segmentSequences: make(map[string]int64),
 	}
 }
 
@@ -124,7 +138,8 @@ func (s *JobService) Create(ctx context.Context, req model.SearchRequest) (model
 	if err := s.search.store.CreateQueryJob(ctx, job); err != nil {
 		return model.QueryJobCreateResponse{}, err
 	}
-	s.initPreviewState(job.ID, normalized.PageSize)
+	s.initPreviewState(job.ID, s.sourceRequestLimit())
+	s.resetRuntimeState(job.ID)
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	if previous := s.replaceActiveRun(job.ID, cancel); previous != nil {
@@ -137,7 +152,7 @@ func (s *JobService) Create(ctx context.Context, req model.SearchRequest) (model
 		zap.Int("service_count", len(normalized.ServiceNames)),
 		zap.Time("start", start),
 		zap.Time("end", end),
-		zap.Int("per_bucket_limit", clampJobResultsPageSize(normalized.PageSize)),
+		zap.Int("per_bucket_limit", s.sourceRequestLimit()),
 	)
 
 	go s.run(runCtx, job.ID, normalized, start, end, datasources)
@@ -152,20 +167,25 @@ func (s *JobService) Get(ctx context.Context, jobID string) (model.QueryJob, err
 	return s.search.store.GetQueryJob(ctx, strings.TrimSpace(jobID))
 }
 
-func (s *JobService) Results(ctx context.Context, jobID, cursor string, pageSize int) (model.JobResultsPage, error) {
-	return s.resultsPage(ctx, jobID, cursor, pageSize)
+func (s *JobService) CurrentSequence(jobID string) int64 {
+	return s.currentEventSequence(strings.TrimSpace(jobID))
 }
 
-func (s *JobService) AllResults(ctx context.Context, jobID, cursor string, pageSize int) (model.JobResultsPage, error) {
-	return s.resultsPage(ctx, jobID, cursor, pageSize)
+func (s *JobService) Results(ctx context.Context, jobID, datasource, cursor string, pageSize int) (model.JobResultsPage, error) {
+	return s.resultsPage(ctx, jobID, datasource, cursor, pageSize)
 }
 
-func (s *JobService) resultsPage(ctx context.Context, jobID, cursor string, pageSize int) (model.JobResultsPage, error) {
+func (s *JobService) AllResults(ctx context.Context, jobID, datasource, cursor string, pageSize int) (model.JobResultsPage, error) {
+	return s.resultsPage(ctx, jobID, datasource, cursor, pageSize)
+}
+
+func (s *JobService) resultsPage(ctx context.Context, jobID, datasource, cursor string, pageSize int) (model.JobResultsPage, error) {
 	jobID = strings.TrimSpace(jobID)
 	job, err := s.search.store.GetQueryJob(ctx, jobID)
 	if err != nil {
 		return model.JobResultsPage{}, err
 	}
+	datasource = canonicalJobDatasource(job, strings.TrimSpace(datasource))
 
 	currentCursor, err := decodeJobCursor(cursor)
 	if err != nil {
@@ -174,39 +194,93 @@ func (s *JobService) resultsPage(ctx context.Context, jobID, cursor string, page
 	if currentCursor.JobID != "" && currentCursor.JobID != jobID {
 		return model.JobResultsPage{}, fmt.Errorf("cursor does not belong to this job")
 	}
+	if currentCursor.Datasource != "" {
+		cursorDatasource := canonicalJobDatasource(job, currentCursor.Datasource)
+		if datasource == "" {
+			datasource = cursorDatasource
+		} else if datasource != cursorDatasource {
+			return model.JobResultsPage{}, fmt.Errorf("cursor datasource does not match request")
+		}
+	}
 
-	results := s.previewRows(jobID)
+	segments, err := s.search.store.ListQuerySegments(ctx, jobID)
+	if err != nil {
+		return model.JobResultsPage{}, err
+	}
+
 	limit := clampJobResultsPageSize(pageSize)
-	startOffset := currentCursor.OffsetInSeg
-	if startOffset < 0 {
-		startOffset = 0
+	pageResults := make([]model.SearchResult, 0, limit)
+	resumeCursor := model.QueryResultsCursor{
+		JobID:          jobID,
+		Datasource:     datasource,
+		SegmentSeq:     currentCursor.SegmentSeq,
+		OffsetInSeg:    currentCursor.OffsetInSeg,
+		FilterRevision: job.FilterRevision,
+		Direction:      "forward",
 	}
-	startIndex := int(startOffset)
-	if startIndex > len(results) {
-		startIndex = len(results)
-	}
-	endIndex := startIndex + limit
-	if endIndex > len(results) {
-		endIndex = len(results)
+	hasMore := false
+	stop := false
+
+	for _, segment := range segments {
+		if segment.Sequence < currentCursor.SegmentSeq {
+			continue
+		}
+		if !segmentMatchesDatasource(segment, datasource) {
+			resumeCursor.SegmentSeq = segment.Sequence
+			resumeCursor.OffsetInSeg = segment.RowCount
+			continue
+		}
+
+		offsetInSegment := int64(0)
+		if segment.Sequence == currentCursor.SegmentSeq {
+			offsetInSegment = currentCursor.OffsetInSeg
+			if offsetInSegment < 0 {
+				offsetInSegment = 0
+			}
+		}
+
+		currentOffset := int64(0)
+		err := s.segments.ReadRows(segment.FilePath, func(row model.SearchResult) (bool, error) {
+			if currentOffset < offsetInSegment {
+				currentOffset++
+				resumeCursor.SegmentSeq = segment.Sequence
+				resumeCursor.OffsetInSeg = currentOffset
+				return true, nil
+			}
+
+			currentOffset++
+			resumeCursor.SegmentSeq = segment.Sequence
+			resumeCursor.OffsetInSeg = currentOffset
+			if datasource != "" && !resultMatchesDatasource(row, datasource) {
+				return true, nil
+			}
+
+			pageResults = append(pageResults, compactSearchResult(row))
+			if len(pageResults) >= limit {
+				hasMore = true
+				stop = true
+				return false, nil
+			}
+			return true, nil
+		})
+		if err != nil {
+			return model.JobResultsPage{}, err
+		}
+		if stop {
+			break
+		}
+		resumeCursor.SegmentSeq = segment.Sequence
+		resumeCursor.OffsetInSeg = segment.RowCount
 	}
 
-	pageResults := append([]model.SearchResult(nil), results[startIndex:endIndex]...)
-	hasMore := endIndex < len(results)
-	nextCursor := ""
-	if hasMore {
-		nextCursor = encodeJobCursor(model.QueryResultsCursor{
-			JobID:          jobID,
-			OffsetInSeg:    int64(endIndex),
-			FilterRevision: job.FilterRevision,
-			Direction:      "forward",
-		})
-	}
+	nextCursor := encodeJobCursor(resumeCursor)
 
 	completed := isTerminalJobStatus(job.Status)
 	partial := job.Status == model.QueryJobPartial || job.Status == model.QueryJobFailed
 
 	return model.JobResultsPage{
 		JobID:             job.ID,
+		Datasource:        datasource,
 		Status:            job.Status,
 		Results:           compactSearchResultsForResponse(pageResults),
 		Sources:           jobSourceStatuses(job),
@@ -218,16 +292,26 @@ func (s *JobService) resultsPage(ctx context.Context, jobID, cursor string, page
 	}, nil
 }
 
-func (s *JobService) Subscribe(jobID string) (<-chan model.QueryJobEvent, func()) {
-	ch := make(chan model.QueryJobEvent, 64)
+func (s *JobService) Subscribe(jobID string, lastSequence int64) (<-chan model.QueryJobEvent, func()) {
+	ch := make(chan model.QueryJobEvent, defaultJobSubscriberBuffer)
 	jobID = strings.TrimSpace(jobID)
 
 	s.subMu.Lock()
+	replay := make([]model.QueryJobEvent, 0)
+	for _, event := range s.eventHistory[jobID] {
+		if event.Sequence > lastSequence {
+			replay = append(replay, event)
+		}
+	}
 	if _, ok := s.subscribers[jobID]; !ok {
 		s.subscribers[jobID] = make(map[chan model.QueryJobEvent]struct{})
 	}
 	s.subscribers[jobID][ch] = struct{}{}
 	s.subMu.Unlock()
+
+	for _, event := range replay {
+		ch <- event
+	}
 
 	cancel := func() {
 		s.subMu.Lock()
@@ -272,6 +356,12 @@ func (s *JobService) cleanupExpired(ctx context.Context) error {
 	}
 	for _, job := range jobs {
 		s.deletePreviewState(job.ID)
+		s.deleteRuntimeState(job.ID)
+		if s.segments != nil {
+			if err := s.segments.DeleteJob(job.ID); err != nil {
+				s.logger.Warn("delete expired query job segments failed", zap.String("job_id", job.ID), zap.Error(err))
+			}
+		}
 		if err := s.search.store.DeleteQueryJob(ctx, job.ID); err != nil {
 			s.logger.Warn("delete expired query job failed", zap.String("job_id", job.ID), zap.Error(err))
 		}
@@ -306,6 +396,7 @@ func (s *JobService) run(ctx context.Context, jobID string, req model.SearchRequ
 		s.logger.Warn("mark query job running failed", zap.String("job_id", jobID), zap.Error(err))
 	}
 	s.publish(jobID, model.QueryJobEvent{
+		Sequence: s.nextEventSequence(jobID),
 		Type:     "status",
 		JobID:    jobID,
 		Status:   job.Status,
@@ -321,7 +412,6 @@ func (s *JobService) run(ctx context.Context, jobID string, req model.SearchRequ
 	var (
 		jobMu       sync.Mutex
 		persistMu   sync.Mutex
-		sequence    int64
 		bucketErrs  int64
 		lastPersist int64
 		workers     sync.WaitGroup
@@ -367,8 +457,9 @@ func (s *JobService) run(ctx context.Context, jobID string, req model.SearchRequ
 			Type:         "progress",
 			JobID:        jobID,
 			Status:       jobCopy.Status,
-			Sequence:     atomic.AddInt64(&sequence, 1),
+			Sequence:     s.nextEventSequence(jobID),
 			DatasourceID: datasource.ID,
+			Datasource:   datasource.Name,
 			Progress:     jobCopy.Progress,
 			Sources:      sources,
 		})
@@ -378,34 +469,41 @@ func (s *JobService) run(ctx context.Context, jobID string, req model.SearchRequ
 		if len(rows) == 0 {
 			return nil
 		}
-		accepted := s.appendPreviewRows(jobID, rows)
-		if len(accepted) == 0 {
-			return nil
+		s.appendPreviewRows(jobID, rows)
+
+		segment, err := s.appendResultSegment(storeCtx, jobID, rows)
+		if err != nil {
+			return err
 		}
 
 		jobMu.Lock()
-		job.Progress.RowsWritten += int64(len(accepted))
-		job.Progress.RowsMatched += int64(len(accepted))
+		job.Progress.SegmentsWritten++
+		job.Progress.RowsWritten += int64(len(rows))
+		job.Progress.RowsMatched += int64(len(rows))
+		job.Progress.BytesWritten += segment.SizeBytes
 		job.Totals.RowsTotal = job.Progress.RowsMatched
 		job.Totals.RowsMatched = job.Progress.RowsMatched
 		s.updateSourceStateLocked(&job, datasource.ID, func(state *model.QuerySourceState) {
-			state.RowsFetched += int64(len(accepted))
-			state.RowsMatched += int64(len(accepted))
+			state.RowsFetched += int64(len(rows))
+			state.RowsMatched += int64(len(rows))
+			state.SegmentsWritten++
 		})
 		jobCopy, sources := snapshotJobLocked()
 		jobMu.Unlock()
 
 		persistJob(jobCopy)
 		s.publish(jobID, model.QueryJobEvent{
-			Type:         "rows",
+			Type:         "rows_available",
 			JobID:        jobID,
 			Status:       jobCopy.Status,
-			Sequence:     atomic.AddInt64(&sequence, 1),
-			RowCount:     int64(len(accepted)),
+			Sequence:     s.nextEventSequence(jobID),
+			FromSequence: segment.Sequence,
+			ToSequence:   segment.Sequence,
+			RowCount:     int64(len(rows)),
 			DatasourceID: datasource.ID,
+			Datasource:   datasource.Name,
 			Progress:     jobCopy.Progress,
 			Sources:      sources,
-			Rows:         compactSearchResultsForResponse(accepted),
 		})
 		return nil
 	}
@@ -451,8 +549,9 @@ func (s *JobService) run(ctx context.Context, jobID string, req model.SearchRequ
 			Type:         "progress",
 			JobID:        jobID,
 			Status:       jobCopy.Status,
-			Sequence:     atomic.AddInt64(&sequence, 1),
+			Sequence:     s.nextEventSequence(jobID),
 			DatasourceID: datasource.ID,
+			Datasource:   datasource.Name,
 			Progress:     jobCopy.Progress,
 			Sources:      sources,
 			LastError:    firstNonEmpty(jobCopy.LastError, errorString(bucketErr)),
@@ -541,7 +640,7 @@ enqueueLoop:
 		Type:      eventType,
 		JobID:     jobID,
 		Status:    finalJob.Status,
-		Sequence:  atomic.AddInt64(&sequence, 1),
+		Sequence:  s.nextEventSequence(jobID),
 		Progress:  finalJob.Progress,
 		Sources:   sources,
 		LastError: finalJob.LastError,
@@ -575,7 +674,7 @@ func (s *JobService) runBucket(
 		serviceFilter,
 		req.Tags,
 	)
-	perBucketLimit := clampJobResultsPageSize(req.PageSize)
+	perBucketLimit := s.sourceRequestLimit()
 
 	batch := make([]model.SearchResult, 0, defaultJobBatchRows)
 	flush := func() error {
@@ -761,6 +860,7 @@ func (s *JobService) failJob(ctx context.Context, jobID string, err error) {
 		Type:      "failed",
 		JobID:     jobID,
 		Status:    model.QueryJobFailed,
+		Sequence:  s.nextEventSequence(jobID),
 		LastError: err.Error(),
 		Progress:  job.Progress,
 		Sources:   jobSourceStatuses(job),
@@ -768,14 +868,172 @@ func (s *JobService) failJob(ctx context.Context, jobID string, err error) {
 }
 
 func (s *JobService) publish(jobID string, event model.QueryJobEvent) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return
+	}
+
 	s.subMu.Lock()
-	defer s.subMu.Unlock()
+	if event.Sequence > 0 {
+		history := append(s.eventHistory[jobID], event)
+		if len(history) > maxJobEventHistory {
+			history = append([]model.QueryJobEvent(nil), history[len(history)-maxJobEventHistory:]...)
+		}
+		s.eventHistory[jobID] = history
+	}
+	listeners := make([]chan model.QueryJobEvent, 0, len(s.subscribers[jobID]))
 	for ch := range s.subscribers[jobID] {
-		select {
-		case ch <- event:
-		default:
+		listeners = append(listeners, ch)
+	}
+	s.subMu.Unlock()
+
+	for _, ch := range listeners {
+		delivered, closed := sendJobEvent(ch, event, publishEventTimeout)
+		if closed {
+			s.removeSubscriber(jobID, ch)
+			continue
+		}
+		if !delivered {
+			s.logger.Warn("query job subscriber is too slow",
+				zap.String("job_id", jobID),
+				zap.String("event_type", event.Type),
+				zap.Int64("event_sequence", event.Sequence),
+			)
 		}
 	}
+}
+
+func (s *JobService) removeSubscriber(jobID string, ch chan model.QueryJobEvent) {
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	if listeners, ok := s.subscribers[jobID]; ok {
+		delete(listeners, ch)
+		if len(listeners) == 0 {
+			delete(s.subscribers, jobID)
+		}
+	}
+}
+
+func sendJobEvent(ch chan model.QueryJobEvent, event model.QueryJobEvent, timeout time.Duration) (delivered bool, closed bool) {
+	defer func() {
+		if recover() != nil {
+			closed = true
+			delivered = false
+		}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case ch <- event:
+		return true, false
+	case <-timer.C:
+		return false, false
+	}
+}
+
+func (s *JobService) resetRuntimeState(jobID string) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return
+	}
+	s.runtimeMu.Lock()
+	s.eventSequences[jobID] = 0
+	s.segmentSequences[jobID] = 0
+	s.runtimeMu.Unlock()
+
+	s.subMu.Lock()
+	delete(s.eventHistory, jobID)
+	s.subMu.Unlock()
+}
+
+func (s *JobService) deleteRuntimeState(jobID string) {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return
+	}
+	s.runtimeMu.Lock()
+	delete(s.eventSequences, jobID)
+	delete(s.segmentSequences, jobID)
+	s.runtimeMu.Unlock()
+
+	s.subMu.Lock()
+	delete(s.eventHistory, jobID)
+	delete(s.subscribers, jobID)
+	s.subMu.Unlock()
+}
+
+func (s *JobService) nextEventSequence(jobID string) int64 {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
+	s.eventSequences[jobID]++
+	return s.eventSequences[jobID]
+}
+
+func (s *JobService) currentEventSequence(jobID string) int64 {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
+	return s.eventSequences[jobID]
+}
+
+func (s *JobService) nextResultSegmentSequence(jobID string) int64 {
+	s.runtimeMu.Lock()
+	defer s.runtimeMu.Unlock()
+	sequence := s.segmentSequences[jobID]
+	s.segmentSequences[jobID]++
+	return sequence
+}
+
+func (s *JobService) sourceRequestLimit() int {
+	limit := s.cfg.SourceRequestLimit
+	if limit <= 0 {
+		limit = defaultJobResultsPageSize
+	}
+	return clampJobResultsPageSize(limit)
+}
+
+func (s *JobService) appendResultSegment(ctx context.Context, jobID string, rows []model.SearchResult) (model.QuerySegment, error) {
+	if len(rows) == 0 {
+		return model.QuerySegment{}, nil
+	}
+	if s.segments == nil {
+		return model.QuerySegment{}, fmt.Errorf("query segment store is not configured")
+	}
+
+	sequence := s.nextResultSegmentSequence(jobID)
+	writer, err := s.segments.OpenWriter(jobID, sequence)
+	if err != nil {
+		return model.QuerySegment{}, err
+	}
+	for _, row := range rows {
+		if err := writer.Write(compactSearchResult(row)); err != nil {
+			_, _ = writer.Close()
+			return model.QuerySegment{}, err
+		}
+	}
+	meta, err := writer.Close()
+	if err != nil {
+		return model.QuerySegment{}, err
+	}
+
+	segment := model.QuerySegment{
+		ID:            util.NewPrefixedID("seg"),
+		JobID:         jobID,
+		Sequence:      sequence,
+		FilePath:      meta.FilePath,
+		RowCount:      meta.RowCount,
+		SizeBytes:     meta.SizeBytes,
+		TimeMin:       meta.TimeMin,
+		TimeMax:       meta.TimeMax,
+		DatasourceIDs: meta.DatasourceIDs,
+		Completed:     true,
+		CreatedAt:     time.Now().UTC(),
+	}
+	if err := s.search.store.CreateQuerySegment(ctx, segment); err != nil {
+		return model.QuerySegment{}, err
+	}
+	return segment, nil
 }
 
 func (s *JobService) replaceActiveRun(jobID string, cancel context.CancelFunc) context.CancelFunc {
@@ -828,6 +1086,7 @@ func jobSourceStatuses(job model.QueryJob) []model.QuerySourceStatus {
 			Datasource: firstNonEmpty(state.DatasourceName, state.DatasourceID),
 			Status:     status,
 			Hits:       int(state.RowsMatched),
+			LoadedHits: int(state.RowsFetched),
 			Error:      state.Error,
 		})
 	}
@@ -962,6 +1221,39 @@ func (s *JobService) previewRows(jobID string) []model.SearchResult {
 	state.mu.RUnlock()
 	sortPreviewRows(rows)
 	return rows
+}
+
+func resultMatchesDatasource(row model.SearchResult, datasource string) bool {
+	if strings.TrimSpace(datasource) == "" {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(row.Datasource), strings.TrimSpace(datasource))
+}
+
+func canonicalJobDatasource(job model.QueryJob, datasource string) string {
+	datasource = strings.TrimSpace(datasource)
+	if datasource == "" {
+		return ""
+	}
+	for _, state := range job.SourceStates {
+		if strings.EqualFold(strings.TrimSpace(state.DatasourceID), datasource) || strings.EqualFold(strings.TrimSpace(state.DatasourceName), datasource) {
+			return firstNonEmpty(strings.TrimSpace(state.DatasourceName), strings.TrimSpace(state.DatasourceID))
+		}
+	}
+	return datasource
+}
+
+func segmentMatchesDatasource(segment model.QuerySegment, datasource string) bool {
+	if strings.TrimSpace(datasource) == "" {
+		return true
+	}
+	target := strings.TrimSpace(datasource)
+	for _, item := range segment.DatasourceIDs {
+		if strings.EqualFold(strings.TrimSpace(item), target) {
+			return true
+		}
+	}
+	return false
 }
 
 func bucketPreviewKey(row model.SearchResult) string {

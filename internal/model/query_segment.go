@@ -18,6 +18,7 @@ type QuerySegment struct {
 
 type QueryResultsCursor struct {
 	JobID          string `json:"job_id"`
+	Datasource     string `json:"datasource,omitempty"`
 	SegmentSeq     int64  `json:"segment_seq"`
 	OffsetInSeg    int64  `json:"offset_in_seg"`
 	FilterRevision int64  `json:"filter_revision"`
@@ -35,13 +36,14 @@ type JobFilterRequest struct {
 }
 
 type JobResultsPage struct {
-	JobID             string         `json:"job_id"`
-	Status            QueryJobStatus `json:"status"`
-	Results           []SearchResult `json:"results"`
+	JobID             string              `json:"job_id"`
+	Datasource        string              `json:"datasource,omitempty"`
+	Status            QueryJobStatus      `json:"status"`
+	Results           []SearchResult      `json:"results"`
 	Sources           []QuerySourceStatus `json:"sources,omitempty"`
-	NextCursor        string         `json:"next_cursor,omitempty"`
-	HasMore           bool           `json:"has_more"`
-	Completed         bool           `json:"completed"`
-	Partial           bool           `json:"partial"`
-	MatchedTotalSoFar int64          `json:"matched_total_so_far"`
+	NextCursor        string              `json:"next_cursor,omitempty"`
+	HasMore           bool                `json:"has_more"`
+	Completed         bool                `json:"completed"`
+	Partial           bool                `json:"partial"`
+	MatchedTotalSoFar int64               `json:"matched_total_so_far"`
 }

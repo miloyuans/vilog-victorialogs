@@ -91,6 +91,8 @@ type QueryJobsConfig struct {
 	SegmentMaxBytes            int           `yaml:"segment_max_bytes"`
 	MaxConcurrentJobs          int           `yaml:"max_concurrent_jobs"`
 	MaxConcurrentSourcesPerJob int           `yaml:"max_concurrent_sources_per_job"`
+	SourceRequestLimit         int           `yaml:"source_request_limit"`
+	MaxTotalRows               int           `yaml:"max_total_rows"`
 	SSEHeartbeatSeconds        int           `yaml:"sse_heartbeat_seconds"`
 	ChunkWindow                time.Duration `yaml:"chunk_window"`
 }
@@ -201,6 +203,8 @@ func Default() Config {
 			SegmentMaxBytes:            4 << 20,
 			MaxConcurrentJobs:          4,
 			MaxConcurrentSourcesPerJob: 4,
+			SourceRequestLimit:         500,
+			MaxTotalRows:               100000,
 			SSEHeartbeatSeconds:        10,
 			ChunkWindow:                15 * time.Minute,
 		},
@@ -421,6 +425,12 @@ func (c *Config) Validate() error {
 	if c.QueryJobs.MaxConcurrentSourcesPerJob <= 0 {
 		c.QueryJobs.MaxConcurrentSourcesPerJob = 4
 	}
+	if c.QueryJobs.SourceRequestLimit <= 0 {
+		c.QueryJobs.SourceRequestLimit = 500
+	}
+	if c.QueryJobs.MaxTotalRows <= 0 {
+		c.QueryJobs.MaxTotalRows = 100000
+	}
 	if c.QueryJobs.SSEHeartbeatSeconds <= 0 {
 		c.QueryJobs.SSEHeartbeatSeconds = 10
 	}
@@ -581,6 +591,12 @@ func applyEnvOverrides(cfg *Config) error {
 		return err
 	}
 	if err := setInt("VILOG_QUERY_JOBS_MAX_CONCURRENT_SOURCES_PER_JOB", &cfg.QueryJobs.MaxConcurrentSourcesPerJob); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_QUERY_JOBS_SOURCE_REQUEST_LIMIT", &cfg.QueryJobs.SourceRequestLimit); err != nil {
+		return err
+	}
+	if err := setInt("VILOG_QUERY_JOBS_MAX_TOTAL_ROWS", &cfg.QueryJobs.MaxTotalRows); err != nil {
 		return err
 	}
 	if err := setInt("VILOG_QUERY_JOBS_SSE_HEARTBEAT_SECONDS", &cfg.QueryJobs.SSEHeartbeatSeconds); err != nil {

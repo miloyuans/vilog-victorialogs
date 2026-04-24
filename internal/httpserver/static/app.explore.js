@@ -59,6 +59,12 @@
     window.state = window.state || {};
     state.search = state.search || {};
     state.ui = state.ui || {};
+    if (!state.search.datasourceViewMode) {
+      state.search.datasourceViewMode = "all";
+    }
+    if (typeof state.search.activeResultDatasource !== "string") {
+      state.search.activeResultDatasource = "all";
+    }
     state.search.exploreController = state.search.exploreController || {
       activeJobID: "",
       runID: 0,
@@ -71,6 +77,11 @@
       partial: false,
       eventSource: null,
       lastPayload: null,
+      rowsByDatasource: {},
+      cursorsByDatasource: {},
+      completedByDatasource: {},
+      fetchingByDatasource: {},
+      pendingFetchByDatasource: {},
       rows: [],
       sources: [],
     };
@@ -397,6 +408,41 @@
     return String(value || "-").trim() || "-";
   }
 
+  function datasourceKeysFromController(controller) {
+    const ordered = [];
+    const seen = new Set();
+
+    safeList(controller && controller.sources).forEach((item) => {
+      const key = normalizeDatasourceKey(item && item.datasource);
+      if (!seen.has(key)) {
+        seen.add(key);
+        ordered.push(key);
+      }
+    });
+
+    Object.keys(safeMap(controller && controller.rowsByDatasource)).forEach((key) => {
+      const normalizedKey = normalizeDatasourceKey(key);
+      if (!seen.has(normalizedKey)) {
+        seen.add(normalizedKey);
+        ordered.push(normalizedKey);
+      }
+    });
+
+    return ordered;
+  }
+
+  function mergedAllRows(controller) {
+    const rows = datasourceKeysFromController(controller).reduce((all, key) => {
+      return all.concat(safeList(controller && controller.rowsByDatasource && controller.rowsByDatasource[key]));
+    }, []);
+    return mergeRows([], rows);
+  }
+
+  function rowsForDatasource(controller, datasource) {
+    const key = normalizeDatasourceKey(datasource);
+    return safeList(controller && controller.rowsByDatasource && controller.rowsByDatasource[key]);
+  }
+
   function normalizeSourceStatuses(sources) {
     return safeList(sources).map((item) => {
       const source = safeMap(item);
@@ -404,20 +450,14 @@
         datasource: normalizeDatasourceKey(source.datasource),
         status: String(source.status || "pending"),
         hits: Number(source.hits || 0),
+        loaded_hits: Number(source.loaded_hits || 0),
         error: String(source.error || ""),
       };
     });
   }
 
-  function reconcileSourceStatuses(sources, results) {
+  function reconcileSourceStatuses(sources, rowsByDatasource) {
     const normalized = normalizeSourceStatuses(sources);
-    const counts = new Map();
-
-    safeList(results).forEach((item) => {
-      const key = normalizeDatasourceKey(item && item.datasource);
-      counts.set(key, Number(counts.get(key) || 0) + 1);
-    });
-
     const orderedKeys = [];
     const seen = new Set();
 
@@ -429,7 +469,7 @@
       }
     });
 
-    counts.forEach((_value, key) => {
+    Object.keys(safeMap(rowsByDatasource)).forEach((key) => {
       if (!seen.has(key)) {
         seen.add(key);
         orderedKeys.push(key);
@@ -438,38 +478,66 @@
 
     return orderedKeys.map((key) => {
       const existing = normalized.find((item) => normalizeDatasourceKey(item.datasource) === key) || {};
+      const loaded = safeList(rowsByDatasource && rowsByDatasource[key]).length;
+      const matched = Math.max(Number(existing.hits || 0), loaded);
       return {
         datasource: key,
-        status: String(existing.status || (counts.get(key) > 0 ? "completed" : "pending")),
-        hits: Number(counts.get(key) || 0),
+        status: String(existing.status || (loaded > 0 ? "completed" : "pending")),
+        hits: matched,
+        loaded_hits: loaded,
         error: String(existing.error || ""),
       };
     });
   }
 
-  function buildResponse(results, sources) {
-    const controller = ensureState();
-    const payload = safeMap(controller.lastPayload);
-    const visibleResults = safeList(results);
+  function syncDatasourceViewState(controller) {
+    const datasourceKeys = datasourceKeysFromController(controller);
+    if (!datasourceKeys.length) {
+      state.search.selectedDatasourceView = "";
+      state.search.activeResultDatasource = "all";
+      state.search.datasourceViewMode = "all";
+      return;
+    }
+
+    const active = normalizeDatasourceKey(state.search.activeResultDatasource || state.search.selectedDatasourceView || datasourceKeys[0]);
+    if (datasourceKeys.indexOf(active) >= 0) {
+      state.search.selectedDatasourceView = active;
+      state.search.activeResultDatasource = active;
+      state.search.datasourceViewMode = "single";
+      return;
+    }
+
+    state.search.selectedDatasourceView = datasourceKeys[0];
+    state.search.activeResultDatasource = datasourceKeys[0];
+    state.search.datasourceViewMode = "single";
+  }
+
+  function buildResponse(controller) {
+    const current = controller || ensureState();
+    const payload = safeMap(current.lastPayload);
+    const allResults = mergedAllRows(current);
     return {
       keyword: String(payload.keyword || ""),
       start: String(payload.start || ""),
       end: String(payload.end || ""),
-      results: visibleResults,
-      total: visibleResults.length,
+      results: allResults,
+      total: allResults.length,
       page: 1,
-      page_size: Number(payload.page_size || state.search.pageSize || DEFAULT_PAGE_SIZE),
+      page_size: Number(state.search.pageSize || DEFAULT_PAGE_SIZE),
       has_more: false,
       next_page: 0,
-      partial: !controller.completed || controller.partial,
+      partial: !current.completed || current.partial,
       cache_hit: false,
       took_ms: 0,
-      sources: reconcileSourceStatuses(sources, visibleResults),
+      sources: reconcileSourceStatuses(current.sources, current.rowsByDatasource),
     };
   }
 
-  function commitVisibleResponse(results, sources, options) {
-    const response = buildResponse(results, sources);
+  function commitVisibleResponse(options) {
+    const controller = ensureState();
+    controller.rows = mergedAllRows(controller);
+    syncDatasourceViewState(controller);
+    const response = buildResponse(controller);
     if (isFn(window.commitSearchResponse)) {
       window.commitSearchResponse(response, {
         preserveSelection: !!(options && options.preserveSelection),
@@ -486,12 +554,20 @@
   function commitPendingResponse(payload, sources) {
     const controller = ensureState();
     controller.lastPayload = safeMap(payload);
+    controller.rowsByDatasource = {};
+    controller.cursorsByDatasource = {};
+    controller.completedByDatasource = {};
+    controller.fetchingByDatasource = {};
+    controller.pendingFetchByDatasource = {};
     controller.rows = [];
     controller.sources = safeList(sources);
     controller.loading = true;
     controller.completed = false;
     controller.partial = true;
-    return commitVisibleResponse([], controller.sources, { preserveSelection: false });
+    state.search.selectedDatasourceView = "";
+    state.search.activeResultDatasource = "all";
+    state.search.datasourceViewMode = "all";
+    return commitVisibleResponse({ preserveSelection: false });
   }
 
   function activeRunningSources() {
@@ -564,30 +640,86 @@
     return safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(jobID)}`));
   }
 
-  async function fetchAllResults(jobID, runID, snapshotToken) {
-    let cursor = "";
-    let results = [];
-    let lastPage = null;
-    for (;;) {
-      if (Number.isFinite(runID) && Number.isFinite(snapshotToken) && !isSnapshotCurrent(jobID, runID, snapshotToken)) {
-        return { results: [], lastPage: null, aborted: true };
+  async function fetchResultsPage(jobID, datasource, cursor) {
+    const params = new URLSearchParams({ page_size: String(SNAPSHOT_PAGE_SIZE) });
+    if (datasource) {
+      params.set("datasource", datasource);
+    }
+    if (cursor) {
+      params.set("cursor", cursor);
+    }
+    return safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(jobID)}/results?${params.toString()}`));
+  }
+
+  function applyResultsPage(datasource, page) {
+    const controller = ensureState();
+    const key = normalizeDatasourceKey(page.datasource || datasource);
+    const current = rowsForDatasource(controller, key);
+    controller.rowsByDatasource[key] = mergeRows(current, safeList(page.results));
+    controller.cursorsByDatasource[key] = String(page.next_cursor || controller.cursorsByDatasource[key] || "");
+    controller.completedByDatasource[key] = !!page.completed && !page.has_more;
+    if (safeList(page.sources).length) {
+      controller.sources = safeList(page.sources);
+    }
+  }
+
+  async function drainDatasourceResults(jobID, runID, datasource, snapshotToken) {
+    const controller = ensureState();
+    const key = normalizeDatasourceKey(datasource);
+    if (!jobID || controller.runID !== runID || controller.activeJobID !== jobID) {
+      return false;
+    }
+
+    let guard = 0;
+    let keepGoing = true;
+    while (keepGoing) {
+      if (Number.isFinite(snapshotToken) && !isSnapshotCurrent(jobID, runID, snapshotToken)) {
+        return false;
       }
-      const params = new URLSearchParams({ page_size: String(SNAPSHOT_PAGE_SIZE) });
-      if (cursor) {
-        params.set("cursor", cursor);
+      if (controller.runID !== runID || controller.activeJobID !== jobID) {
+        return false;
       }
-      const page = safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(jobID)}/results/all?${params.toString()}`));
-      if (Number.isFinite(runID) && Number.isFinite(snapshotToken) && !isSnapshotCurrent(jobID, runID, snapshotToken)) {
-        return { results: [], lastPage: null, aborted: true };
+
+      const cursor = String(controller.cursorsByDatasource[key] || "");
+      const page = await fetchResultsPage(jobID, key, cursor);
+      if (Number.isFinite(snapshotToken) && !isSnapshotCurrent(jobID, runID, snapshotToken)) {
+        return false;
       }
-      lastPage = page;
-      results = mergeRows(results, safeList(page.results));
-      if (!(page.has_more && page.next_cursor)) {
+
+      applyResultsPage(key, page);
+      controller.rows = mergedAllRows(controller);
+      commitVisibleResponse({ preserveSelection: true });
+      syncRuntime(String(page.status || (controller.completed ? "completed" : "running")), "");
+
+      const nextCursor = String(page.next_cursor || "");
+      keepGoing = !!(page.has_more && nextCursor && nextCursor !== cursor);
+      guard += 1;
+      if (guard > 2000) {
         break;
       }
-      cursor = String(page.next_cursor || "");
     }
-    return { results, lastPage: safeMap(lastPage), aborted: false };
+    return true;
+  }
+
+  function queueDatasourceFetch(jobID, runID, datasource, snapshotToken) {
+    const controller = ensureState();
+    const key = normalizeDatasourceKey(datasource);
+    controller.pendingFetchByDatasource[key] = true;
+    if (controller.fetchingByDatasource[key]) {
+      return;
+    }
+
+    void (async () => {
+      controller.fetchingByDatasource[key] = true;
+      try {
+        while (controller.pendingFetchByDatasource[key]) {
+          controller.pendingFetchByDatasource[key] = false;
+          await drainDatasourceResults(jobID, runID, key, snapshotToken);
+        }
+      } finally {
+        controller.fetchingByDatasource[key] = false;
+      }
+    })();
   }
 
   async function syncSnapshot(jobID, runID) {
@@ -620,23 +752,18 @@
       }
 
       if (controller.rows.length) {
-        commitVisibleResponse(controller.rows, controller.sources, { preserveSelection: true });
+        commitVisibleResponse({ preserveSelection: true });
       } else {
         commitPendingResponse(controller.lastPayload, controller.sources.length ? controller.sources : pendingSources(controller.lastPayload));
       }
       syncRuntime(String(job.status || ""), job.last_error || "");
 
-      const snapshot = await fetchAllResults(jobID, runID, snapshotToken);
-      if (snapshot.aborted || !isSnapshotCurrent(jobID, runID, snapshotToken)) {
-        return false;
+      for (const datasourceKey of datasourceKeysFromController(controller)) {
+        const ok = await drainDatasourceResults(jobID, runID, datasourceKey, snapshotToken);
+        if (!ok) {
+          return false;
+        }
       }
-
-      controller.lastPayload = safeMap(controller.lastPayload && Object.keys(controller.lastPayload).length ? controller.lastPayload : job.request);
-      controller.rows = mergeRows([], snapshot.results);
-      controller.sources = mapSources(job, snapshot.lastPage);
-      controller.loading = !isTerminalStatus(job.status);
-      controller.completed = isTerminalStatus(job.status);
-      controller.partial = String(job.status || "") === "partial" || String(job.status || "") === "failed";
 
       if (state.search.job) {
         state.search.job.id = jobID;
@@ -646,7 +773,8 @@
         state.search.job.cursor = "";
       }
 
-      commitVisibleResponse(controller.rows, controller.sources, { preserveSelection: true });
+      controller.rows = mergedAllRows(controller);
+      commitVisibleResponse({ preserveSelection: true });
       syncRuntime(String(job.status || ""), job.last_error || "");
 
       if (controller.completed) {
@@ -697,7 +825,7 @@
     if (!controller.rows.length) {
       commitPendingResponse(controller.lastPayload, controller.sources.length ? controller.sources : pendingSources(controller.lastPayload));
     } else {
-      commitVisibleResponse(controller.rows, controller.sources, { preserveSelection: true });
+      commitVisibleResponse({ preserveSelection: true });
     }
     syncRuntime(String(payload.status || ""), payload.error || "");
     if (isTerminalStatus(String(payload.status || ""))) {
@@ -711,8 +839,11 @@
       return;
     }
     applyEventPayload(payload);
-    controller.rows = mergeRows(controller.rows, safeList(payload.rows));
-    commitVisibleResponse(controller.rows, controller.sources, { preserveSelection: true });
+    const datasource = normalizeDatasourceKey(payload.datasource || payload.datasource_id);
+    if (datasource) {
+      queueDatasourceFetch(controller.activeJobID, runID, datasource);
+    }
+    commitVisibleResponse({ preserveSelection: true });
     syncRuntime(String(payload.status || "running"), payload.error || "");
   }
 
@@ -723,7 +854,7 @@
     }
     applyEventPayload(payload);
     if (controller.rows.length) {
-      commitVisibleResponse(controller.rows, controller.sources, { preserveSelection: true });
+      commitVisibleResponse({ preserveSelection: true });
     } else {
       commitPendingResponse(controller.lastPayload, controller.sources.length ? controller.sources : pendingSources(controller.lastPayload));
     }
@@ -769,7 +900,7 @@
         void syncSnapshot(jobID, runID);
       }
     });
-    source.addEventListener("rows", (event) => {
+    source.addEventListener("rows_available", (event) => {
       handleRowsEvent(parseEvent(event), runID);
     });
     source.addEventListener("completed", (event) => {
@@ -890,6 +1021,7 @@
       }
 
       openStream(controller.activeJobID, runID);
+      void syncSnapshot(controller.activeJobID, runID);
       if (!background) {
         setLoading(false);
       }
@@ -958,6 +1090,7 @@
       }
 
       openStream(restoredJobID, runID);
+      void syncSnapshot(restoredJobID, runID);
       return true;
     } catch (_error) {
       closeStream();
@@ -1043,6 +1176,11 @@
     controller.loading = false;
     controller.completed = true;
     controller.partial = false;
+    controller.rowsByDatasource = {};
+    controller.cursorsByDatasource = {};
+    controller.completedByDatasource = {};
+    controller.fetchingByDatasource = {};
+    controller.pendingFetchByDatasource = {};
     controller.rows = [];
     controller.sources = [];
     controller.lastPayload = {};

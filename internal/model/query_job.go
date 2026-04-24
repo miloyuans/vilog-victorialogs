@@ -67,8 +67,11 @@ type QueryJobEvent struct {
 	JobID        string              `json:"job_id"`
 	Status       QueryJobStatus      `json:"status,omitempty"`
 	Sequence     int64               `json:"sequence,omitempty"`
+	FromSequence int64               `json:"from_sequence,omitempty"`
+	ToSequence   int64               `json:"to_sequence,omitempty"`
 	RowCount     int64               `json:"row_count,omitempty"`
 	DatasourceID string              `json:"datasource_id,omitempty"`
+	Datasource   string              `json:"datasource,omitempty"`
 	Progress     QueryJobProgress    `json:"progress,omitempty"`
 	Sources      []QuerySourceStatus `json:"sources,omitempty"`
 	Rows         []SearchResult      `json:"rows,omitempty"`
