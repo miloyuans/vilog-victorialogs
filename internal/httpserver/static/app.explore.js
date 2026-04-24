@@ -3,6 +3,7 @@
     return;
   }
   window.__vilogExploreStreamRunnerV2 = true;
+  window.__vilogExploreControllerOwnsSearch = true;
 
   const JOB_STORAGE_KEY = "vilog.search.activeJobId";
   const SNAPSHOT_PAGE_SIZE = 500;
@@ -499,7 +500,7 @@
       return;
     }
 
-    const active = normalizeDatasourceKey(state.search.activeResultDatasource || state.search.selectedDatasourceView || datasourceKeys[0]);
+    const active = normalizeDatasourceKey(state.search.selectedDatasourceView || state.search.activeResultDatasource || datasourceKeys[0]);
     if (datasourceKeys.indexOf(active) >= 0) {
       state.search.selectedDatasourceView = active;
       state.search.activeResultDatasource = active;
@@ -694,6 +695,9 @@
       const nextCursor = String(page.next_cursor || "");
       keepGoing = !!(page.has_more && nextCursor && nextCursor !== cursor);
       guard += 1;
+      if (guard % 4 === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
       if (guard > 2000) {
         break;
       }
@@ -843,7 +847,6 @@
     if (datasource) {
       queueDatasourceFetch(controller.activeJobID, runID, datasource);
     }
-    commitVisibleResponse({ preserveSelection: true });
     syncRuntime(String(payload.status || "running"), payload.error || "");
   }
 
@@ -1021,7 +1024,6 @@
       }
 
       openStream(controller.activeJobID, runID);
-      void syncSnapshot(controller.activeJobID, runID);
       if (!background) {
         setLoading(false);
       }

@@ -840,6 +840,8 @@ function handleClick(event) {
   const resultDatasource = button.getAttribute("data-select-result-datasource");
   if (resultDatasource != null) {
     state.search.selectedDatasourceView = resultDatasource;
+    state.search.activeResultDatasource = resultDatasource || "all";
+    state.search.datasourceViewMode = resultDatasource ? "single" : "all";
     state.search.selectedResultKey = "";
     return renderSearchResults();
   }
@@ -1120,7 +1122,9 @@ function renderSearchSources() {
       const datasource = String(item && item.datasource || "").trim();
       const active = datasource && datasource === selectedDatasource;
       const actionHint = datasource ? s("点击查看该数据源结果", "Click to inspect this datasource") : s("无可用数据源标识", "No datasource identifier");
-      return `<button class="source-card source-card-button ${active ? "active" : ""}" type="button" data-select-result-datasource="${esc(datasource)}" ${datasource ? "" : "disabled"}><div class="section-head"><div><h4 class="card-title">${esc(item.datasource || "-")}</h4><div class="tiny">${esc(item.error || s("无错误信息", "No error message"))}</div></div>${pill(localizeStatus(item.status).label, localizeStatus(item.status).tone)}</div><div class="chip-row">${pill(`${s("命中", "Hits")}: ${item.hits || 0}`, "tone-soft")}</div><div class="tiny">${esc(actionHint)}</div></button>`;
+      const loadedHits = Number(item && item.loaded_hits || 0);
+      const matchedHits = Number(item && item.hits || 0);
+      return `<button class="source-card source-card-button ${active ? "active" : ""}" type="button" data-select-result-datasource="${esc(datasource)}" ${datasource ? "" : "disabled"}><div class="section-head"><div><h4 class="card-title">${esc(item.datasource || "-")}</h4><div class="tiny">${esc(item.error || s("无错误信息", "No error message"))}</div></div>${pill(localizeStatus(item.status).label, localizeStatus(item.status).tone)}</div><div class="chip-row">${pill(`${s("已加载", "Loaded")}: ${loadedHits}`, "tone-soft")}${pill(`${s("匹配", "Matched")}: ${matchedHits}`, "tone-neutral")}</div><div class="tiny">${esc(actionHint)}</div></button>`;
     }).join("")
     : empty(s("查询后这里会展示各数据源状态。", "Per-source states appear after a query."));
 }
@@ -1141,20 +1145,27 @@ function ensureSelectedDatasourceView() {
   const datasources = listSearchResultDatasources();
   if (!datasources.length) {
     state.search.selectedDatasourceView = "";
+    state.search.activeResultDatasource = "all";
+    state.search.datasourceViewMode = "all";
     return "";
   }
-  const current = String(state.search.selectedDatasourceView || "").trim();
+  const current = String(state.search.selectedDatasourceView || state.search.activeResultDatasource || "").trim();
   if (current && datasources.indexOf(current) >= 0) {
+    state.search.selectedDatasourceView = current;
+    state.search.activeResultDatasource = current;
+    state.search.datasourceViewMode = "single";
     return current;
   }
   state.search.selectedDatasourceView = datasources[0];
+  state.search.activeResultDatasource = datasources[0];
+  state.search.datasourceViewMode = "single";
   return state.search.selectedDatasourceView;
 }
 
 function getDatasourceDecoratedResults() {
   const all = getDecoratedResults();
-  const datasource = ensureSelectedDatasourceView();
-  if (!datasource) return all;
+  const datasource = String(state.search.activeResultDatasource || ensureSelectedDatasourceView() || "").trim();
+  if (!datasource || datasource === "all") return all;
   return all.filter((item) => String(item && item.datasource || "").trim() === datasource);
 }
 
