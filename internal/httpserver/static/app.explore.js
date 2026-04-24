@@ -1268,6 +1268,49 @@
     restartAutoTimer();
   }
 
+  function invalidateSearchResults(reason) {
+    closeStream();
+    writeStorage(JOB_STORAGE_KEY, "");
+
+    const controller = ensureState();
+    cancelSnapshotSync(controller);
+    controller.runID = ++runSequence;
+    controller.activeJobID = "";
+    controller.finalizedJobID = "";
+    controller.starting = false;
+    controller.loading = false;
+    controller.completed = true;
+    controller.partial = false;
+    controller.rowsByDatasource = {};
+    controller.cursorsByDatasource = {};
+    controller.completedByDatasource = {};
+    controller.fetchingByDatasource = {};
+    controller.pendingFetchByDatasource = {};
+    controller.rows = [];
+    controller.sources = [];
+    controller.lastPayload = {};
+
+    if (state.search.job) {
+      state.search.job.id = "";
+      state.search.job.loading = false;
+      state.search.job.fetching = false;
+      state.search.job.completed = true;
+      state.search.job.partial = false;
+      state.search.job.cursor = "";
+      state.search.job.eventSource = null;
+    }
+
+    state.search.response = null;
+    state.search.selectedDatasourceView = "";
+    state.search.activeResultDatasource = "all";
+    state.search.datasourceViewMode = "all";
+    state.ui.detailOpen = false;
+
+    call(window.renderSearchResults);
+    setRuntime("idle", reason || "Filters changed. Run query to load matching logs.");
+    restartAutoTimer();
+  }
+
   function bindEvents() {
     if (window.__vilogExploreStreamRunnerBound) {
       return;
@@ -1313,6 +1356,9 @@
           value: String(target.value || ""),
         }];
         call(window.syncHiddenQueryInput);
+        if (state.search.response || isJobActive()) {
+          invalidateSearchResults("Query changed. Run query to load matching logs.");
+        }
         return;
       }
 
@@ -1339,6 +1385,9 @@
         state.search.pageSizeCustom = resolved;
         state.search.pageSize = resolved;
         target.classList.remove("field-error");
+        if (state.search.response || isJobActive()) {
+          invalidateSearchResults("Rows / service changed. Run query to load matching logs.");
+        }
       }
     }, true);
 
@@ -1365,6 +1414,9 @@
           state.search.pageSize = normalizePageSizeValue(mode, DEFAULT_PAGE_SIZE);
         }
         call(window.renderSearchControls);
+        if (state.search.response || isJobActive()) {
+          invalidateSearchResults("Rows / service changed. Run query to load matching logs.");
+        }
         return;
       }
 
@@ -1377,6 +1429,9 @@
           state.search.pageSizeCustom = normalizePageSizeValue(candidate, DEFAULT_PAGE_SIZE);
           state.search.pageSize = state.search.pageSizeCustom;
           target.classList.remove("field-error");
+          if (state.search.response || isJobActive()) {
+            invalidateSearchResults("Rows / service changed. Run query to load matching logs.");
+          }
         }
         return;
       }
@@ -1575,6 +1630,7 @@
   };
 
   clearSearchFilters = window.clearSearchFilters = clearSearchFiltersNow;
+  window.invalidateExploreSearchResponse = invalidateSearchResults;
   runSearchWindow = window.runSearchWindow = async function (_pageOverride, options) {
     return startSearch(options || {});
   };

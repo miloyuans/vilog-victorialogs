@@ -1210,6 +1210,9 @@ function setQuickRangeValues(name) {
 
 applyQuickRange = function (name) {
   setQuickRangeValues(name);
+  if (typeof window.invalidateExploreSearchResponse === "function") {
+    window.invalidateExploreSearchResponse("Time range changed. Run query to load matching logs.");
+  }
   closeSearchMenus();
   renderSearchTimePanel();
 };
@@ -1227,6 +1230,9 @@ applyCustomTime = function () {
   byId("search-start").value = start;
   byId("search-end").value = end;
   state.search.timePreset = "custom";
+  if (typeof window.invalidateExploreSearchResponse === "function") {
+    window.invalidateExploreSearchResponse("Time range changed. Run query to load matching logs.");
+  }
   closeSearchMenus();
   renderSearchTimePanel();
 };
@@ -3971,6 +3977,9 @@ highlight = function (text) {
     state.search.selectedDatasourceIDs = selected.indexOf(id) >= 0
       ? selected.filter((item) => item !== id)
       : selected.concat([id]);
+    if (typeof window.invalidateExploreSearchResponse === "function") {
+      window.invalidateExploreSearchResponse("Datasource selection changed. Run query to load matching logs.");
+    }
     syncCatalogDatasource();
     await loadSearchCatalogs();
   };
@@ -3980,6 +3989,9 @@ highlight = function (text) {
     const enabled = safeArray(state.datasources).filter((item) => item && item.enabled);
     const pool = enabled.length ? enabled : safeArray(state.datasources);
     state.search.selectedDatasourceIDs = pool.map((item) => item.id);
+    if (typeof window.invalidateExploreSearchResponse === "function") {
+      window.invalidateExploreSearchResponse("Datasource selection changed. Run query to load matching logs.");
+    }
     syncCatalogDatasource();
     await loadSearchCatalogs();
   };
@@ -3992,6 +4004,9 @@ highlight = function (text) {
       : selected.concat([name]);
     state.search.activeFilters = {};
     state.search.tagValues = {};
+    if (typeof window.invalidateExploreSearchResponse === "function") {
+      window.invalidateExploreSearchResponse("Service filter changed. Run query to load matching logs.");
+    }
     await loadSearchCatalogs();
   };
 
@@ -4000,6 +4015,9 @@ highlight = function (text) {
     state.search.serviceNames = [];
     state.search.activeFilters = {};
     state.search.tagValues = {};
+    if (typeof window.invalidateExploreSearchResponse === "function") {
+      window.invalidateExploreSearchResponse("Service filter changed. Run query to load matching logs.");
+    }
     await loadSearchCatalogs();
   };
 

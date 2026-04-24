@@ -1421,6 +1421,9 @@ async function handleCatalogDatasourceChange(event) {
   state.search.service = "";
   state.search.activeFilters = {};
   state.search.tagValues = {};
+  if (typeof window.invalidateExploreSearchResponse === "function") {
+    window.invalidateExploreSearchResponse("Datasource selection changed. Run query to load matching logs.");
+  }
   try {
     await loadSearchCatalogs();
   } catch (error) {
@@ -1432,6 +1435,9 @@ async function handleServiceChange(event) {
   state.search.service = event.target.value;
   state.search.activeFilters = {};
   state.search.tagValues = {};
+  if (typeof window.invalidateExploreSearchResponse === "function") {
+    window.invalidateExploreSearchResponse("Service filter changed. Run query to load matching logs.");
+  }
   try {
     await loadSearchCatalogs();
   } catch (error) {
@@ -1592,6 +1598,9 @@ function toggleSearchDatasource(id) {
   const index = state.search.selectedDatasourceIDs.indexOf(id);
   if (index >= 0) state.search.selectedDatasourceIDs = state.search.selectedDatasourceIDs.filter((item) => item !== id);
   else state.search.selectedDatasourceIDs = state.search.selectedDatasourceIDs.concat([id]);
+  if (typeof window.invalidateExploreSearchResponse === "function") {
+    window.invalidateExploreSearchResponse("Datasource selection changed. Run query to load matching logs.");
+  }
   renderSearchDatasourceGrid();
   renderSearchContext();
 }
