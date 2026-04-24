@@ -69,6 +69,7 @@
     state.search.exploreController = state.search.exploreController || {
       activeJobID: "",
       runID: 0,
+      finalizedJobID: "",
       starting: false,
       syncingSnapshot: false,
       snapshotJobID: "",
@@ -550,6 +551,7 @@
     controller.loading = true;
     controller.completed = false;
     controller.partial = true;
+    controller.finalizedJobID = "";
     state.search.selectedDatasourceView = "";
     state.search.activeResultDatasource = "all";
     state.search.datasourceViewMode = "all";
@@ -637,6 +639,21 @@
     return safeMap(await requestJSON(`/api/query/jobs/${encodeURIComponent(jobID)}/results?${params.toString()}`));
   }
 
+  async function waitForDatasourceIdle(jobID, runID, datasource, snapshotToken) {
+    const controller = ensureState();
+    const key = normalizeDatasourceKey(datasource);
+    while (controller.fetchingByDatasource[key]) {
+      if (Number.isFinite(snapshotToken) && !isSnapshotCurrent(jobID, runID, snapshotToken)) {
+        return false;
+      }
+      if (controller.runID !== runID || controller.activeJobID !== jobID) {
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return !Number.isFinite(snapshotToken) || isSnapshotCurrent(jobID, runID, snapshotToken);
+  }
+
   function applyResultsPage(datasource, page) {
     const controller = ensureState();
     const key = normalizeDatasourceKey(page.datasource || datasource);
@@ -716,6 +733,9 @@
     if (!jobID || controller.runID !== runID || controller.activeJobID !== jobID) {
       return false;
     }
+    if (controller.finalizedJobID === String(jobID || "") && controller.completed && !controller.syncingSnapshot) {
+      return false;
+    }
     if (controller.syncingSnapshot && controller.snapshotJobID === String(jobID || "")) {
       return false;
     }
@@ -748,6 +768,14 @@
       syncRuntime(String(job.status || ""), job.last_error || "");
 
       for (const datasourceKey of datasourceKeysFromController(controller)) {
+        controller.pendingFetchByDatasource[datasourceKey] = true;
+        const idle = await waitForDatasourceIdle(jobID, runID, datasourceKey, snapshotToken);
+        if (!idle) {
+          return false;
+        }
+        if (controller.completedByDatasource[datasourceKey]) {
+          continue;
+        }
         const ok = await drainDatasourceResults(jobID, runID, datasourceKey, snapshotToken);
         if (!ok) {
           return false;
@@ -767,6 +795,7 @@
       syncRuntime(String(job.status || ""), job.last_error || "");
 
       if (controller.completed) {
+        controller.finalizedJobID = String(jobID || "");
         closeStream();
         writeStorage(JOB_STORAGE_KEY, "");
       }
@@ -786,6 +815,7 @@
         const shouldRestartAuto = !!controller.completed;
         controller.syncingSnapshot = false;
         controller.snapshotJobID = "";
+        syncRuntime(controller.completed ? (controller.partial ? "partial" : "completed") : "running", "");
         if (shouldRestartAuto) {
           restartAutoTimer();
         }
@@ -830,6 +860,11 @@
     applyEventPayload(payload);
     const datasource = normalizeDatasourceKey(payload.datasource || payload.datasource_id);
     if (datasource) {
+      if (controller.syncingSnapshot && controller.snapshotJobID === controller.activeJobID) {
+        controller.pendingFetchByDatasource[datasource] = true;
+        syncRuntime(String(payload.status || "running"), payload.error || "");
+        return;
+      }
       queueDatasourceFetch(controller.activeJobID, runID, datasource);
     }
     syncRuntime(String(payload.status || "running"), payload.error || "");
@@ -958,6 +993,7 @@
 
     controller.runID = runID;
     controller.activeJobID = "";
+    controller.finalizedJobID = "";
     controller.starting = true;
     controller.loading = true;
     controller.completed = false;
@@ -1045,6 +1081,7 @@
     cancelSnapshotSync(controller);
     controller.runID = runID;
     controller.activeJobID = restoredJobID;
+    controller.finalizedJobID = "";
     controller.starting = false;
     controller.loading = true;
     controller.completed = false;
