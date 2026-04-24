@@ -492,25 +492,10 @@
   }
 
   function syncDatasourceViewState(controller) {
-    const datasourceKeys = datasourceKeysFromController(controller);
-    if (!datasourceKeys.length) {
-      state.search.selectedDatasourceView = "";
-      state.search.activeResultDatasource = "all";
-      state.search.datasourceViewMode = "all";
-      return;
-    }
-
-    const active = normalizeDatasourceKey(state.search.selectedDatasourceView || state.search.activeResultDatasource || datasourceKeys[0]);
-    if (datasourceKeys.indexOf(active) >= 0) {
-      state.search.selectedDatasourceView = active;
-      state.search.activeResultDatasource = active;
-      state.search.datasourceViewMode = "single";
-      return;
-    }
-
-    state.search.selectedDatasourceView = datasourceKeys[0];
-    state.search.activeResultDatasource = datasourceKeys[0];
-    state.search.datasourceViewMode = "single";
+    void controller;
+    state.search.selectedDatasourceView = "";
+    state.search.activeResultDatasource = "all";
+    state.search.datasourceViewMode = "all";
   }
 
   function buildResponse(controller) {

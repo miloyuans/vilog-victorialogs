@@ -839,11 +839,7 @@ function handleClick(event) {
 
   const resultDatasource = button.getAttribute("data-select-result-datasource");
   if (resultDatasource != null) {
-    state.search.selectedDatasourceView = resultDatasource;
-    state.search.activeResultDatasource = resultDatasource || "all";
-    state.search.datasourceViewMode = resultDatasource ? "single" : "all";
-    state.search.selectedResultKey = "";
-    return renderSearchResults();
+    return;
   }
 
   const addTag = button.getAttribute("data-add-tag");
@@ -1116,15 +1112,11 @@ function renderSearchHistogramPanel() {
 
 function renderSearchSources() {
   const items = (state.search.response && state.search.response.sources) || [];
-  const selectedDatasource = ensureSelectedDatasourceView();
   byId("search-source-grid").innerHTML = items.length
     ? items.map((item) => {
-      const datasource = String(item && item.datasource || "").trim();
-      const active = datasource && datasource === selectedDatasource;
-      const actionHint = datasource ? s("点击查看该数据源结果", "Click to inspect this datasource") : s("无可用数据源标识", "No datasource identifier");
       const loadedHits = Number(item && item.loaded_hits || 0);
       const matchedHits = Number(item && item.hits || 0);
-      return `<button class="source-card source-card-button ${active ? "active" : ""}" type="button" data-select-result-datasource="${esc(datasource)}" ${datasource ? "" : "disabled"}><div class="section-head"><div><h4 class="card-title">${esc(item.datasource || "-")}</h4><div class="tiny">${esc(item.error || s("无错误信息", "No error message"))}</div></div>${pill(localizeStatus(item.status).label, localizeStatus(item.status).tone)}</div><div class="chip-row">${pill(`${s("已加载", "Loaded")}: ${loadedHits}`, "tone-soft")}${pill(`${s("匹配", "Matched")}: ${matchedHits}`, "tone-neutral")}</div><div class="tiny">${esc(actionHint)}</div></button>`;
+      return `<div class="source-card compact-source-card"><div class="section-head"><div><h4 class="card-title">${esc(item.datasource || "-")}</h4><div class="tiny">${esc(item.error || s("无错误信息", "No error message"))}</div></div>${pill(localizeStatus(item.status).label, localizeStatus(item.status).tone)}</div><div class="chip-row">${pill(`${s("已加载", "Loaded")}: ${loadedHits}`, "tone-soft")}${pill(`${s("匹配", "Matched")}: ${matchedHits}`, "tone-neutral")}</div><div class="tiny">${esc(s("仅展示数据源状态汇总，日志结果区统一合并显示全部数据源。", "Datasource cards show status only. The results pane displays merged rows from all datasources."))}</div></div>`;
     }).join("")
     : empty(s("查询后这里会展示各数据源状态。", "Per-source states appear after a query."));
 }
@@ -1142,31 +1134,14 @@ function listSearchResultDatasources() {
 }
 
 function ensureSelectedDatasourceView() {
-  const datasources = listSearchResultDatasources();
-  if (!datasources.length) {
-    state.search.selectedDatasourceView = "";
-    state.search.activeResultDatasource = "all";
-    state.search.datasourceViewMode = "all";
-    return "";
-  }
-  const current = String(state.search.selectedDatasourceView || state.search.activeResultDatasource || "").trim();
-  if (current && datasources.indexOf(current) >= 0) {
-    state.search.selectedDatasourceView = current;
-    state.search.activeResultDatasource = current;
-    state.search.datasourceViewMode = "single";
-    return current;
-  }
-  state.search.selectedDatasourceView = datasources[0];
-  state.search.activeResultDatasource = datasources[0];
-  state.search.datasourceViewMode = "single";
-  return state.search.selectedDatasourceView;
+  state.search.selectedDatasourceView = "";
+  state.search.activeResultDatasource = "all";
+  state.search.datasourceViewMode = "all";
+  return "";
 }
 
 function getDatasourceDecoratedResults() {
-  const all = getDecoratedResults();
-  const datasource = String(state.search.activeResultDatasource || ensureSelectedDatasourceView() || "").trim();
-  if (!datasource || datasource === "all") return all;
-  return all.filter((item) => String(item && item.datasource || "").trim() === datasource);
+  return getDecoratedResults();
 }
 
 function renderSearchResultsScope() {
@@ -1176,16 +1151,11 @@ function renderSearchResultsScope() {
     node.textContent = "";
     return;
   }
-  const datasource = ensureSelectedDatasourceView();
   const items = getDatasourceDecoratedResults();
   const totalDatasources = listSearchResultDatasources().length;
-  if (!datasource) {
-    node.textContent = s("当前无可切换的数据源结果。", "No datasource result scope is available.");
-    return;
-  }
   node.textContent = s(
-    `当前结果窗口正在查看 ${datasource}，共 ${items.length} 条日志，可切换 ${totalDatasources} 个数据源。`,
-    `Result window is showing ${datasource} with ${items.length} rows across ${totalDatasources} datasource views.`,
+    `当前结果窗口统一展示全部数据源结果，共 ${items.length} 条日志，包含 ${totalDatasources} 个数据源。`,
+    `The result window is showing merged rows from all datasources: ${items.length} rows across ${totalDatasources} datasources.`,
   );
 }
 
@@ -1206,9 +1176,8 @@ function renderSearchResultsBody() {
   ensureSelectedResult(results);
   if (!results.length) return void (node.innerHTML = empty(s("当前条件下没有日志结果。", "No logs matched the current query.")));
   if (state.search.view === "json") {
-    const datasource = ensureSelectedDatasourceView();
     return void (node.innerHTML = `<div class="raw-view"><pre>${esc(JSON.stringify({
-      datasource,
+      datasource: "all",
       total_datasources: listSearchResultDatasources().length,
       visible_results: results,
     }, null, 2))}</pre></div>`);
